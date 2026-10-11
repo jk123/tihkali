@@ -20,7 +20,7 @@ mod vm;
 
 use core::panic::PanicInfo;
 
-use tihkali_hal::{console, gicv3, kprintln};
+use tihkali_hal::{console, gic, kprintln};
 
 /// Embedded initramfs: used when no virtio-blk disk is attached.
 static INITRAMFS: &[u8] = include_bytes!(env!("TIHKALI_INITRAMFS"));
@@ -31,7 +31,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     kprintln!("tihkali {} booting", env!("CARGO_PKG_VERSION"));
     kprintln!("boot: entered at EL{entry_el}, now at EL{}", current_el());
 
-    gicv3::init();
+    gic::init();
     kprintln!("gic: distributor/redistributor/CPU interface up, PPI30 enabled");
     tty::init();
     kprintln!("tty: PL011 RX on SPI 33");
@@ -100,6 +100,7 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     kprintln!("boot: entering EL0 (pid 0)");
     user::enter(entry)
 }
+
 
 /// Where `sys_exit` returns control: no scheduler yet, so we idle at EL1
 /// (interrupts enabled via the synthetic SPSR the syscall handler installs).

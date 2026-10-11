@@ -126,6 +126,22 @@ gate_has "s5: exit code via wait4" "$S5" 'sh: linux-hello exited 42'
 gate_has "s5: clean exit"         "$S5" 'proc: pid 0 exited \(0\)'
 gate_bad  "s5" "$S5"
 
+echo "== session 6: Raspberry Pi 3 (raspi3b, embedded initramfs)"
+S6="$T/s6.log"
+( sleep 2
+  printf 'ls /bin\n';    sleep 0.6
+  printf 'greet\n';      sleep 1.5
+  printf 'exit\n'
+) | timeout 15 ./tools/run.sh --rpi >"$S6" 2>&1
+gate_has "s6: booted on raspi3b"     "$S6" 'entered at EL'
+gate_has "s6: no-GIC dispatcher"     "$S6" 'BCM283x poll dispatcher'
+gate_has "s6: fallback initramfs"    "$S6" 'no device in 32 MMIO slots'
+gate_has "s6: timer ticks"           "$S6" '\[irq\] tick'
+gate_has "s6: shell listed ls"       "$S6" 'linux-hello'
+gate_has "s6: fork/exec on Pi"       "$S6" 'sh: greet exited 5'
+gate_has "s6: clean exit"            "$S6" 'proc: pid 0 exited \(0\)'
+gate_bad  "s6" "$S6"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

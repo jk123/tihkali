@@ -17,15 +17,36 @@ else
 fi
 
 # `--no-drive` (consumed here) boots without a disk to exercise the
-# kernel's embedded-initramfs fallback path.
+# kernel's embedded-initramfs fallback path. `--rpi` (also consumed)
+# rebuilds for the Raspberry Pi 3 and boots via -M raspi3b (no disk:
+# raspi3 has no virtio — the embedded initramfs is used).
 QEMU_ARGS=()
+MODE=virt
 for a in "$@"; do
     if [ "$a" = "--no-drive" ]; then
+        DRIVE_ARGS=()
+    elif [ "$a" = "--rpi" ]; then
+        MODE=rpi
         DRIVE_ARGS=()
     else
         QEMU_ARGS+=("$a")
     fi
 done
+
+if [ "$MODE" = "rpi" ]; then
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" \
+        --no-default-features --features rpi3
+    IMG8="$ROOT/target/kernel8.img"
+    llvm-objcopy-19 -O binary "$BIN" "$IMG8"
+    QEMU="$ROOT/.toolchain/qemu/usr/bin/qemu-system-aarch64"
+    export LD_LIBRARY_PATH="$ROOT/.toolchain/qemu/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    exec "$QEMU" \
+        -L "$ROOT/.toolchain/qemu/usr/share/qemu" \
+        -M raspi3b \
+        -display none -serial stdio -monitor none \
+        -kernel "$IMG8" \
+        "${QEMU_ARGS[@]}"
+fi
 
 QEMU="$ROOT/.toolchain/qemu/usr/bin/qemu-system-aarch64"
 export LD_LIBRARY_PATH="$ROOT/.toolchain/qemu/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

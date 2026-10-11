@@ -1,6 +1,6 @@
 //! Trap frame, exception dispatch, syscall handling, and register dumps.
 
-use tihkali_hal::gicv3;
+use tihkali_hal::gic;
 use tihkali_hal::{kprint, kprintln};
 
 use crate::arch::timer;
@@ -243,19 +243,19 @@ fn fatal(frame: &mut TrapFrame) -> ! {
 /// IRQ entry: claim from the GIC, dispatch, EOI; preempt EL0 on timer ticks.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_irq_handler(frame: &mut TrapFrame) {
-    let iar = gicv3::iar();
+    let iar = gic::iar();
     let id = iar & 0x00ff_ffff;
     match id {
-        gicv3::SPURIOUS => return,
-        gicv3::PPI_PHYS_TIMER => timer::on_tick(),
+        gic::SPURIOUS => return,
+        gic::PPI_PHYS_TIMER => timer::on_tick(),
         crate::tty::UART0_SPI => crate::tty::on_rx(),
         other => kprintln!("[irq] unhandled INTID {other}"),
     }
-    gicv3::eoir(iar);
+    gic::eoir(iar);
     // Round-robin when the tick interrupted user mode (SPSR M=EL0t);
     // additionally, any IRQ that lands while the kernel idles gets a
     // schedule chance (that's how a woken reader resumes from idle).
-    if id == gicv3::PPI_PHYS_TIMER && frame.spsr & 0xf == 0 {
+    if id == gic::PPI_PHYS_TIMER && frame.spsr & 0xf == 0 {
         let _ = crate::proc::schedule(frame);
     } else if crate::proc::is_idle() {
         let _ = crate::proc::schedule_ex(frame, false);

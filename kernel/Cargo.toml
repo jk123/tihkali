@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["qemu-virt"]
+qemu-virt = ["tihkali-hal/qemu-virt"]
+rpi3 = ["tihkali-hal/raspi3"]
+
 [[bin]]
 name = "tihkali"
 path = "src/main.rs"
 
 [dependencies]
-tihkali-hal = { path = "../hal" }
+tihkali-hal = { path = "../hal", default-features = false }

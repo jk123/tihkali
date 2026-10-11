@@ -4,6 +4,14 @@
 .section ".text.boot"
 .global _start
 _start:
+    // All cores may enter here on the Pi: park everything but core 0
+    // (MPIDR Aff0) before touching shared state.
+    mrs     x0, mpidr_el1
+    and     x0, x0, #0xff
+    cbz     x0, 1f
+0:  wfe
+    b       0b
+1:
     mrs     x19, CurrentEL
     lsr     x19, x19, #2
     cmp     x19, #3

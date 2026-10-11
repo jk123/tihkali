@@ -5,5 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["qemu-virt"]
+# Board selection comes from the kernel crate's features; none by default.
+default = []
 qemu-virt = []
+raspi3 = []

@@ -8,12 +8,13 @@ static mut BUF: [u8; CAP] = [0; CAP];
 static mut IN: usize = 0; // monotonic write cursor
 static mut OUT: usize = 0; // monotonic read cursor
 
-pub const UART0_SPI: u32 = 33; // QEMU virt: a15irqmap[VIRT_UART0] = 1 → 32+1
+/// Board UART interrupt number (GIC SPI on virt, VC IRQ on the Pi).
+pub const UART0_SPI: u32 = tihkali_hal::platform::UART0_SPI;
 
 /// Wire up RX: unmask PL011 + enable the GIC SPI.
 pub fn init() {
     tihkali_hal::console::enable_rx_irq();
-    tihkali_hal::gicv3::enable_spi(UART0_SPI);
+    tihkali_hal::gic::enable_spi(UART0_SPI);
 }
 
 /// RX interrupt: drain the UART FIFO into the ring, wake readers.

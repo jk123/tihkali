@@ -3,8 +3,15 @@ use std::process::Command;
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    println!("cargo:rustc-link-arg=-T{dir}/src/arch/link.ld");
-    println!("cargo:rerun-if-changed=src/arch/link.ld");
+    // Board selects the link address: QEMU virt loads at 0x40080000,
+    // the Pi's boot ROM loads kernel8.bin at 0x80000.
+    let script = if std::env::var_os("CARGO_FEATURE_RPI3").is_some() {
+        "src/arch/link-rpi.ld"
+    } else {
+        "src/arch/link.ld"
+    };
+    println!("cargo:rustc-link-arg=-T{dir}/{script}");
+    println!("cargo:rerun-if-changed={script}");
     println!("cargo:rerun-if-changed=../user/src/main.rs");
     println!("cargo:rerun-if-changed=../user/src/greet.rs");
     println!("cargo:rerun-if-changed=../user/src/sh.rs");
