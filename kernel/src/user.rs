@@ -8,6 +8,10 @@ pub const USER_BASE: usize = 0x1_0000_0000;
 pub const USER_TEXT_LIMIT: usize = USER_BASE + 0x20_0000;
 pub const USER_LIMIT: usize = USER_BASE + 0x40_0000;
 
+/// Images must end below this (busybox is ~1.14 MiB); the rest splits into
+/// the brk arena (image_end..floor) and the mmap arena (floor..2 MiB).
+pub const MMAP_FLOOR: usize = USER_BASE + 0x0014_0000;
+
 /// Top page of the text region: holds the sigreturn trampoline
 /// (`svc #295; b .`), mapped executable at every image load.
 pub const TRAMPOLINE: usize = USER_BASE + 0x001F_F000;
@@ -37,8 +41,8 @@ fn le64(b: &[u8], o: usize) -> u64 {
 }
 
 /// Copy PT_LOAD segments into the address space `ttbr`, populating pages
-/// on demand (4 KiB frames); returns the entry point.
-pub fn load(elf: &[u8], ttbr: usize) -> Result<usize, &'static str> {
+/// on demand (4 KiB frames); returns (entry, image_end).
+pub fn load(elf: &[u8], ttbr: usize) -> Result<(usize, usize), &'static str> {
     if elf.len() < 64 {
         return Err("ELF too small");
     }
@@ -64,6 +68,7 @@ pub fn load(elf: &[u8], ttbr: usize) -> Result<usize, &'static str> {
     }
 
     let mut loaded = 0usize;
+    let mut image_end = entry;
     for i in 0..phnum as usize {
         let p = phoff + i * phentsize as usize;
         if p + 56 > elf.len() {
@@ -80,6 +85,9 @@ pub fn load(elf: &[u8], ttbr: usize) -> Result<usize, &'static str> {
             && vaddr.checked_add(memsz).is_some_and(|e| e <= USER_LIMIT))
         {
             return Err("segment outside user space");
+        }
+        if vaddr + memsz > MMAP_FLOOR {
+            return Err("image larger than 1 MiB (no room for brk arena)");
         }
         if offset + filesz > elf.len() {
             return Err("segment data out of file");
@@ -104,12 +112,13 @@ pub fn load(elf: &[u8], ttbr: usize) -> Result<usize, &'static str> {
             }
         }
         loaded += memsz;
+        image_end = image_end.max(vaddr + memsz);
         kprintln!("user: PT_LOAD {vaddr:#x} +{memsz:#x} (filesz {filesz:#x})");
     }
     if loaded == 0 {
         return Err("no PT_LOAD segments");
     }
-    Ok(entry)
+    Ok((entry, image_end))
 }
 
 /// Drop to EL0 at `entry` with interrupts enabled (via SPSR).

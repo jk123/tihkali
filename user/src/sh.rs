@@ -724,18 +724,34 @@ pub extern "C" fn _start() -> ! {
                 }
                 unsafe { close(fd) };
             }
-            "greet" | "hello" | "linux-hello" => {
-                let mut path = [0u8; 32];
+            other => {
+                // Generic: fork + exec /bin/<cmd>.
+                let cl = other.len();
+                let mut path = [0u8; 64];
+                if cl == 0 || cl > 58 {
+                    unsafe { write(1, "sh: bad command\n") };
+                    continue;
+                }
                 path[..5].copy_from_slice(b"/bin/");
-                let cl = cmd.len();
-                path[5..5 + cl].copy_from_slice(cmd.as_bytes());
+                path[5..5 + cl].copy_from_slice(other.as_bytes());
                 let path_s = core::str::from_utf8(&path[..5 + cl]).unwrap_or("?");
+
+                // Full argv: cmd + remaining words (busybox needs `busybox
+                // echo hi` to see "echo hi", not just argv[0]).
+                let mut args: [&str; 8] = [""; 8];
+                let mut nargs = 0usize;
+                for w in trimmed.split_whitespace() {
+                    if nargs < args.len() {
+                        args[nargs] = w;
+                        nargs += 1;
+                    }
+                }
 
                 let pid = unsafe { fork() };
                 if pid == 0 {
-                    unsafe { execve(path_s, &[cmd]) };
-                    unsafe { write(1, "sh: exec failed\n") };
-                    unsafe { exit(1) }
+                    let r = unsafe { execve(path_s, &args[..nargs]) };
+                    // -2 = ENOENT (conventional shell exit codes)
+                    unsafe { exit(if r == -2 { 127 } else { 126 }) }
                 }
                 if pid < 0 {
                     unsafe { write(1, "sh: fork failed\n") };
@@ -760,21 +776,23 @@ pub extern "C" fn _start() -> ! {
                 if r > 0 {
                     let st = status as u32;
                     unsafe { write(1, "sh: ") };
-                    unsafe { write(1, cmd) };
+                    unsafe { write(1, other) };
                     if st & 0x7f != 0 {
                         unsafe { write(1, " terminated by signal ") };
                         unsafe { write(1, utoa((st & 0x7f) as u64, &mut buf)) };
                     } else {
-                        unsafe { write(1, " exited ") };
-                        unsafe { write(1, utoa((st >> 8) as u64, &mut buf)) };
+                        let code = st >> 8;
+                        if code == 127 {
+                            unsafe { write(1, ": not found") };
+                        } else if code == 126 {
+                            unsafe { write(1, ": cannot execute") };
+                        } else {
+                            unsafe { write(1, " exited ") };
+                            unsafe { write(1, utoa(code as u64, &mut buf)) };
+                        }
                     }
                     unsafe { write(1, "\n") };
                 }
-            }
-            other => {
-                unsafe { write(1, "sh: ") };
-                unsafe { write(1, other) };
-                unsafe { write(1, ": not found\n") };
             }
         }
     }

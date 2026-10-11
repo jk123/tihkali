@@ -51,6 +51,11 @@ if [ -x .toolchain/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc ]; then
 else
     fail "musl toolchain missing (run tools/fetch-linux-toolchain.sh)"
 fi
+if [ -x .toolchain/alpine/busybox ]; then
+    pass "alpine busybox present"
+else
+    fail "busybox missing (run tools/fetch-alpine-busybox.sh)"
+fi
 
 echo "== session 1: fs ops + write-back"
 S1="$T/s1.log"
@@ -141,6 +146,27 @@ gate_has "s6: shell listed ls"       "$S6" 'linux-hello'
 gate_has "s6: fork/exec on Pi"       "$S6" 'sh: greet exited 5'
 gate_has "s6: clean exit"            "$S6" 'proc: pid 0 exited \(0\)'
 gate_bad  "s6" "$S6"
+
+echo "== session 7: Linux ABI depth + Alpine busybox"
+S7="$T/s7.log"
+( sleep 1.5
+  printf 'linux-probe\n'
+  sleep 3
+  printf 'busybox echo hello-from-alpine\n'
+  sleep 2
+  printf 'busybox ls /bin\n'
+  sleep 2
+  printf 'busybox cat /etc/motd\n'
+  sleep 2
+  printf 'exit\n'
+) | timeout 20 ./tools/run.sh >"$S7" 2>&1
+gate_has "s7: probe all ok"          "$S7" 'linux-probe: all ok'
+gate_has "s7: probe exited 0"        "$S7" 'sh: linux-probe exited 0'
+gate_count "s7: busybox echo ran"    "$S7" 'hello-from-alpine' 2
+gate_has "s7: busybox ls via getdents64" "$S7" 'linux-probe'
+gate_has "s7: busybox cat read"      "$S7" 'Welcome to tihkali'
+gate_has "s7: busybox exited 0"      "$S7" 'sh: busybox exited 0'
+gate_bad  "s7" "$S7"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

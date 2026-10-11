@@ -91,6 +91,16 @@ pub fn handle_fault(ttbr: usize, far: usize, is_write: bool) -> Result<(), &'sta
 
     let pte_val = unsafe { *pte };
     if !pte_present(pte_val) {
+        if in_text(va) {
+            // brk/mmap arenas inside the text window grow on first touch.
+            let (brk, mmap_next) = crate::proc::current_arenas();
+            if (va as u64) < brk
+                || ((va as u64) >= crate::user::MMAP_FLOOR as u64 && (va as u64) < mmap_next)
+            {
+                return map_page(ttbr, va).map_err(|_| "arena page alloc failed");
+            }
+            return Err("text-region access outside brk/mmap arenas");
+        }
         if in_stack(va) {
             // Demand-zero stack growth (any access; also covers EL1
             // writes like wait4's status pointer).
@@ -195,4 +205,49 @@ fn drop_region(l3: *mut u64) {
             }
         }
     }
+}
+
+/// Change permissions of present pages in [addr, addr+len):
+/// prot bits — 1=read, 2=write, 4=exec (Linux PROT_*).
+pub fn set_perms(ttbr: usize, addr: u64, len: u64, prot: u32) -> Result<(), ()> {
+    let start = addr & !0xfff;
+    let end = (addr + len + 0xfff) & !0xfff;
+    let mut va = start;
+    while va < end {
+        if let Some(pte) = walk(ttbr, va as usize) {
+            let p = unsafe { *pte };
+            if pte_present(p) {
+                let ap = if prot & 2 != 0 { AP_RW } else { AP_RO };
+                let mut np = (p & !(AP_RW | AP_RO)) | ap;
+                if prot & 4 != 0 {
+                    np &= !UXN; // executable for EL0
+                } else {
+                    np |= UXN;
+                }
+                unsafe { *pte = np };
+            }
+        }
+        va += 0x1000;
+    }
+    mmu::flush_tlb();
+    Ok(())
+}
+
+/// Free present pages in [addr, addr+len) and clear their PTEs.
+pub fn unmap(ttbr: usize, addr: u64, len: u64) -> Result<(), ()> {
+    let start = addr & !0xfff;
+    let end = (addr + len + 0xfff) & !0xfff;
+    let mut va = start;
+    while va < end {
+        if let Some(pte) = walk(ttbr, va as usize) {
+            let p = unsafe { *pte };
+            if pte_present(p) {
+                pmm::free(pte_frame(p));
+                unsafe { *pte = 0 };
+            }
+        }
+        va += 0x1000;
+    }
+    mmu::flush_tlb();
+    Ok(())
 }

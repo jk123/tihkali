@@ -41,6 +41,8 @@ pub struct OpenFile {
     pub node: usize,
     pub pos: usize,
     pub refs: u8,
+    /// Opened with O_WRONLY/O_RDWR (drives F_GETFL).
+    pub writable: bool,
 }
 
 struct FileTable(UnsafeCell<Vec<Option<OpenFile>>>);
@@ -96,7 +98,7 @@ pub fn open(path: &str, flags: u64) -> Result<usize, u8> {
             t.len() - 1
         }
     };
-    t[slot] = Some(OpenFile { node: idx, pos, refs: 1 });
+    t[slot] = Some(OpenFile { node: idx, pos, refs: 1, writable: acc != 0 });
     Ok(slot)
 }
 
@@ -208,4 +210,100 @@ pub fn release_all(targets: &[Option<FdTarget>]) {
             let _ = close(*i);
         }
     }
+}
+
+/// Pseudo-inode for an open file (stable node index + 1).
+pub fn ino(idx: usize) -> Result<usize, u8> {
+    Ok(table()[idx].as_ref().ok_or(EBADF)?.node + 1)
+}
+
+/// (is_dir, size) of an open file, for stat(2).
+pub fn meta(idx: usize) -> Result<(bool, usize), u8> {
+    let f = table()[idx].as_ref().ok_or(EBADF)?;
+    Ok((fs::is_dir(f.node), fs::data_len(f.node)))
+}
+
+/// Path of an open file (for dirfd-relative lookups).
+pub fn path_of_fd(idx: usize) -> Result<&'static str, u8> {
+    let f = table()[idx].as_ref().ok_or(EBADF)?;
+    if !fs::is_dir(f.node) {
+        return Err(ENOTDIR);
+    }
+    Ok(fs::path_of(f.node))
+}
+
+/// Whether the description was opened for writing (F_GETFL).
+pub fn is_writable(idx: usize) -> Result<bool, u8> {
+    Ok(table()[idx].as_ref().ok_or(EBADF)?.writable)
+}
+
+/// lseek(2): SEEK_SET/CUR/END; returns the new absolute position.
+pub fn lseek(idx: usize, offset: i64, whence: u32) -> Result<i64, u8> {
+    let (node, pos) = {
+        let f = table()[idx].as_ref().ok_or(EBADF)?;
+        (f.node, f.pos as i64)
+    };
+    let new = match whence {
+        0 => offset,
+        1 => pos.checked_add(offset).ok_or(EINVAL)?,
+        2 => fs::data_len(node) as i64 + offset,
+        _ => return Err(EINVAL),
+    };
+    if new < 0 {
+        return Err(EINVAL);
+    }
+    table()[idx].as_mut().unwrap().pos = new as usize;
+    Ok(new)
+}
+
+/// getdents64(2) buffer fill — Linux `struct dirent64`:
+/// {ino u64, off i64, reclen u16, d_type u8, name[]}, reclen = align8(20+namlen).
+/// Cursor semantics identical to the NetBSD getdents path.
+pub fn getdents64_to_user(idx: usize, addr: u64, len: usize) -> Result<usize, u8> {
+    let (dir, mut pos) = {
+        let f = table()[idx].as_ref().ok_or(EBADF)?;
+        if !fs::is_dir(f.node) {
+            return Err(ENOTDIR);
+        }
+        (fs::path_of(f.node), f.pos)
+    };
+
+    let list = fs::listable(dir);
+    let mut written = 0usize;
+    let mut matched = 0usize;
+    for node in list {
+        matched += 1;
+        if matched <= pos {
+            continue;
+        }
+        let path = fs::path_of(node);
+        let name = match path.rfind('/') {
+            Some(i) => &path[i + 1..],
+            None => path,
+        };
+        let namlen = name.len();
+        let reclen = (20 + namlen + 7) & !7; // header19 + name + NUL, 8-aligned
+        if written + reclen > len {
+            if written == 0 {
+                return Err(EINVAL);
+            }
+            break;
+        }
+        unsafe {
+            let rec = (addr as *mut u8).add(written);
+            rec.cast::<u64>().write_unaligned((node as u64) + 1); // d_ino
+            rec.add(8).cast::<i64>().write_unaligned(0); // d_off
+            rec.add(16).cast::<u16>().write_unaligned(reclen as u16);
+            rec.add(18).write(if fs::is_dir(node) { 4 } else { 8 }); // DT_*
+            core::ptr::copy_nonoverlapping(name.as_ptr(), rec.add(19), namlen);
+            rec.add(19 + namlen).write(0);
+            for off in (20 + namlen)..reclen {
+                rec.add(off).write(0);
+            }
+        }
+        written += reclen;
+        pos = matched;
+    }
+    table()[idx].as_mut().unwrap().pos = pos;
+    Ok(written)
 }

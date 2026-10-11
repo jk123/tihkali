@@ -74,12 +74,111 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=../linux/hello.c");
 
-    // Pack everything into a cpio newc initramfs image.
-    let motd = std::fs::read(Path::new(&dir).join("assets/motd")).expect("read motd");
-    let sh_bytes = std::fs::read(&sh).unwrap();
-    let hello_bytes = std::fs::read(&hello).unwrap();
-    let greet_bytes = std::fs::read(&greet).unwrap();
+    // Linux syscall depth probe (packed as /bin/linux-probe).
+    let probe_out = Path::new(&out).join("linux-probe");
+    let probe_src = Path::new(&dir).join("../linux/probe.c");
+    let status = Command::new(&gcc)
+        .args(["-static", "-no-pie", "-O2", "-Wl,-Ttext-segment=0x100000000", "-o"])
+        .arg(&probe_out)
+        .arg(&probe_src)
+        .status();
+    match status {
+        Ok(st) if st.success() => {}
+        Ok(_) => panic!("linux probe compile failed"),
+        Err(e) => panic!("musl gcc not runnable ({e})"),
+    }
+    println!("cargo:rerun-if-changed=../linux/probe.c");
+
+    // Alpine busybox (static ET_EXEC at 0x400000): shift all VAs into the
+    // user window. Static aarch64 code addresses everything PC-relatively
+    // (adrp/add), so only entry/phdrs and .{init,fini,preinit}_array
+    // pointers need adjusting; the binary has no relocations/dynamic section.
+    let busybox_src = Path::new(&dir).join("../.toolchain/alpine/busybox");
+    let busybox_out = Path::new(&out).join("busybox");
+    std::fs::copy(&busybox_src, &busybox_out)
+        .unwrap_or_else(|e| panic!("{} (run tools/fetch-alpine-busybox.sh)", e));
+    shift_elf_vas(&busybox_out, 0x1_0000_0000 - 0x0040_0000);
+    println!("cargo:rerun-if-changed=../.toolchain/alpine/busybox");
+
+    fn shift_elf_vas(path: &std::path::Path, delta: u64) {
+        const LO: u64 = 0x3F_0000; // original image was linked at 0x400000,
+        const HI: u64 = 0x60_0000; // pointers live in (LO..HI)
+        let mut d = std::fs::read(path).expect("read elf");
+        let et = u16::from_le_bytes([d[16], d[17]]);
+        assert_eq!(et, 2, "busybox must be ET_EXEC (relink with -no-pie)");
+        // entry point
+        let entry = u64::from_le_bytes(d[0x18..0x20].try_into().unwrap());
+        d[0x18..0x20].copy_from_slice(&(entry + delta).to_le_bytes());
+        // PT_LOAD p_vaddr/p_paddr
+        let phoff = u64::from_le_bytes(d[0x20..0x28].try_into().unwrap()) as usize;
+        let phentsz = u16::from_le_bytes([d[0x36], d[0x37]]) as usize;
+        let phnum = u16::from_le_bytes([d[0x38], d[0x39]]) as usize;
+        for i in 0..phnum {
+            let o = phoff + i * phentsz;
+            if u32::from_le_bytes(d[o..o + 4].try_into().unwrap()) != 1 {
+                continue;
+            }
+            for fo in [16usize, 24] {
+                let o2 = o + fo;
+                let v = u64::from_le_bytes(d[o2..o2 + 8].try_into().unwrap());
+                d[o2..o2 + 8].copy_from_slice(&(v + delta).to_le_bytes());
+            }
+        }
+        // Absolute pointers baked into sections (no .rela in this binary).
+        // Scan .text/.rodata/.data + init/fini/preinit arrays for u64 values
+        // inside the original image range and rebase them.
+        let shoff = u64::from_le_bytes(d[0x28..0x30].try_into().unwrap()) as usize;
+        let shentsz = u16::from_le_bytes([d[0x3a], d[0x3b]]) as usize;
+        let shnum = u16::from_le_bytes([d[0x3c], d[0x3d]]) as usize;
+        let shstrndx = u16::from_le_bytes([d[0x3e], d[0x3f]]) as usize;
+        let str_sh = shoff + shstrndx * shentsz;
+        let stroff =
+            u64::from_le_bytes(d[str_sh + 0x18..str_sh + 0x20].try_into().unwrap()) as usize;
+        let mut patched = 0u32;
+        for i in 0..shnum {
+            let sh = shoff + i * shentsz;
+            let name_off =
+                u32::from_le_bytes(d[sh..sh + 4].try_into().unwrap()) as usize + stroff;
+            let end = d[name_off..].iter().position(|&b| b == 0).unwrap() + name_off;
+            let name = std::str::from_utf8(&d[name_off..end]).unwrap_or("");
+            // Only pointer-bearing sections: scanning .text/.rodata also
+            // matches unrelated integer constants in the address range.
+            if !matches!(
+                name,
+                ".data.rel.ro" | ".got" | ".data"
+                    | ".init_array" | ".fini_array" | ".preinit_array"
+            ) {
+                continue;
+            }
+            let off = u64::from_le_bytes(d[sh + 0x18..sh + 0x20].try_into().unwrap()) as usize;
+            let sz = u64::from_le_bytes(d[sh + 0x20..sh + 0x28].try_into().unwrap()) as usize;
+            let mut k = 0;
+            while k + 8 <= sz {
+                let v = u64::from_le_bytes(d[off + k..off + k + 8].try_into().unwrap());
+                if v > LO && v < HI {
+                    d[off + k..off + k + 8].copy_from_slice(&(v + delta).to_le_bytes());
+                    patched += 1;
+                }
+                k += 8;
+            }
+        }
+        if patched == 0 {
+            panic!("busybox pointer scan found nothing to patch — layout changed?");
+        }
+        eprintln!("build.rs: busybox rebased ({patched} pointers +{delta:#x})");
+        std::fs::write(path, &d).expect("write elf");
+    }
+
+    // Read every payload once (paths resolved above).
+    let sh_bytes = std::fs::read(&sh).expect("read tihkali-sh");
+    let hello_bytes = std::fs::read(&hello).expect("read tihkali-hello");
+    let greet_bytes = std::fs::read(&greet).expect("read tihkali-greet");
     let linux_bytes = std::fs::read(&linux_out).expect("read linux-hello");
+    let probe_bytes = std::fs::read(&probe_out).expect("read linux-probe");
+    let busybox_bytes = std::fs::read(&busybox_out).expect("read busybox");
+
+    let motd = std::fs::read(Path::new(&dir).join("assets/motd")).expect("read motd");
+
     let entries: Vec<CpioEntry> = vec![
         CpioEntry::dir("."),
         CpioEntry::dir("bin"),
@@ -88,6 +187,8 @@ fn main() {
         CpioEntry::file("bin/hello", &hello_bytes),
         CpioEntry::file("bin/greet", &greet_bytes),
         CpioEntry::file("bin/linux-hello", &linux_bytes),
+        CpioEntry::file("bin/linux-probe", &probe_bytes),
+        CpioEntry::exe("bin/busybox", &busybox_bytes),
         CpioEntry::file("etc/motd", &motd),
     ];
     let image = pack_newc(&entries);
@@ -116,6 +217,9 @@ impl<'a> CpioEntry<'a> {
     }
     fn file(name: &str, data: &'a [u8]) -> Self {
         Self { name: name.into(), mode: 0o100644, data }
+    }
+    fn exe(name: &str, data: &'a [u8]) -> Self {
+        Self { name: name.into(), mode: 0o100755, data }
     }
 }
 

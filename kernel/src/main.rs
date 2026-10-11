@@ -88,15 +88,15 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
         panic!("pid0: out of memory creating address space");
     };
     arch::mmu::activate(space[0]);
-    let entry = match fs::with_bytes(sh, |elf| user::load(elf, space[0])) {
-        Ok(e) => e,
+    let (entry, image_end) = match fs::with_bytes(sh, |elf| user::load(elf, space[0])) {
+        Ok(v) => v,
         Err(msg) => panic!("pid0 load failed: {msg}"),
     };
     if user::install_trampoline(space[0]).is_err() {
         panic!("pid0: trampoline install failed");
     }
     kprintln!("user: /bin/sh ({} bytes) loaded, entry {:#x}", fs::data_len(sh), entry);
-    proc::init(entry, space);
+    proc::init(entry, image_end, space);
     kprintln!("boot: entering EL0 (pid 0)");
     user::enter(entry)
 }

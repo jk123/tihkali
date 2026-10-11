@@ -29,6 +29,10 @@ pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
 const SIGKILL: usize = 9;
 
+fn align_up(v: u64) -> u64 {
+    (v + 0xfff) & !0xfff
+}
+
 /// Signals whose default action is process termination.
 fn default_is_term(sig: usize) -> bool {
     matches!(sig, 1 | 2 | 3 | 9 | 15 | 30 | 31) // HUP INT QUIT KILL TERM USR1 USR2
@@ -62,6 +66,14 @@ pub struct Process {
     pub signaled: bool,
     /// sigprocmask block set (bit N = signal N; bit 9 never set).
     pub blocked: u64,
+    /// brk arena: [brk_start, MMAP_FLOOR) inside the text window.
+    pub brk_start: u64,
+    pub brk: u64,
+    /// mmap bump pointer (0 = unused); arena = [MMAP_FLOOR, mmap_next).
+    pub mmap_next: u64,
+    /// Dispositions were installed via the Linux ABI (signal numbers seen
+    /// by the handler must be converted back from canonical/NetBSD).
+    pub sig_linux: bool,
 }
 
 struct ProcTable(UnsafeCell<Vec<Option<Process>>>);
@@ -111,7 +123,8 @@ fn switch_ttbr(ttbr: usize) {
 
 /// Register the initial (pid 0) process before entering EL0.
 /// `tables` must already be active (`mmu::activate`).
-pub fn init(entry: usize, tables: Vec<usize>) {
+pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
+    let brk = align_up(image_end as u64);
     let t = table();
     t.clear();
     t.push(Some(Process {
@@ -136,6 +149,10 @@ pub fn init(entry: usize, tables: Vec<usize>) {
         handlers: [SIG_DFL; NSIG],
         signaled: false,
         blocked: 0,
+        brk_start: brk,
+        brk,
+        mmap_next: 0,
+        sig_linux: false,
     }));
     CURRENT.store(0, Ordering::Relaxed);
     NEXT_PID.store(1, Ordering::Relaxed);
@@ -253,9 +270,13 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
     // Inherit the fd table; share file descriptions (common offset).
     let fds = t[cur].as_ref().unwrap().fds.clone();
     // POSIX: dispositions and the signal mask inherit across fork
-    // (pending does not).
+    // (pending does not). Arenas are inherited as-is (pages are shared COW).
     let handlers = t[cur].as_ref().unwrap().handlers;
     let blocked = t[cur].as_ref().unwrap().blocked;
+    let brk_start = t[cur].as_ref().unwrap().brk_start;
+    let brk = t[cur].as_ref().unwrap().brk;
+    let mmap_next = t[cur].as_ref().unwrap().mmap_next;
+    let sig_linux = t[cur].as_ref().unwrap().sig_linux;
     for target in fds.iter().flatten() {
         if let FdTarget::File(i) = target {
             file::dup(*i);
@@ -275,6 +296,10 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         handlers,
         signaled: false,
         blocked,
+        brk_start,
+        brk,
+        mmap_next,
+        sig_linux,
     });
     kprintln!("proc: fork pid {} (parent {})", pid, t[cur].as_ref().unwrap().pid);
     Ok(pid)
@@ -471,8 +496,8 @@ pub fn sys_execve(frame: &mut TrapFrame, path_ptr: u64, argv_ptr: u64) -> Result
     // (stack writes demand-page via the fault handler).
     switch_ttbr(new_tables[0]);
     let loaded = crate::fs::with_bytes(fs_idx, |elf| crate::user::load(elf, new_tables[0]));
-    let entry = match loaded {
-        Ok(e) => e,
+    let (entry, image_end) = match loaded {
+        Ok(v) => v,
         Err(msg) => {
             kprintln!("exec: load failed: {msg}");
             switch_ttbr(old_tables[0]);
@@ -502,6 +527,11 @@ pub fn sys_execve(frame: &mut TrapFrame, path_ptr: u64, argv_ptr: u64) -> Result
         // POSIX: caught dispositions reset to DFL across exec; pending cleared.
         p.handlers = [SIG_DFL; NSIG];
         p.pending = 0;
+        p.sig_linux = false;
+        let brk = align_up(image_end as u64);
+        p.brk_start = brk;
+        p.brk = brk;
+        p.mmap_next = 0;
     }
     frame.elr = entry as u64;
     frame.spsr = 0; // EL0t, interrupts on
@@ -572,7 +602,7 @@ pub enum Io {
     Slept,     // blocked; skip the syscall epilogue
 }
 
-fn current_target(fd: usize) -> Option<FdTarget> {
+pub fn current_target(fd: usize) -> Option<FdTarget> {
     let t = table();
     let cur = CURRENT.load(Ordering::Relaxed);
     t[cur].as_ref().and_then(|p| p.fds.get(fd).copied().flatten())
@@ -704,6 +734,18 @@ pub fn sys_getdents(fd: usize, buf: u64, len: usize) -> Result<usize, u8> {
         return Err(EFAULT);
     }
     file::getdents_to_user(i, buf, len)
+}
+
+/// Linux getdents64(61).
+pub fn sys_getdents64(fd: usize, buf: u64, len: usize) -> Result<usize, u8> {
+    let Some(FdTarget::File(i)) = current_target(fd) else { return Err(EBADF) };
+    if len == 0 {
+        return Ok(0);
+    }
+    if !user_range_ok(buf, len) {
+        return Err(EFAULT);
+    }
+    file::getdents64_to_user(i, buf, len)
 }
 
 /// SYS_close(fd).
@@ -881,6 +923,44 @@ pub fn deliver_signals(frame: &mut TrapFrame) {
     }
 }
 
+// ---------- signal-number ABI mapping (canonical = NetBSD) ----------
+
+/// Linux signo -> canonical (NetBSD) index; None = unsupported.
+pub fn sig_from_user(sig: i64, linux: bool) -> Option<usize> {
+    if !linux {
+        return if (1..NSIG as i64).contains(&sig) { Some(sig as usize) } else { None };
+    }
+    let c = match sig {
+        10 => 30, // USR1
+        12 => 31, // USR2
+        17 => 20, // CHLD
+        s if (1..NSIG as i64).contains(&s) => s as _,
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// canonical -> Linux signo (for handler entry / oldact results).
+pub fn sig_to_user(canonical: usize, linux: bool) -> i64 {
+    if !linux {
+        return canonical as i64;
+    }
+    match canonical {
+        30 => 10,
+        31 => 12,
+        20 => 17,
+        s => s as i64,
+    }
+}
+
+/// Record that the process talks the Linux signal ABI (set by rt_sigaction).
+pub fn note_signal_abi(linux: bool) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if let Some(p) = table()[cur].as_mut() {
+        p.sig_linux = linux;
+    }
+}
+
 /// Push the interrupted context onto the user stack and enter the handler:
 /// x0 = signal, x30 = sigreturn trampoline, fresh EL0 context.
 fn install_handler_frame(frame: &mut TrapFrame, sig: usize, handler: usize) {
@@ -904,10 +984,11 @@ fn install_handler_frame(frame: &mut TrapFrame, sig: usize, handler: usize) {
         dst.add(32).write_volatile(frame.spsr);
     }
     write_sp_el0(new_sp as u64);
+    let linux_abi = table()[cur].as_mut().unwrap().sig_linux;
     table()[cur].as_mut().unwrap().pending &= !(1 << sig);
 
     let mut x = [0u64; 31];
-    x[0] = sig as u64;
+    x[0] = sig_to_user(sig, linux_abi) as u64;
     x[30] = crate::user::TRAMPOLINE as u64;
     *frame = TrapFrame {
         x,
@@ -915,4 +996,77 @@ fn install_handler_frame(frame: &mut TrapFrame, sig: usize, handler: usize) {
         spsr: 0, // EL0t, interrupts enabled in the handler
         esr: 0,
     };
+}
+
+// ---------- brk / mmap (Linux ABI arenas) ----------
+
+/// (brk, mmap_next) of the running process — consulted by the page-fault
+/// handler to demand-map arena growth in the text window.
+pub fn current_arenas() -> (u64, u64) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_ref().expect("no current process");
+    (p.brk, p.mmap_next)
+}
+
+/// Linux brk(214): x0 == 0 queries; otherwise request a new break inside
+/// [brk_start, MMAP_FLOOR). Returns the current break on refusal.
+pub fn sys_brk(addr: u64) -> u64 {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().unwrap();
+    if addr == 0 {
+        return p.brk;
+    }
+    let ok = addr >= p.brk_start && addr <= user::MMAP_FLOOR as u64;
+    tihkali_hal::kprintln!("sys_brk: req={addr:#x} start={:#x} floor={:#x} ok={ok}", p.brk_start, user::MMAP_FLOOR);
+    if ok {
+        p.brk = addr;
+    }
+    p.brk
+}
+
+/// Linux mmap(222): anonymous bumps only (v1) — returns the arena base;
+/// pages materialize on first touch via the fault handler.
+pub fn sys_mmap(len: u64) -> Result<u64, u8> {
+    let pages = len.checked_add(0xfff).map(|v| v & !0xfff).ok_or(EINVAL)?;
+    if pages == 0 {
+        return Err(EINVAL);
+    }
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().unwrap();
+    let base = if p.mmap_next == 0 {
+        user::MMAP_FLOOR as u64
+    } else {
+        p.mmap_next
+    };
+    let end = base + pages;
+    if end > user::USER_TEXT_LIMIT as u64 {
+        return Err(ENOMEM);
+    }
+    p.mmap_next = end;
+    Ok(base)
+}
+
+/// Linux munmap(215): drop present pages in [addr, addr+len) of the text
+/// window; the arena bump pointer is not shrunk (v1).
+pub fn sys_munmap(addr: u64, len: u64) -> Result<(), u8> {
+    if addr % 4096 != 0 || len == 0 {
+        return Err(EINVAL);
+    }
+    let ttbr: usize;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
+    }
+    vm::unmap(ttbr, addr, len).map_err(|_| EINVAL)
+}
+
+/// Linux mprotect(226): adjust perms of present pages in the range.
+pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> Result<(), u8> {
+    if addr % 4096 != 0 || len == 0 {
+        return Err(EINVAL);
+    }
+    let ttbr: usize;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
+    }
+    vm::set_perms(ttbr, addr, len, prot as u32).map_err(|_| EINVAL)
 }
