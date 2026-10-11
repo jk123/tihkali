@@ -67,9 +67,16 @@ pub extern "C" fn rust_sync_handler(frame: &mut TrapFrame) {
     crate::proc::deliver_signals(frame);
 }
 
-/// NetBSD aarch64: syscall number in the SVC immediate (ESR ISS).
+/// Split the two syscall ABIs sharing `svc`:
+///   Linux   = svc #0 with the number in x8   → linux_abi::svc
+///   NetBSD  = svc #NR (NR never 0)           → immediate dispatch below
 fn svc_dispatch(frame: &mut TrapFrame) {
-    let nr = frame.esr & 0xffff;
+    let imm = frame.esr & 0xffff;
+    if imm == 0 {
+        crate::linux_abi::svc(frame);
+        return;
+    }
+    let nr = imm;
     let (result, err): (i64, u8) = match nr {
         1 => {
             // SYS_exit(code)

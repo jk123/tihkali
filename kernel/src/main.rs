@@ -10,6 +10,7 @@ mod cpio;
 mod file;
 mod fs;
 mod kmem;
+mod linux_abi;
 mod mm;
 mod proc;
 mod tty;

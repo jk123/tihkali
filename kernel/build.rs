@@ -43,11 +43,36 @@ fn main() {
     println!("cargo:rustc-env=TIHKALI_USER_GREET={}", greet.display());
     println!("cargo:rustc-env=TIHKALI_USER_SHELL={}", sh.display());
 
+    // Linux-personality test binary (static musl, linked into the 4 GiB
+    // user window; needs tools/fetch-linux-toolchain.sh once).
+    let gcc = Path::new(&dir)
+        .join("../.toolchain/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc");
+    let linux_out = Path::new(&out).join("linux-hello");
+    let src = Path::new(&dir).join("../linux/hello.c");
+    let status = Command::new(&gcc)
+        .args([
+            "-static",
+            "-no-pie",
+            "-O2",
+            "-Wl,-Ttext-segment=0x100000000",
+            "-o",
+        ])
+        .arg(&linux_out)
+        .arg(&src)
+        .status();
+    match status {
+        Ok(st) if st.success() => {}
+        Ok(_) => panic!("linux hello compile failed (run tools/fetch-linux-toolchain.sh)"),
+        Err(e) => panic!("musl gcc not runnable ({e}); run tools/fetch-linux-toolchain.sh"),
+    }
+    println!("cargo:rerun-if-changed=../linux/hello.c");
+
     // Pack everything into a cpio newc initramfs image.
     let motd = std::fs::read(Path::new(&dir).join("assets/motd")).expect("read motd");
     let sh_bytes = std::fs::read(&sh).unwrap();
     let hello_bytes = std::fs::read(&hello).unwrap();
     let greet_bytes = std::fs::read(&greet).unwrap();
+    let linux_bytes = std::fs::read(&linux_out).expect("read linux-hello");
     let entries: Vec<CpioEntry> = vec![
         CpioEntry::dir("."),
         CpioEntry::dir("bin"),
@@ -55,6 +80,7 @@ fn main() {
         CpioEntry::file("bin/sh", &sh_bytes),
         CpioEntry::file("bin/hello", &hello_bytes),
         CpioEntry::file("bin/greet", &greet_bytes),
+        CpioEntry::file("bin/linux-hello", &linux_bytes),
         CpioEntry::file("etc/motd", &motd),
     ];
     let image = pack_newc(&entries);

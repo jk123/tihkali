@@ -512,14 +512,25 @@ pub fn sys_execve(frame: &mut TrapFrame, path_ptr: u64, argv_ptr: u64) -> Result
     Ok(())
 }
 
-/// Lay out argv strings + NULL-terminated pointer array at the top of the
-/// user stack region. Returns (argc, argv_ptr, initial_sp).
+/// Lay out the user stack head for BOTH ABIs:
+///   sp -> argc, argv[0..argc-1], NULL, NULL (empty envp),
+///         auxv {AT_PAGESZ, AT_RANDOM}, {0,0}, then argv strings above.
+/// NetBSD-style entry uses registers (x0=argc, x1=argv); musl's aarch64
+/// crt reads argc/argv/envp/auxv straight off the stack.
 fn place_argv(args: &[Vec<u8>]) -> Option<(u64, u64, u64)> {
     if args.len() > 16 {
         return None;
     }
     let mut cursor: u64 = user::USER_LIMIT as u64;
     let mut ptrs = [0u64; 17];
+    // Strings plus 16 AT_RANDOM canary bytes at the very top.
+    cursor -= 16;
+    let random_ptr = cursor;
+    unsafe {
+        for i in 0..16u64 {
+            *((cursor + i) as *mut u8) = 0x5a;
+        }
+    }
     for (i, a) in args.iter().enumerate() {
         cursor = cursor.checked_sub(a.len() as u64 + 1)?;
         unsafe {
@@ -528,16 +539,29 @@ fn place_argv(args: &[Vec<u8>]) -> Option<(u64, u64, u64)> {
         }
         ptrs[i] = cursor;
     }
-    let arr_len = 8 * (args.len() + 1);
-    cursor = cursor.checked_sub(arr_len as u64)?;
-    cursor &= !0xfu64; // 16-byte stack alignment
+
+    let argc = args.len() as u64;
+    // slots: argc + argv ptrs + argv NULL + envp NULL + 3 auxv pairs
+    let slots = argc as usize + 9;
+    let raw = cursor.checked_sub((slots * 8) as u64)?;
+    let base = raw & !0xfu64; // 16-byte stack alignment
     unsafe {
-        let base = cursor as *mut u64;
-        for i in 0..=args.len() {
-            base.add(i).write_volatile(ptrs[i]);
+        let p = base as *mut u64;
+        p.add(0).write_volatile(argc);
+        for i in 0..argc as usize {
+            p.add(1 + i).write_volatile(ptrs[i]);
         }
+        p.add(1 + argc as usize).write_volatile(0); // argv NULL
+        p.add(2 + argc as usize).write_volatile(0); // envp NULL
+        p.add(3 + argc as usize).write_volatile(6); // AT_PAGESZ
+        p.add(4 + argc as usize).write_volatile(4096);
+        p.add(5 + argc as usize).write_volatile(25); // AT_RANDOM
+        p.add(6 + argc as usize).write_volatile(random_ptr);
+        p.add(7 + argc as usize).write_volatile(0); // AT_NULL
+        p.add(8 + argc as usize).write_volatile(0);
     }
-    Some((args.len() as u64, cursor, cursor))
+    let argv = base + 8;
+    Some((argc, argv, base))
 }
 
 // ---------- file-descriptor I/O ----------

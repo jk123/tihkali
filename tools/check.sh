@@ -46,6 +46,11 @@ if [ -f target/initramfs.img ]; then
 else
     fail "initramfs.img missing"
 fi
+if [ -x .toolchain/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc ]; then
+    pass "musl cross toolchain present"
+else
+    fail "musl toolchain missing (run tools/fetch-linux-toolchain.sh)"
+fi
 
 echo "== session 1: fs ops + write-back"
 S1="$T/s1.log"
@@ -108,6 +113,18 @@ gate_has "s4: fs served"         "$S4" 'Welcome to tihkali'
 gate_has "s4: sh listed"         "$S4" '^sh'
 gate_has "s4: clean exit"        "$S4" 'proc: pid 0 exited \(0\)'
 gate_bad  "s4" "$S4"
+
+echo "== session 5: Linux ABI personality"
+S5="$T/s5.log"
+( sleep 1.5
+  printf 'linux-hello\n'
+  sleep 2.0
+  printf 'exit\n'
+) | timeout 12 ./tools/run.sh >"$S5" 2>&1
+gate_has "s5: linux binary ran"  "$S5" 'hello from linux/musl \(EL0 via Linux ABI\)'
+gate_has "s5: exit code via wait4" "$S5" 'sh: linux-hello exited 42'
+gate_has "s5: clean exit"         "$S5" 'proc: pid 0 exited \(0\)'
+gate_bad  "s5" "$S5"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

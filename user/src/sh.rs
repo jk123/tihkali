@@ -435,7 +435,7 @@ pub extern "C" fn _start() -> ! {
     let mut line = [0u8; 64];
     let mut buf = [0u8; 20];
     let mut bg: [i64; 4] = [0; 4]; // background job slots
-    unsafe { write(1, "tihkali sh — try: ls, save, sync, trap, sigblock, kill, jobs, greet &, exit\n") };
+    unsafe { write(1, "tihkali sh — try: ls, sync, trap, kill, greet &, linux-hello, exit\n") };
 
     loop {
         // Reap finished background jobs (WNOHANG) before the prompt.
@@ -724,7 +724,7 @@ pub extern "C" fn _start() -> ! {
                 }
                 unsafe { close(fd) };
             }
-            "greet" | "hello" => {
+            "greet" | "hello" | "linux-hello" => {
                 let mut path = [0u8; 32];
                 path[..5].copy_from_slice(b"/bin/");
                 let cl = cmd.len();
