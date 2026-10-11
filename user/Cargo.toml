@@ -1,0 +1,17 @@
+[package]
+name = "tihkali-user"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tihkali-hello"
+path = "src/main.rs"
+
+[[bin]]
+name = "tihkali-greet"
+path = "src/greet.rs"
+
+[[bin]]
+name = "tihkali-sh"
+path = "src/sh.rs"

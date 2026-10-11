@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["hal", "kernel", "user"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

@@ -1,0 +1,12 @@
+[package]
+name = "tihkali-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tihkali"
+path = "src/main.rs"
+
+[dependencies]
+tihkali-hal = { path = "../hal" }
