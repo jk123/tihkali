@@ -135,13 +135,15 @@ echo "== session 6: Raspberry Pi 3 (raspi3b, embedded initramfs)"
 S6="$T/s6.log"
 ( sleep 3
   printf 'ls /bin\n';    sleep 0.6
+  printf 'busybox sleep 0.5\n'; sleep 1.4
   printf 'greet\n';      sleep 1.5
   printf 'exit\n'
 ) | timeout 15 ./tools/run.sh --rpi >"$S6" 2>&1
 gate_has "s6: booted on raspi3b"     "$S6" 'entered at EL'
 gate_has "s6: no-GIC dispatcher"     "$S6" 'BCM283x poll dispatcher'
 gate_has "s6: fallback initramfs"    "$S6" 'no device in 32 MMIO slots'
-gate_has "s6: timer ticks"           "$S6" '\[irq\] tick'
+gate_has "s6: timer armed"           "$S6" 'timer: 100 Hz'
+gate_has "s6: timer IRQ woke sleep"  "$S6" 'sh: busybox exited 0'
 gate_has "s6: shell listed ls"       "$S6" 'linux-hello'
 gate_has "s6: fork/exec on Pi"       "$S6" 'sh: greet exited 5'
 gate_has "s6: clean exit"            "$S6" 'proc: pid 0 exited \(0\)'

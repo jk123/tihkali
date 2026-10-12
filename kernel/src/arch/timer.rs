@@ -64,16 +64,8 @@ pub fn hz() -> u64 {
 
 /// Called from the IRQ handler in interrupt context.
 pub fn on_tick() {
-    let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = TICKS.fetch_add(1, Ordering::Relaxed);
     // Re-arm first so the level-triggered PPI deasserts before EOI.
     let interval = unsafe { INTERVAL_TICKS };
     set_tval(interval);
-
-    let freq = unsafe { FREQ_HZ };
-    let hz = freq / interval; // effective tick rate (rounds down)
-    if n <= 5 || n % (hz * 5) == 0 {
-        let sec = n / hz;
-        let frac = (n % hz) * 100 / hz;
-        kprintln!("[irq] tick {n:>4}  uptime {sec:>2}.{frac:02}s");
-    }
 }
