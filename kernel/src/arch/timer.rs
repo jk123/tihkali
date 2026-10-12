@@ -45,6 +45,12 @@ pub fn now() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Seconds since the fake epoch (matches clock_gettime's REALTIME base),
+/// used for file mtimes.
+pub fn unix_secs() -> i64 {
+    1_700_000_000 + (now() / hz().max(1)) as i64
+}
+
 /// Effective tick rate set by `init`.
 pub fn hz() -> u64 {
     let freq = unsafe { FREQ_HZ };

@@ -200,6 +200,7 @@ fn main() {
         "cat", "ls", "echo", "head", "tail", "wc", "grep", "sleep", "mkdir", "rm", "rmdir",
         "touch", "cp", "mv", "ln", "pwd", "which", "true", "false", "sort", "seq", "date",
         "uname", "id", "env", "basename", "dirname", "[", "test", "printf", "unzip", "tar",
+        "chmod", "stat", "truncate", "readlink",
     ] {
         entries.push(CpioEntry::symlink(&format!("bin/{applet}"), "busybox"));
     }
@@ -240,15 +241,19 @@ impl<'a> CpioEntry<'a> {
 
 /// cpio "newc": 110-byte header, ASCII hex big-endian fields, name NUL-
 /// terminated, name+header padded to 4, data padded to 4.
+/// Fixed boot-image timestamp (2026-10-12 UTC) so ls -l shows a sane
+/// date for packed files; runtime writes use the kernel clock.
+const BOOT_MTIME: i64 = 1_791_763_200;
+
 fn pack_newc(entries: &[CpioEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut ino = 1u32;
     for e in entries {
-        write_newc(&mut out, ino, e.mode, &e.name, e.data);
+        write_newc(&mut out, ino, e.mode, &e.name, e.data, BOOT_MTIME);
         ino += 1;
     }
     // Trailer.
-    write_newc(&mut out, 0, 0, "TRAILER!!!", &[]);
+    write_newc(&mut out, 0, 0, "TRAILER!!!", &[], 0);
     while out.len() % 512 != 0 {
         out.push(0);
     }
@@ -259,7 +264,7 @@ fn pack_newc(entries: &[CpioEntry]) -> Vec<u8> {
     out
 }
 
-fn write_newc(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8]) {
+fn write_newc(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8], mtime: i64) {
     let name_bytes = name.as_bytes();
     let namesize = name_bytes.len() + 1; // includes NUL
     let mut hdr = String::with_capacity(110);
@@ -270,7 +275,7 @@ fn write_newc(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8]) {
         0, // uid
         0, // gid
         1, // nlink
-        0, // mtime
+        mtime as u32,
         data.len() as u32,
         0, // devmajor
         0, // devminor

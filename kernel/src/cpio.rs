@@ -8,6 +8,8 @@ pub struct RawEntry {
     pub mode: u32,
     pub data_off: usize,
     pub data_len: usize,
+    /// newc header mtime (unix seconds).
+    pub mtime: i64,
 }
 
 fn hex8(img: &[u8], off: usize) -> Option<u32> {
@@ -33,6 +35,7 @@ pub fn parse(img: &[u8]) -> Vec<RawEntry> {
             panic!("cpio: bad magic at {pos:#x}");
         }
         let mode = hex8(img, pos + 14).expect("cpio: mode");
+        let mtime = hex8(img, pos + 46).expect("cpio: mtime") as i64;
         let filesize = hex8(img, pos + 54).expect("cpio: filesize") as usize;
         let namesize = hex8(img, pos + 94).expect("cpio: namesize") as usize;
         if namesize == 0 || pos + 110 + namesize > img.len() {
@@ -58,7 +61,13 @@ pub fn parse(img: &[u8]) -> Vec<RawEntry> {
             p.push_str(name);
             p
         };
-        out.push(RawEntry { path, mode, data_off, data_len: filesize });
+        out.push(RawEntry {
+            path,
+            mode,
+            data_off,
+            data_len: filesize,
+            mtime,
+        });
         pos = align4(data_off + filesize);
     }
     out

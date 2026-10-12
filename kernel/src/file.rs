@@ -298,15 +298,17 @@ pub fn release_all(targets: &[Option<FdTarget>]) {
     }
 }
 
-/// Pseudo-inode for an open file (stable node index + 1).
-pub fn ino(idx: usize) -> Result<usize, u8> {
-    Ok(table()[idx].as_ref().ok_or(EBADF)?.node + 1)
+/// Fs node index behind an open file (for stat/chmod/ftruncate).
+pub fn node_of(idx: usize) -> Result<usize, u8> {
+    Ok(table()[idx].as_ref().ok_or(EBADF)?.node)
 }
 
-/// (is_dir, size) of an open file, for stat(2).
-pub fn meta(idx: usize) -> Result<(bool, usize), u8> {
-    let f = table()[idx].as_ref().ok_or(EBADF)?;
-    Ok((fs::is_dir(f.node), fs::data_len(f.node)))
+/// Fs node behind an open *fd* (resolves the process fd table first).
+pub fn node_of_fd(fd: usize) -> Result<usize, u8> {
+    match crate::proc::current_target(fd) {
+        Some(FdTarget::File(i)) => node_of(i),
+        _ => Err(EBADF),
+    }
 }
 
 /// Path of an open file (for dirfd-relative lookups).

@@ -2,6 +2,7 @@
  * through musl wrappers. Exit code = number of failed checks (0 = pass). */
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -237,6 +238,60 @@ int main(void) {
     kill(getpid(), SIGUSR1);
     OK(hcnt == 2, "re-kill delivered after handler returns");
     OK(!hnested, "same signal blocked during handler (no nesting)");
+
+    /* --- M19b: writable FS depth — mode/mtime/rename/truncate/symlink --- */
+    /* A prior run's fsync persists state to the boot image; clear leftovers
+     * (ignore errors) so the test is idempotent across boots. */
+    rmdir("/pdir");
+    unlink("/pf"); unlink("/pg"); unlink("/plnk");
+    OK(mkdir("/pdir", 0700) == 0, "mkdir 0700");
+    struct stat ms;
+    OK(stat("/pdir", &ms) == 0 && S_ISDIR(ms.st_mode) && (ms.st_mode & 0777) == 0700,
+       "mkdir mode persisted");
+
+    int fdw = open("/pf", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    OK(fdw >= 0, "create /pf");
+    OK(write(fdw, "012345678", 9) == 9, "write 9 bytes");
+    OK(chmod("/pf", 0600) == 0, "chmod 0600");
+    OK(fstat(fdw, &ms) == 0 && (ms.st_mode & 0777) == 0600, "chmod visible in fstat");
+
+    /* rename: old path gone, open fd keeps working (stable node index) */
+    OK(rename("/pf", "/pg") == 0, "rename");
+    OK(open("/pf", O_RDONLY) == -1 && errno == ENOENT, "old path ENOENT");
+    OK(lseek(fdw, 0, SEEK_END) == 9, "fd offset survives rename");
+    OK(write(fdw, "X", 1) == 1, "write after rename");
+
+    /* ftruncate: shrink, grow, zero-fill */
+    OK(ftruncate(fdw, 4) == 0, "ftruncate shrink");
+    OK(fstat(fdw, &ms) == 0 && ms.st_size == 4, "size after shrink");
+    OK(ftruncate(fdw, 100) == 0, "ftruncate grow");
+    OK(fstat(fdw, &ms) == 0 && ms.st_size == 100, "size after grow");
+    OK(lseek(fdw, 50, SEEK_SET) == 50 && read(fdw, b, 1) == 1 && b[0] == 0,
+       "ftruncate zero-fill");
+
+    /* utimensat: mtime = 2000-01-01 00:00:00 UTC (atime slot ignored v1) */
+    struct timespec ts[2] = { {0, 0}, {946684800, 0} };
+    OK(utimensat(AT_FDCWD, "/pg", ts, 0) == 0, "utimensat explicit");
+    OK(fstat(fdw, &ms) == 0 && ms.st_mtime == 946684800, "st_mtime set");
+
+    OK(fsync(fdw) == 0, "fsync");
+    close(fdw);
+
+    /* symlink + readlink + lstat vs stat */
+    OK(symlink("/etc/motd", "/plnk") == 0, "symlink");
+    char rl[64];
+    n = readlink("/plnk", rl, sizeof(rl) - 1);
+    OK(n == 9 && memcmp(rl, "/etc/motd", 9) == 0, "readlink target");
+    OK(lstat("/plnk", &ms) == 0 && S_ISLNK(ms.st_mode) && ms.st_size == 9,
+       "lstat sees the link");
+    OK(stat("/plnk", &ms) == 0 && S_ISREG(ms.st_mode), "stat follows the link");
+
+    /* cleanup — final sync leaves the boot image clean for the next run */
+    OK(unlink("/pg") == 0, "unlink");
+    OK(unlink("/plnk") == 0, "unlink symlink");
+    OK(rmdir("/pdir") == 0, "rmdir");
+    unlink("/probe"); /* the open/write section's fixture */
+    sync();
 
     if (!fails) {
         static const char ok[] = "linux-probe: all ok\n";

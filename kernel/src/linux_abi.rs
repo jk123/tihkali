@@ -11,6 +11,7 @@ use tihkali_hal::kprintln;
 
 use crate::arch::trap::TrapFrame;
 use crate::file::{self, FdTarget};
+use crate::fs;
 use crate::proc::{self, Io};
 
 const AT_FDCWD: i64 = -100;
@@ -102,7 +103,7 @@ pub fn svc(frame: &mut TrapFrame) {
             Ok(()) => (0, 0),
             Err(e) => (0, e),
         },
-        79 => newfstatat(frame.x[0] as i64, frame.x[1], frame.x[2]),
+        79 => newfstatat(frame.x[0] as i64, frame.x[1], frame.x[2], frame.x[3]),
         61 => match proc::sys_getdents64(frame.x[0] as usize, frame.x[1], frame.x[2] as usize) {
             Ok(n) => (n as i64, 0),
             Err(e) => (0, e),
@@ -226,6 +227,137 @@ pub fn svc(frame: &mut TrapFrame) {
             Ok(pid) => (pid as i64, 0),
             Err(e) => (0, e),
         },
+        34 => {
+            // mkdirat(dirfd, path, mode)
+            match resolve_path(frame.x[0] as i64, read_cstr(frame.x[1])) {
+                Err(e) => (0, e),
+                Ok(path) => match fs::create_dir(&path) {
+                    Ok(idx) => {
+                        let _ = fs::set_mode(idx, (frame.x[2] as u16) & 0o7777);
+                        (0, 0)
+                    }
+                    Err(e) => (0, e),
+                },
+            }
+        }
+        35 => {
+            // unlinkat(dirfd, path, flags): AT_REMOVEDIR selects rmdir
+            match resolve_path(frame.x[0] as i64, read_cstr(frame.x[1])) {
+                Err(e) => (0, e),
+                Ok(path) => {
+                    let r = if frame.x[2] & 0x200 != 0 {
+                        fs::remove_dir(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                    match r {
+                        Ok(()) => (0, 0),
+                        Err(e) => (0, e),
+                    }
+                }
+            }
+        }
+        36 => symlinkat_arm(frame.x[0], frame.x[1] as i64, frame.x[2]),
+        38 => renameat_arm(frame.x[0] as i64, frame.x[1], frame.x[2] as i64, frame.x[3]),
+        276 => {
+            // renameat2: RENAME_NOREPLACE/RENAME_EXCHANGE unsupported v1
+            if frame.x[4] != 0 {
+                (0, 22)
+            } else {
+                renameat_arm(
+                    frame.x[0] as i64,
+                    frame.x[1],
+                    frame.x[2] as i64,
+                    frame.x[3],
+                )
+            }
+        }
+        45 => {
+            // truncate(path, len)
+            match resolve_path(AT_FDCWD, read_cstr(frame.x[0])) {
+                Err(e) => (0, e),
+                Ok(path) => match fs::lookup(&path) {
+                    None => (0, 2),
+                    Some(idx) => match fs::set_len(idx, frame.x[1] as usize) {
+                        Ok(()) => (0, 0),
+                        Err(e) => (0, e),
+                    },
+                },
+            }
+        }
+        46 => {
+            // ftruncate(fd, len)
+            match file::node_of_fd(frame.x[0] as usize) {
+                Err(e) => (0, e),
+                Ok(node) => match fs::set_len(node, frame.x[1] as usize) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (0, e),
+                },
+            }
+        }
+        52 => {
+            // fchmod(fd, mode)
+            match file::node_of_fd(frame.x[0] as usize) {
+                Err(e) => (0, e),
+                Ok(node) => match fs::set_mode(node, frame.x[1] as u16) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (0, e),
+                },
+            }
+        }
+        53 => {
+            // fchmodat(dirfd, path, mode, flags)
+            match resolve_path(frame.x[0] as i64, read_cstr(frame.x[1])) {
+                Err(e) => (0, e),
+                Ok(path) => match fs::lookup(&path) {
+                    None => (0, 2),
+                    Some(idx) => match fs::set_mode(idx, frame.x[2] as u16) {
+                        Ok(()) => (0, 0),
+                        Err(e) => (0, e),
+                    },
+                },
+            }
+        }
+        78 => readlinkat_arm(frame.x[0] as i64, frame.x[1], frame.x[2], frame.x[3]),
+        81 => {
+            // sync: v1 flushes the whole image
+            match proc::sys_sync() {
+                Ok(()) => (0, 0),
+                Err(e) => (0, e),
+            }
+        }
+        82 | 83 => {
+            // fsync/fdatasync: v1 syncs the whole image
+            if proc::current_target(frame.x[0] as usize).is_none() {
+                (0, 9) // EBADF
+            } else {
+                match proc::sys_sync() {
+                    Ok(()) => (0, 0),
+                    Err(e) => (0, e),
+                }
+            }
+        }
+        48 => {
+            // faccessat(dirfd, path, mode): single-user root — R/W always
+            // allowed on existing nodes; X_OK needs an execute bit (POSIX
+            // exempts only dirs from that). access() follows symlinks.
+            match resolve_path(frame.x[0] as i64, read_cstr(frame.x[1])) {
+                Err(e) => (0, e),
+                Ok(path) => match fs::lookup(&path) {
+                    None => (0, 2), // ENOENT
+                    Some(i) => {
+                        let want = frame.x[2] as u32;
+                        let x_ok = fs::is_dir(i) || fs::perms(i) & 0o111 != 0;
+                        if want & 1 != 0 && !x_ok {
+                            (0, 13) // X_OK denied
+                        } else {
+                            (0, 0)
+                        }
+                    }
+                },
+            }
+        }
+        88 => utimensat(frame.x[0] as i64, frame.x[1], frame.x[2]),
         // Identity: single-user root. Observed from ash/musl startup.
         144 => (0, 0), // setgid
         146 => (0, 0), // setuid
@@ -538,44 +670,213 @@ fn writev(fd: usize, iov: u64, cnt: usize) -> (i64, u8) {
     (total, 0)
 }
 
-/// Fill the asm-generic `struct stat` (128 bytes) at a user address.
-fn write_linux_stat(addr: u64, mode: u32, size: u64, ino: u64) -> Result<(), u8> {
+/// Fill musl-aarch64 `struct stat` at a user address. Offsets verified
+/// against the toolchain's bits/stat.h: size@48, blksize@56, blocks@72,
+/// atime@80, mtime@96, ctime@112 (v1: all three times = mtime).
+fn write_linux_stat(addr: u64, mode: u32, size: u64, ino: u64, mtime: i64) -> Result<(), u8> {
     if !proc::user_range_ok(addr, 128) {
         return Err(14);
     }
     unsafe {
         let p = addr as *mut u8;
         core::ptr::write_bytes(p, 0, 128);
+        // Offsets measured from musl aarch64 (gcc offsetof): dev@0 ino@8
+        // mode@16 nlink@20 rdev@32 size@48 blksize@56 blocks@64
+        // atim@72 mtim@88 ctim@104, sizeof 128. tv_sec slots get mtime,
+        // tv_nsec stays 0.
         (p as *mut u64).add(0).write_unaligned(1); // st_dev
         (p as *mut u64).add(1).write_unaligned(ino);
         (p as *mut u32).add(4).write_unaligned(mode); // @16
         (p as *mut u32).add(5).write_unaligned(1); // nlink @20
-        (p as *mut i64).add(6).write_unaligned(size as i64); // @48
-        (p as *mut i32).add(14).write_unaligned(4096); // blksize @56
-        (p as *mut i64).add(8).write_unaligned(((size + 511) / 512) as i64); // @64
+        (p as *mut i64).add(6).write_unaligned(size as i64); // size @48
+        (p as *mut i64).add(7).write_unaligned(4096); // blksize @56
+        (p as *mut i64).add(8).write_unaligned(((size + 511) / 512) as i64); // blocks @64
+        (p as *mut i64).add(9).write_unaligned(mtime); // atim.tv_sec @72
+        (p as *mut i64).add(11).write_unaligned(mtime); // mtim.tv_sec @88
+        (p as *mut i64).add(13).write_unaligned(mtime); // ctim.tv_sec @104
     }
     Ok(())
 }
 
-/// S_IFCHR|0666, S_IFREG|0644, S_IFDIR|0755
+/// S_IFCHR|0666 (tty fds).
 const MODE_CHR: u32 = 0x21B6;
-const MODE_REG: u32 = 0x81A4;
-const MODE_DIR: u32 = 0x41ED;
+
+/// stat by node index: type|perms, size, ino (= node+1), mtime.
+fn stat_node(idx: usize, buf: u64) -> Result<(), u8> {
+    let mode = if fs::is_symlink(idx) {
+        0o120777 // S_IFLNK | 0777
+    } else if fs::is_dir(idx) {
+        0o40000 | fs::perms(idx) as u32
+    } else {
+        0o100000 | fs::perms(idx) as u32
+    };
+    write_linux_stat(
+        buf,
+        mode,
+        fs::data_len(idx) as u64,
+        (idx + 1) as u64,
+        fs::mtime_of(idx),
+    )
+}
 
 fn fstat_fd(fd: usize, buf: u64) -> Result<(), u8> {
     match proc::current_target(fd) {
         None => Err(file::EBADF),
         Some(FdTarget::File(i)) => {
-            let (is_dir, size) = file::meta(i)?;
-            let mode = if is_dir { MODE_DIR } else { MODE_REG };
-            let ino = file::ino(i)?;
-            write_linux_stat(buf, mode, size as u64, ino as u64)
+            let node = file::node_of(i)?;
+            stat_node(node, buf)
         }
-        Some(_) => write_linux_stat(buf, MODE_CHR, 0, 1),
+        Some(_) => write_linux_stat(buf, MODE_CHR, 0, 1, 0),
     }
 }
 
-fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64) -> (i64, u8) {
+/// read_user_cstr as an option→EFAULT/ENOENT-friendly Result.
+fn read_cstr(ptr: u64) -> String {
+    proc::read_user_cstr(ptr, 128).unwrap_or_default()
+}
+
+/// renameat(2) core: (olddirfd, oldpath, newdirfd, newpath).
+fn renameat_arm(od: i64, op: u64, nd: i64, np: u64) -> (i64, u8) {
+    let Some(oldp) = proc::read_user_cstr(op, 128) else {
+        return (0, 14);
+    };
+    let old = match resolve_path(od, oldp) {
+        Ok(p) => p,
+        Err(e) => return (0, e),
+    };
+    let Some(newp) = proc::read_user_cstr(np, 128) else {
+        return (0, 14);
+    };
+    let new = match resolve_path(nd, newp) {
+        Ok(p) => p,
+        Err(e) => return (0, e),
+    };
+    match fs::rename(&old, &new) {
+        Ok(()) => (0, 0),
+        Err(e) => (0, e),
+    }
+}
+
+/// utimensat(dirfd, path, times[2], flags): v1 tracks mtime only and
+/// always follows symlinks (AT_SYMLINK_NOFOLLOW ignored); times=NULL
+/// stamps "now".
+fn utimensat(dirfd: i64, path_ptr: u64, times: u64) -> (i64, u8) {
+    let Some(path) = proc::read_user_cstr(path_ptr, 128) else {
+        return (0, 14);
+    };
+    let resolved = match resolve_path(dirfd, path) {
+        Ok(p) => p,
+        Err(e) => return (0, e),
+    };
+    let Some(idx) = fs::lookup(&resolved) else {
+        return (0, 2);
+    };
+    let now = crate::arch::timer::unix_secs();
+    if times == 0 {
+        fs::set_mtime(idx, now);
+        return (0, 0);
+    }
+    if !proc::user_range_ok(times, 32) {
+        return (0, 14);
+    }
+    // mtime = times[1] = {tv_sec @+16, tv_nsec @+24}
+    let (sec, nsec) = unsafe {
+        (
+            *((times + 16) as *const i64),
+            *((times + 24) as *const i64),
+        )
+    };
+    const UTIME_OMIT: i64 = 0x7FFF_FFFF;
+    const UTIME_NOW: i64 = 0x3FFF_FFFF;
+    let t = match nsec {
+        UTIME_OMIT => return (0, 0), // mtime untouched
+        UTIME_NOW => now,
+        n if n >= 0 && n < 1_000_000_000 && sec >= 0 => sec,
+        _ => return (0, 22),
+    };
+    fs::set_mtime(idx, t);
+    (0, 0)
+}
+
+/// symlinkat(target, newdirfd, linkpath).
+fn symlinkat_arm(target_ptr: u64, dirfd: i64, link_ptr: u64) -> (i64, u8) {
+    let Some(target) = proc::read_user_cstr(target_ptr, 128) else {
+        return (0, 14);
+    };
+    let Some(link) = proc::read_user_cstr(link_ptr, 128) else {
+        return (0, 14);
+    };
+    match resolve_path(dirfd, link) {
+        Err(e) => (0, e),
+        Ok(path) => match fs::create_symlink(&path, &target) {
+            Ok(_) => (0, 0),
+            Err(e) => (0, e),
+        },
+    }
+}
+
+/// readlinkat(dirfd, path, buf, bufsiz): no NUL appended.
+fn readlinkat_arm(dirfd: i64, path_ptr: u64, buf: u64, bufsiz: u64) -> (i64, u8) {
+    let Some(path) = proc::read_user_cstr(path_ptr, 128) else {
+        return (0, 14);
+    };
+    let resolved = match resolve_path(dirfd, path) {
+        Ok(p) => p,
+        Err(e) => return (0, e),
+    };
+    let Some(idx) = fs::lookup_nofollow(&resolved) else {
+        return (0, 2);
+    };
+    if !fs::is_symlink(idx) {
+        return (0, 22); // EINVAL on non-symlink
+    }
+    let bufsiz = bufsiz as usize;
+    let n = fs::with_bytes(idx, |b: &[u8]| {
+        let n = b.len().min(bufsiz);
+        if n > 0 {
+            if !proc::user_range_ok(buf, n as usize) {
+                return None;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(b.as_ptr(), buf as *mut u8, n);
+            }
+        }
+        Some(n)
+    });
+    match n {
+        None => (0, 14),
+        Some(n) => (n as i64, 0),
+    }
+}
+
+/// Resolve (dirfd, path) to an absolute path. Absolute paths and
+/// AT_FDCWD resolve as given (root-relative — no cwd tracking v1);
+/// dirfd-relative paths are prefixed with the fd's directory.
+fn resolve_path(dirfd: i64, path: String) -> Result<String, u8> {
+    if path.starts_with('/') || dirfd == AT_FDCWD {
+        return Ok(path);
+    }
+    if dirfd >= 0 {
+        match proc::current_target(dirfd as usize) {
+            Some(FdTarget::File(i)) => match file::path_of_fd(i) {
+                Ok(dir) => {
+                    let mut p = String::from(dir);
+                    if p != "/" {
+                        p.push('/');
+                    }
+                    p.push_str(&path);
+                    Ok(p)
+                }
+                Err(e) => Err(e),
+            },
+            _ => Err(file::EBADF),
+        }
+    } else {
+        Err(file::EINVAL)
+    }
+}
+
+fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64, flags: u64) -> (i64, u8) {
     let Some(path) = proc::read_user_cstr(path_ptr, 128) else {
         return (0, 14);
     };
@@ -586,37 +887,22 @@ fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64) -> (i64, u8) {
             Err(e) => (0, e),
         };
     }
-    let resolved: String = if path.starts_with('/') || dirfd == AT_FDCWD {
-        path
-    } else if dirfd >= 0 {
-        match proc::current_target(dirfd as usize) {
-            Some(FdTarget::File(i)) => match file::path_of_fd(i) {
-                Ok(dir) => {
-                    let mut p = String::from(dir);
-                    if p != "/" {
-                        p.push('/');
-                    }
-                    p.push_str(&path);
-                    p
-                }
-                Err(e) => return (0, e),
-            },
-            _ => return (0, file::EBADF),
-        }
-    } else {
-        return (0, 22);
+    let resolved = match resolve_path(dirfd, path) {
+        Ok(p) => p,
+        Err(e) => return (0, e),
     };
-    // Open briefly to resolve, stat, close (v1; no fdless lookup yet).
-    match proc::sys_open(&resolved, 0) {
-        Ok(fd) => {
-            let r = fstat_fd(fd, buf);
-            let _ = proc::sys_close(fd);
-            match r {
-                Ok(()) => (0, 0),
-                Err(e) => (0, e),
-            }
-        }
-        Err(e) => (0, e),
+    // AT_SYMLINK_NOFOLLOW: stat the link itself, not its target.
+    let idx = if flags & 0x100 != 0 {
+        fs::lookup_nofollow(&resolved)
+    } else {
+        fs::lookup(&resolved)
+    };
+    match idx {
+        None => (0, file::ENOENT),
+        Some(i) => match stat_node(i, buf) {
+            Ok(()) => (0, 0),
+            Err(e) => (0, e),
+        },
     }
 }
 

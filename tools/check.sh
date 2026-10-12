@@ -24,12 +24,12 @@ gate_bad() { # <name> <log>
 }
 
 gate_has() { # <name> <log> <ERE>
-    if grep -qE "$3" "$2"; then pass "$1"; else fail "$1 (missing: $3)"; fi
+    if grep -qE -- "$3" "$2"; then pass "$1"; else fail "$1 (missing: $3)"; fi
 }
 
 gate_count() { # <name> <log> <ERE> <expected>
     local n
-    n=$(grep -cE "$3" "$2")
+    n=$(grep -cE -- "$3" "$2")
     if [ "$n" -eq "$4" ]; then pass "$1 (x$n)"; else fail "$1: got x$n, want x$4"; fi
 }
 
@@ -212,6 +212,54 @@ gate_count "s9: no ENOSYS noise"                "$S9" 'ENOSYS' 0
 gate_has "s9: ash exited 0"                     "$S9" 'sh: busybox exited 0'
 gate_has "s9: clean exit"                       "$S9" 'proc: pid 0 exited \(0\)'
 gate_bad  "s9" "$S9"
+
+echo "== session 10: writable FS depth — stage mode/mtime/rename/symlink + sync"
+S10="$T/s10.log"
+( sleep 3
+  printf 'busybox rm -rf /w\n';                 sleep 0.4
+  printf 'busybox mkdir -m 700 /w\n';           sleep 0.4
+  printf 'save /w/f m19-fs-depth\n';            sleep 0.4
+  printf 'busybox chmod 600 /w/f\n';            sleep 0.4
+  printf 'busybox touch -t 200001010000 /w/f\n'; sleep 0.5
+  printf 'busybox mv /w/f /w/g\n';              sleep 0.4
+  printf 'busybox ln -s /etc/motd /w/l\n';      sleep 0.4
+  printf 'busybox sync\n';                      sleep 1.5
+  printf 'sync\n';                              sleep 2.0
+  printf 'exit\n'
+) | timeout 18 ./tools/run.sh >"$S10" 2>&1
+gate_has "s10: sync wrote"     "$S10" 'sync: wrote [0-9]+ sectors'
+gate_count "s10: no ENOSYS"    "$S10" 'ENOSYS' 0
+gate_count "s10: no bad syscalls from *at arms" "$S10" 'sh: busybox exited 1' 0
+gate_has "s10: clean exit"     "$S10" 'proc: pid 0 exited \(0\)'
+gate_bad  "s10" "$S10"
+
+echo "== session 11: FS depth persistence across reboot (modes/mtime/rename/symlink)"
+S11="$T/s11.log"
+( sleep 3
+  printf 'busybox ls -ld /w\n';                 sleep 0.5
+  printf 'busybox ls -l /w\n';                  sleep 0.5
+  printf 'busybox cat /w/g\n';                  sleep 0.4
+  printf 'busybox readlink /w/l\n';             sleep 0.4
+  printf 'busybox stat -c %%Y /w/g\n';          sleep 0.5
+  printf 'busybox cat /w/f\n';                  sleep 0.5
+  printf 'busybox rm /w/g\n';                   sleep 0.4
+  printf 'busybox rm /w/l\n';                   sleep 0.4
+  printf 'busybox rmdir /w\n';                  sleep 0.4
+  printf 'sync\n';                              sleep 2.0
+  printf 'exit\n'
+) | timeout 18 ./tools/run.sh >"$S11" 2>&1
+gate_has "s11: dir mode 700 persisted"   "$S11" 'drwx------'
+gate_has "s11: file mode 600 persisted"  "$S11" '-rw-------'
+gate_has "s11: symlink lstat persisted"  "$S11" 'lrwxrwxrwx'
+gate_has "s11: content after reboot"     "$S11" 'm19-fs-depth'
+gate_has "s11: readlink target"          "$S11" '^/etc/motd'
+gate_has "s11: mtime year 2000"          "$S11" '946684800'
+gate_count "s11: rename: old name gone (only failing cmd)" \
+    "$S11" 'sh: busybox exited 1' 1
+gate_has "s11: removal synced"           "$S11" 'sync: wrote [0-9]+ sectors'
+gate_count "s11: no ENOSYS"              "$S11" 'ENOSYS' 0
+gate_has "s11: clean exit"               "$S11" 'proc: pid 0 exited \(0\)'
+gate_bad  "s11" "$S11"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

@@ -8,7 +8,8 @@ space lives at VA 4 GiB, kernel identity-maps all RAM in every address space).
 ## The one rule
 
 `./tools/check.sh` must exit 0 before calling anything done (0-warning build
-+ 6 scripted QEMU sessions; logs land in `/tmp/tihkali-check/*.log`). A
++ 11 scripted QEMU sessions / 73 gates; logs land in
+`/tmp/tihkali-check/*.log`). A
 warning is a failure. Sessions use scripted stdin:
 
 ```sh

@@ -26,6 +26,10 @@ pub struct FsNode {
     /// Tombstone: index stays stable for open fds; hidden from lookup,
     /// listing and write-back (sync drops it from the disk image).
     removed: bool,
+    /// Permission bits (0o7777). Type bits live in is_dir/symlink.
+    mode: u16,
+    /// Modification time (unix seconds); persisted through cpio.
+    mtime: i64,
 }
 
 struct Nodes(UnsafeCell<Option<Vec<FsNode>>>);
@@ -44,6 +48,7 @@ pub fn mount(img: Vec<u8>) -> usize {
     for e in raw {
         let is_dir = e.mode & 0o170000 == 0o040000;
         let symlink = e.mode & 0o170000 == 0o120000;
+        let perms = (e.mode & 0o7777) as u16;
         v.push(FsNode {
             path: e.path,
             data: img[e.data_off..e.data_off + e.data_len].to_vec(),
@@ -51,6 +56,8 @@ pub fn mount(img: Vec<u8>) -> usize {
             symlink,
             dirty: false,
             removed: false,
+            mode: if perms == 0 { 0o644 } else { perms },
+            mtime: e.mtime,
         });
     }
     let n = v.len();
@@ -167,6 +174,7 @@ pub fn write_at(idx: usize, pos: usize, src: u64, len: usize) -> usize {
         core::ptr::copy_nonoverlapping(src as *const u8, n.data.as_mut_ptr().add(pos), len);
     }
     n.dirty = true;
+    n.mtime = crate::arch::timer::unix_secs();
     len
 }
 
@@ -193,7 +201,9 @@ fn create_node(path: &str, as_dir: bool) -> Result<usize, u8> {
     if p == "/" {
         return Err(EEXIST);
     }
-    if lookup(&p).is_some() {
+    // Name occupancy, not target: a dangling symlink at `p` must block the
+    // create, or the node table ends up with two live nodes on one path.
+    if lookup_nofollow(&p).is_some() {
         return Err(EEXIST);
     }
     let parent = parent_of(&p).to_string();
@@ -209,6 +219,8 @@ fn create_node(path: &str, as_dir: bool) -> Result<usize, u8> {
                 symlink: false,
                 dirty: true,
                 removed: false,
+                mode: if as_dir { 0o755 } else { 0o644 },
+                mtime: crate::arch::timer::unix_secs(),
             });
             Ok(n.len() - 1)
         }
@@ -219,13 +231,159 @@ fn any_dirty() -> bool {
     nodes().iter().any(|n| n.dirty)
 }
 
+/// Permission bits of a node (for stat/chmod).
+pub fn perms(idx: usize) -> u16 {
+    nodes()[idx].mode
+}
+
+/// Modification time (unix seconds).
+pub fn mtime_of(idx: usize) -> i64 {
+    nodes()[idx].mtime
+}
+
+/// True when the node is a symlink (lstat/readlink).
+pub fn is_symlink(idx: usize) -> bool {
+    nodes()[idx].symlink
+}
+
+/// chmod(2): replace permission bits (type unchanged).
+pub fn set_mode(idx: usize, mode: u16) -> Result<(), u8> {
+    let n = &mut nodes()[idx];
+    if n.removed {
+        return Err(ENOENT);
+    }
+    n.mode = mode & 0o7777;
+    n.dirty = true;
+    Ok(())
+}
+
+/// ftruncate/truncate: shrink or zero-extend a file.
+pub fn set_len(idx: usize, len: usize) -> Result<(), u8> {
+    let n = &mut nodes()[idx];
+    if n.is_dir {
+        return Err(EISDIR);
+    }
+    if len < n.data.len() {
+        n.data.truncate(len);
+    } else {
+        n.data.resize(len, 0);
+    }
+    n.dirty = true;
+    n.mtime = crate::arch::timer::unix_secs();
+    Ok(())
+}
+
+/// Set the modification time (utimensat/touch).
+pub fn set_mtime(idx: usize, t: i64) {
+    let n = &mut nodes()[idx];
+    n.mtime = t;
+    n.dirty = true;
+}
+
+/// lookup without following the final symlink (lstat/readlink).
+pub fn lookup_nofollow(path: &str) -> Option<usize> {
+    let p = normalize(path);
+    nodes().iter().position(|n| !n.removed && n.path == p)
+}
+
+/// symlink(2): create a symbolic link node whose data is the target.
+pub fn create_symlink(path: &str, target: &str) -> Result<usize, u8> {
+    let p = normalize(path);
+    if lookup_nofollow(&p).is_some() {
+        return Err(EEXIST);
+    }
+    let parent = parent_of(&p).to_string();
+    match lookup(&parent) {
+        None => Err(ENOENT),
+        Some(pi) if !is_dir(pi) => Err(ENOTDIR),
+        Some(_) => {
+            let n = nodes();
+            n.push(FsNode {
+                path: p,
+                data: target.as_bytes().to_vec(),
+                is_dir: false,
+                symlink: true,
+                dirty: true,
+                removed: false,
+                mode: 0o777,
+                mtime: crate::arch::timer::unix_secs(),
+            });
+            Ok(n.len() - 1)
+        }
+    }
+}
+
+/// rename(2): move `old` onto `new` (single filesystem). Directories take
+/// their children along; an existing non-empty target is rejected, an
+/// existing file target is replaced (tombstoned — open fds keep working).
+pub fn rename(old: &str, new: &str) -> Result<(), u8> {
+    let o = normalize(old);
+    let n = normalize(new);
+    if o == n {
+        return Ok(());
+    }
+    if o != "/" && n.starts_with(&format!("{o}/")) {
+        return Err(22); // EINVAL: directory moved into itself
+    }
+    let oi = lookup_nofollow(&o).ok_or(ENOENT)?;
+    let np = parent_of(&n).to_string();
+    match lookup(&np) {
+        None => return Err(ENOENT),
+        Some(pi) if !is_dir(pi) => return Err(ENOTDIR),
+        Some(_) => {}
+    }
+    let o_dir = is_dir(oi);
+    if let Some(ni) = lookup_nofollow(&n) {
+        if ni == oi {
+            return Ok(());
+        }
+        let n_dir = is_dir(ni);
+        if n_dir && !o_dir {
+            return Err(EISDIR);
+        }
+        if o_dir && !n_dir {
+            return Err(ENOTDIR);
+        }
+        if n_dir {
+            let empty = nodes().iter().all(|m| {
+                m.removed || m.path == n || parent_of(&m.path) != n.as_str()
+            });
+            if !empty {
+                return Err(ENOTEMPTY);
+            }
+        }
+        let tn = &mut nodes()[ni];
+        tn.removed = true;
+        tn.dirty = true;
+    }
+    if o_dir {
+        let prefix = format!("{o}/");
+        let kids: Vec<usize> = nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.removed && m.path.starts_with(&prefix))
+            .map(|(i, _)| i)
+            .collect();
+        for i in kids {
+            let m = &mut nodes()[i];
+            m.path = format!("{}/{}", n, &m.path[prefix.len()..]);
+            m.dirty = true;
+        }
+    }
+    let nn = &mut nodes()[oi];
+    nn.path = n;
+    nn.dirty = true;
+    Ok(())
+}
+
 /// unlink(2): remove a regular file (tombstoned; open fds keep reading).
 pub fn remove_file(path: &str) -> Result<(), u8> {
     let p = normalize(path);
     if p == "/" {
         return Err(EISDIR);
     }
-    let i = lookup(&p).ok_or(ENOENT)?;
+    // unlink(2) removes the final symlink itself, never its target.
+    let i = lookup_nofollow(&p).ok_or(ENOENT)?;
     if is_dir(i) {
         return Err(EISDIR);
     }
@@ -241,7 +399,7 @@ pub fn remove_dir(path: &str) -> Result<(), u8> {
     if p == "/" {
         return Err(EBUSY);
     }
-    let i = lookup(&p).ok_or(ENOENT)?;
+    let i = lookup_nofollow(&p).ok_or(ENOENT)?;
     if !is_dir(i) {
         return Err(ENOTDIR);
     }
@@ -267,16 +425,16 @@ fn build_cpio() -> Vec<u8> {
         }
         let rel: &str = if n.path == "/" { "." } else { &n.path[1..] };
         let mode = if n.is_dir {
-            0o40755
+            0o40000 | n.mode as u32
         } else if n.symlink {
-            0o120777
+            0o120000 | 0o777
         } else {
-            0o100644
+            0o100000 | n.mode as u32
         };
-        write_newc(&mut out, ino, mode, rel, &n.data);
+        write_newc(&mut out, ino, mode, rel, &n.data, n.mtime);
         ino += 1;
     }
-    write_newc(&mut out, 0, 0, "TRAILER!!!", &[]);
+    write_newc(&mut out, 0, 0, "TRAILER!!!", &[], 0);
     while out.len() % 512 != 0 {
         out.push(0);
     }
@@ -290,7 +448,7 @@ fn push_hex8(out: &mut Vec<u8>, v: u32) {
     }
 }
 
-fn write_newc(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8]) {
+fn write_newc(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8], mtime: i64) {
     out.extend_from_slice(b"070701");
     for field in [
         ino,
@@ -298,7 +456,7 @@ fn write_newc(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8]) {
         0, // uid
         0, // gid
         1, // nlink
-        0, // mtime
+        mtime as u32,
         data.len() as u32,
         0, // devmajor
         0, // devminor
