@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../user/src/sh.rs");
     println!("cargo:rerun-if-changed=../user/user.ld");
     println!("cargo:rerun-if-changed=assets/motd");
+    println!("cargo:rerun-if-changed=assets/demo.sh");
 
     // Build the user programs into a private target dir (nested cargo
     // would deadlock on the parent's target-dir lock, hence OUT_DIR/user).
@@ -178,8 +179,9 @@ fn main() {
     let busybox_bytes = std::fs::read(&busybox_out).expect("read busybox");
 
     let motd = std::fs::read(Path::new(&dir).join("assets/motd")).expect("read motd");
+    let demo_sh = std::fs::read(Path::new(&dir).join("assets/demo.sh")).expect("read demo.sh");
 
-    let entries: Vec<CpioEntry> = vec![
+    let mut entries: Vec<CpioEntry> = vec![
         CpioEntry::dir("."),
         CpioEntry::dir("bin"),
         CpioEntry::dir("etc"),
@@ -190,7 +192,17 @@ fn main() {
         CpioEntry::file("bin/linux-probe", &probe_bytes),
         CpioEntry::exe("bin/busybox", &busybox_bytes),
         CpioEntry::file("etc/motd", &motd),
+        CpioEntry::file("etc/demo.sh", &demo_sh),
     ];
+    // busybox applet links (Alpine convention: /bin/<applet> -> busybox).
+    // ash execs these by name; busybox dispatches on argv[0]'s basename.
+    for applet in [
+        "cat", "ls", "echo", "head", "tail", "wc", "grep", "sleep", "mkdir", "rm", "rmdir",
+        "touch", "cp", "mv", "ln", "pwd", "which", "true", "false", "sort", "seq", "date",
+        "uname", "id", "env", "basename", "dirname", "[", "test", "printf", "unzip", "tar",
+    ] {
+        entries.push(CpioEntry::symlink(&format!("bin/{applet}"), "busybox"));
+    }
     let image = pack_newc(&entries);
 
     // Canonical location for the QEMU drive (tools/run.sh reads this path).
@@ -220,6 +232,9 @@ impl<'a> CpioEntry<'a> {
     }
     fn exe(name: &str, data: &'a [u8]) -> Self {
         Self { name: name.into(), mode: 0o100755, data }
+    }
+    fn symlink(name: &str, target: &'a str) -> Self {
+        Self { name: name.into(), mode: 0o120777, data: target.as_bytes() }
     }
 }
 

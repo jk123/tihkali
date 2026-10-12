@@ -6,6 +6,7 @@
 
 use core::cell::UnsafeCell;
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -19,6 +20,8 @@ pub struct FsNode {
     path: String,
     data: Vec<u8>,
     is_dir: bool,
+    /// Symlink: `data` holds the target path (Alpine-style /bin/cat links).
+    symlink: bool,
     dirty: bool,
     /// Tombstone: index stays stable for open fds; hidden from lookup,
     /// listing and write-back (sync drops it from the disk image).
@@ -40,10 +43,12 @@ pub fn mount(img: Vec<u8>) -> usize {
     let mut v: Vec<FsNode> = Vec::with_capacity(raw.len());
     for e in raw {
         let is_dir = e.mode & 0o170000 == 0o040000;
+        let symlink = e.mode & 0o170000 == 0o120000;
         v.push(FsNode {
             path: e.path,
             data: img[e.data_off..e.data_off + e.data_len].to_vec(),
             is_dir,
+            symlink,
             dirty: false,
             removed: false,
         });
@@ -51,8 +56,13 @@ pub fn mount(img: Vec<u8>) -> usize {
     let n = v.len();
     unsafe { *NODES.0.get() = Some(v) };
     for i in 0..n {
-        let suffix = if is_dir(i) && path_of(i) != "/" { "/" } else { "" };
-        kprintln!("initramfs: {}{}", path_of(i), suffix);
+        if nodes()[i].symlink {
+            let t = core::str::from_utf8(&nodes()[i].data).unwrap_or("?");
+            kprintln!("initramfs: {} -> {}", path_of(i), t);
+        } else {
+            let suffix = if is_dir(i) && path_of(i) != "/" { "/" } else { "" };
+            kprintln!("initramfs: {}{}", path_of(i), suffix);
+        }
     }
     n
 }
@@ -71,9 +81,29 @@ fn normalize(path: &str) -> String {
 }
 
 pub fn lookup(path: &str) -> Option<usize> {
-    let p = normalize(path);
-    nodes().iter().position(|n| !n.removed && n.path == p)
+    let mut p = normalize(path);
+    // Follow symlink chains (bounded; relative targets resolve against
+    // the link's parent directory).
+    for _ in 0..8 {
+        let idx = nodes().iter().position(|n| !n.removed && n.path == p.as_str())?;
+        if !nodes()[idx].symlink {
+            return Some(idx);
+        }
+        let target = core::str::from_utf8(&nodes()[idx].data).ok()?.to_string();
+        p = if target.starts_with('/') {
+            normalize(&target)
+        } else {
+            let dir = parent_of(&p);
+            if dir == "/" {
+                normalize(&format!("/{target}"))
+            } else {
+                normalize(&format!("{dir}/{target}"))
+            }
+        };
+    }
+    None
 }
+
 
 pub fn is_dir(idx: usize) -> bool {
     nodes()[idx].is_dir
@@ -176,6 +206,7 @@ fn create_node(path: &str, as_dir: bool) -> Result<usize, u8> {
                 path: p,
                 data: Vec::new(),
                 is_dir: as_dir,
+                symlink: false,
                 dirty: true,
                 removed: false,
             });
@@ -235,7 +266,13 @@ fn build_cpio() -> Vec<u8> {
             continue;
         }
         let rel: &str = if n.path == "/" { "." } else { &n.path[1..] };
-        let mode = if n.is_dir { 0o40755 } else { 0o100644 };
+        let mode = if n.is_dir {
+            0o40755
+        } else if n.symlink {
+            0o120777
+        } else {
+            0o100644
+        };
         write_newc(&mut out, ino, mode, rel, &n.data);
         ino += 1;
     }

@@ -35,6 +35,79 @@ pub enum FdTarget {
     TtyIn,
     TtyOut,
     File(usize),
+    /// Anonymous pipe: (buffer slot, is this the write end?)
+    Pipe { slot: usize, write_end: bool },
+}
+
+/// Fixed pool of anonymous pipes (v1: 8 × 512 B).
+const NPIPES: usize = 8;
+const PIPESZ: usize = 512;
+/// Reported by fcntl(F_GETPIPE_SZ/F_SETPIPE_SZ).
+pub const PIPE_SIZE: usize = PIPESZ;
+
+struct PipeBuf {
+    data: [u8; PIPESZ],
+    head: u64, // monotonic
+    tail: u64,
+}
+
+struct PipePool(UnsafeCell<[Option<PipeBuf>; NPIPES]>);
+unsafe impl Sync for PipePool {}
+
+static PIPES: PipePool = PipePool(UnsafeCell::new([const { None }; NPIPES]));
+
+fn pipe(slot: usize) -> &'static mut PipeBuf {
+    unsafe { (*PIPES.0.get())[slot].as_mut().expect("bad pipe slot") }
+}
+
+/// Create a pipe; returns its buffer slot.
+pub fn pipe_create() -> Result<usize, u8> {
+    let pool = unsafe { &mut *PIPES.0.get() };
+    let slot = pool.iter().position(|p| p.is_none()).ok_or(28 /*ENOSPC*/)?;
+    pool[slot] = Some(PipeBuf { data: [0; PIPESZ], head: 0, tail: 0 });
+    Ok(slot)
+}
+
+pub enum PipeRead {
+    Data(usize),
+    WouldBlock,
+}
+
+/// Pop up to `len` bytes into the user buffer.
+pub fn pipe_read(slot: usize, addr: u64, len: usize) -> Result<PipeRead, u8> {
+    if !crate::proc::user_range_ok(addr, len.max(1)) {
+        return Err(14);
+    }
+    let p = pipe(slot);
+    let avail = (p.head - p.tail) as usize;
+    if avail == 0 {
+        return Ok(PipeRead::WouldBlock);
+    }
+    let n = avail.min(len);
+    unsafe {
+        for i in 0..n {
+            *((addr as usize + i) as *mut u8) = p.data[((p.tail + i as u64) as usize) % PIPESZ];
+        }
+    }
+    p.tail += n as u64;
+    Ok(PipeRead::Data(n))
+}
+
+/// Push bytes; returns how many were accepted (short write when full).
+pub fn pipe_write(slot: usize, addr: u64, len: usize) -> Result<usize, u8> {
+    if !crate::proc::user_range_ok(addr, len) {
+        return Err(14);
+    }
+    let p = pipe(slot);
+    let free = PIPESZ as u64 - (p.head - p.tail);
+    let n = (len as u64).min(free) as usize;
+    unsafe {
+        for i in 0..n {
+            p.data[((p.head + i as u64) as usize) % PIPESZ] = *((addr as usize + i) as *const u8);
+        }
+    }
+    p.head += n as u64;
+    Ok(n)
 }
 
 pub struct OpenFile {
@@ -203,7 +276,8 @@ pub fn getdents_to_user(idx: usize, addr: u64, len: usize) -> Result<usize, u8> 
     Ok(written)
 }
 
-/// Close every file fd an exiting process holds (tty targets need no action).
+/// Close every file fd an exiting process holds (tty/pipe targets need no
+/// refcounting: pipe EOF is decided by scanning live fds in proc).
 pub fn release_all(targets: &[Option<FdTarget>]) {
     for t in targets {
         if let Some(FdTarget::File(i)) = t {

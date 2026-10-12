@@ -168,6 +168,25 @@ gate_has "s7: busybox cat read"      "$S7" 'Welcome to tihkali'
 gate_has "s7: busybox exited 0"      "$S7" 'sh: busybox exited 0'
 gate_bad  "s7" "$S7"
 
+echo "== session 8: busybox ash (POSIX shell: script + pipeline + applets)"
+S8="$T/s8.log"
+( sleep 1.8
+  printf 'busybox ash /etc/demo.sh\n'
+  sleep 3
+  printf 'busybox cat /etc/motd\n'
+  sleep 2
+  printf 'busybox ls /bin\n'
+  sleep 2
+  printf 'exit\n'
+) | timeout 18 ./tools/run.sh >"$S8" 2>&1
+gate_has "s8: ash ran demo script"      "$S8" 'hello-from-pipeline'
+gate_has "s8: pipeline second line"     "$S8" '^done'
+gate_has "s8: ash exited 0"             "$S8" 'sh: busybox exited 0'
+gate_has "s8: file cat via sendfile"    "$S8" 'Welcome to tihkali'
+gate_has "s8: applet symlink ls"        "$S8" 'linux-hello'
+gate_count "s8: no ENOSYS noise"        "$S8" 'ENOSYS' 0
+gate_bad  "s8" "$S8"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

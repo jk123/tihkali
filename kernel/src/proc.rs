@@ -644,6 +644,25 @@ pub fn sys_read(frame: &mut TrapFrame, fd: usize, buf: u64, len: usize) -> Io {
             Ok(n) => Io::Val(n as i64),
             Err(e) => Io::Err(e),
         },
+        FdTarget::Pipe { slot, write_end: false } => {
+            // Single-core: no writer can run while we're in-kernel, so an
+            // empty pipe is a stable state — EOF once all write ends are gone.
+            match file::pipe_read(slot, buf, len) {
+                Ok(file::PipeRead::Data(n)) => Io::Val(n as i64),
+                Ok(file::PipeRead::WouldBlock) => {
+                    if pipe_end_count(slot, true) == 0 {
+                        Io::Val(0) // no writers left: EOF
+                    } else if has_deliverable() {
+                        Io::Err(EINTR)
+                    } else {
+                        sleep_current(frame);
+                        Io::Slept
+                    }
+                }
+                Err(e) => Io::Err(e),
+            }
+        }
+        FdTarget::Pipe { write_end: true, .. } => Io::Err(EBADF),
     }
 }
 
@@ -663,6 +682,15 @@ pub fn sys_write(fd: usize, buf: u64, len: usize) -> Result<i64, u8> {
             tihkali_hal::console::write_bytes(bytes);
             Ok(len as i64)
         }
+        FdTarget::Pipe { slot, write_end: true } => match file::pipe_write(slot, buf, len) {
+            Ok(n) => {
+                // A reader may be asleep on this pipe.
+                wake_sleeping();
+                Ok(n as i64)
+            }
+            Err(e) => Err(e),
+        },
+        FdTarget::Pipe { write_end: false, .. } => Err(EBADF),
         FdTarget::File(i) => {
             if !user_range_ok(buf, len) {
                 return Err(EFAULT);
@@ -1069,4 +1097,108 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> Result<(), u8> {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
     }
     vm::set_perms(ttbr, addr, len, prot as u32).map_err(|_| EINVAL)
+}
+
+// ---------- pipes / dup3 / misc (Linux personality entry points) ----------
+
+/// How many live fds reference this pipe's read or write ends?
+pub fn pipe_end_count(slot: usize, write_end: bool) -> usize {
+    let t = table();
+    t.iter()
+        .flatten()
+        .flat_map(|p| p.fds.iter())
+        .filter(|f| matches!(f, Some(FdTarget::Pipe { slot: s, write_end: w }) if *s == slot && *w == write_end))
+        .count()
+}
+
+/// pipe2(2): create an anonymous pipe; returns the two fds.
+pub fn sys_pipe2(pipefd: u64) -> Result<(), u8> {
+    if !user_range_ok(pipefd, 8) {
+        return Err(EFAULT);
+    }
+    let slot = file::pipe_create()?;
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().unwrap();
+    let take_fd = |p: &mut crate::proc::Process| -> usize {
+        match p.fds.iter().position(|f| f.is_none()) {
+            Some(i) => i,
+            None => {
+                p.fds.push(None);
+                p.fds.len() - 1
+            }
+        }
+    };
+    let r = take_fd(p);
+    p.fds[r] = Some(FdTarget::Pipe { slot, write_end: false });
+    let w = take_fd(p);
+    p.fds[w] = Some(FdTarget::Pipe { slot, write_end: true });
+    unsafe {
+        (pipefd as *mut i32).add(0).write_volatile(r as i32);
+        (pipefd as *mut i32).add(1).write_volatile(w as i32);
+    }
+    Ok(())
+}
+
+/// dup3(oldfd, newfd, flags): copy an fd into slot `newfd` (closing it).
+pub fn sys_dup3(oldfd: i64, newfd: i64) -> Result<usize, u8> {
+    if newfd < 0 || newfd > 1024 {
+        return Err(EINVAL);
+    }
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().unwrap();
+    let target = p
+        .fds
+        .get(oldfd as usize)
+        .copied()
+        .flatten()
+        .ok_or(EBADF)?;
+    if oldfd == newfd {
+        return Ok(newfd as usize);
+    }
+    while p.fds.len() <= newfd as usize {
+        p.fds.push(None);
+    }
+    if let Some(old) = p.fds[newfd as usize].take() {
+        if let FdTarget::File(i) = old {
+            let _ = file::close(i);
+        }
+    }
+    if let FdTarget::File(i) = target {
+        file::dup(i);
+    }
+    p.fds[newfd as usize] = Some(target);
+    Ok(newfd as usize)
+}
+
+/// fcntl(F_DUPFD): duplicate into the lowest free slot >= min.
+pub fn sys_dupfd(oldfd: i64, min: i64) -> Result<usize, u8> {
+    if min < 0 || min > 1024 {
+        return Err(EINVAL);
+    }
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().unwrap();
+    let target = p.fds.get(oldfd as usize).copied().flatten().ok_or(EBADF)?;
+    while p.fds.len() <= min as usize {
+        p.fds.push(None);
+    }
+    let slot = (min as usize..p.fds.len())
+        .find(|&i| p.fds[i].is_none())
+        .ok_or(EINVAL)?;
+    if let FdTarget::File(i) = target {
+        file::dup(i);
+    }
+    p.fds[slot] = Some(target);
+    Ok(slot)
+}
+
+/// Parent pid for getppid (0 when init).
+pub fn current_ppid() -> i64 {
+    let t = table();
+    let cur = CURRENT.load(Ordering::Relaxed);
+    match t[cur].as_ref() {
+        Some(p) if p.parent != NO_PARENT && p.parent < t.len() => {
+            t[p.parent].as_ref().map_or(0, |q| q.pid as i64)
+        }
+        _ => 0,
+    }
 }

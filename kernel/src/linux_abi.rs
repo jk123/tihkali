@@ -96,8 +96,20 @@ pub fn svc(frame: &mut TrapFrame) {
             Ok(n) => (n as i64, 0),
             Err(e) => (0, e),
         },
-        25 => fcntl(frame.x[0] as usize, frame.x[1] as i64),
+        25 => fcntl(frame.x[0] as usize, frame.x[1] as i64, frame.x[2] as i64),
         29 => ioctl(frame.x[0] as usize, frame.x[1], frame.x[2]),
+        17 => getcwd(frame.x[0], frame.x[1]), // getcwd(path, size)
+        173 => (proc::current_ppid(), 0),     // getppid
+        24 => match proc::sys_dup3(frame.x[0] as i64, frame.x[1] as i64) {
+            // dup3(old, new, flags)
+            Ok(fd) => (fd as i64, 0),
+            Err(e) => (0, e),
+        },
+        59 => match proc::sys_pipe2(frame.x[0]) {
+            // pipe2(pipefd, flags)
+            Ok(()) => (0, 0),
+            Err(e) => (0, e),
+        },
         // --- memory ---
         214 => (proc::sys_brk(frame.x[0]) as i64, 0), // brk never fails
         222 => {
@@ -142,6 +154,31 @@ pub fn svc(frame: &mut TrapFrame) {
             proc::sys_sigreturn(frame);
             return;
         }
+        220 => {
+            // clone(flags, stack, ptid, tls, ctid): plain fork only.
+            // threads / shared-mm (CLONE_VM etc.) unsupported in v1.
+            if frame.x[0] & !0xff != 0 {
+                (0, 22)
+            } else {
+                match proc::sys_fork(frame) {
+                    Ok(pid) => (pid as i64, 0),
+                    Err(proc::ForkError::NoMem) => (0, 12),
+                }
+            }
+        }
+        71 => sendfile(
+            // sendfile(out, in, off, count): regular-file sources only;
+            // pipe/tty sources return EINVAL so busybox falls back to read
+            frame.x[0] as usize,
+            frame.x[1] as usize,
+            frame.x[2],
+            frame.x[3] as usize,
+        ),
+        // Identity: single-user root. Observed from ash/musl startup.
+        144 => (0, 0), // setgid
+        146 => (0, 0), // setuid
+        174 => (0, 0), // getuid
+        176 => (0, 0), // getgid
         135 => match proc::sys_sigprocmask(frame.x[0] as i64 + 1, frame.x[1], frame.x[2]) {
             // Linux how 0/1/2 -> NetBSD 1/2/3
             Ok(()) => (0, 0),
@@ -158,6 +195,12 @@ pub fn svc(frame: &mut TrapFrame) {
 
     // Linux epilogue: x0 = value or -errno; carry flags untouched (musl
     // tests with `cmp x0, #-4095` in user space).
+    if err == 22 {
+        kprintln!(
+            "[linux] EINVAL nr={nr} x0={:#x} x1={:#x} x2={:#x} elr={:#x}",
+            frame.x[0], frame.x[1], frame.x[2], frame.elr
+        );
+    }
     if err != 0 {
         frame.x[0] = (-(err as i64)) as u64;
     } else {
@@ -213,8 +256,12 @@ fn openat(dirfd: i64, path_ptr: u64, flags: u64) -> (i64, u8) {
         return (0, 22); // EINVAL: unknown dirfd
     };
     match proc::sys_open(&resolved, translate_open_flags(flags)) {
-        Ok(fd) => (fd as i64, 0),
-        Err(e) => (0, e),
+        Ok(fd) => {
+            (fd as i64, 0)
+        }
+        Err(e) => {
+            (0, e)
+        }
     }
 }
 
@@ -323,17 +370,36 @@ fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64) -> (i64, u8) {
     }
 }
 
-fn fcntl(fd: usize, cmd: i64) -> (i64, u8) {
+fn fcntl(fd: usize, cmd: i64, arg: i64) -> (i64, u8) {
     match cmd {
-        1 | 2 => (0, 0),           // F_GETFD / F_SETFD (no cloexec tracking)
-        3 => match file::is_writable(fd) {
-            // F_GETFL
-            Ok(true) => (2, 0),    // O_RDWR-ish
-            Ok(false) => (0, 0),   // O_RDONLY
+        0 => match proc::sys_dupfd(fd as i64, arg) {
+            // F_DUPFD
+            Ok(n) => (n as i64, 0),
             Err(e) => (0, e),
         },
-        4 => (0, 0),               // F_SETFL: ignore
-        _ => (0, 22),              // EINVAL (incl. F_DUPFD v1)
+        1 | 2 => (0, 0),  // F_GETFD / F_SETFD (no cloexec tracking, v1)
+        3 => match proc::current_target(fd) {
+            // F_GETFL
+            Some(FdTarget::File(i)) => match file::is_writable(i) {
+                Ok(true) => (2, 0),
+                Ok(false) => (0, 0),
+                Err(e) => (0, e),
+            },
+            Some(_) => (0, file::EBADF),
+            None => (0, file::EBADF),
+        },
+        4 => (0, 0), // F_SETFL: ignore
+        1030 => match proc::sys_dupfd(fd as i64, arg) {
+            // F_DUPFD_CLOEXEC (no cloexec tracking v1 — same as F_DUPFD)
+            Ok(n) => (n as i64, 0),
+            Err(e) => (0, e),
+        },
+        1031 | 1032 => match proc::current_target(fd) {
+            // F_SETPIPE_SZ / F_GETPIPE_SZ: accept, report the fixed size
+            Some(FdTarget::Pipe { .. }) => (file::PIPE_SIZE as i64, 0),
+            _ => (0, file::EBADF),
+        },
+        _ => (0, 22), // EINVAL (unknown commands)
     }
 }
 
@@ -437,6 +503,75 @@ fn uname(buf: u64) -> (i64, u8) {
         ] {
             core::ptr::copy_nonoverlapping(s.as_ptr(), p.add(off), s.len());
         }
+    }
+    (0, 0)
+}
+
+/// getcwd(17): no process cwd yet — report "/" (POSIX root).
+/// sendfile(71): bounce a regular file through a kernel buffer. Sources
+/// that can block (pipe/tty) return EINVAL — busybox then uses read/write,
+/// which owns the sleep/EOF logic.
+fn sendfile(out_fd: usize, in_fd: usize, off: u64, count: usize) -> (i64, u8) {
+    if off != 0 {
+        return (0, 22); // v1: caller-supplied offset unsupported
+    }
+    let Some(FdTarget::File(src)) = proc::current_target(in_fd) else {
+        return (0, 22);
+    };
+    let Some(dst) = proc::current_target(out_fd) else {
+        return (0, 9);
+    };
+    // Pipe destinations need blocking-write semantics sendfile can't do
+    // synchronously; EINVAL sends busybox through the read/write path.
+    if !matches!(dst, FdTarget::TtyOut | FdTarget::File(_)) {
+        return (0, 22);
+    }
+    let mut total = 0usize;
+    let mut kbuf = [0u8; 1024];
+    let kaddr = kbuf.as_mut_ptr() as u64;
+    while total < count {
+        let want = (count - total).min(kbuf.len());
+        let n = match file::read_to_user(src, kaddr, want) {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(e) => {
+                return if total > 0 { (total as i64, 0) } else { (0, e) }
+            }
+        };
+        let wrote = match dst {
+            FdTarget::TtyOut => {
+                let bytes = unsafe { core::slice::from_raw_parts(kaddr as *const u8, n) };
+                tihkali_hal::console::write_bytes(bytes);
+                n
+            }
+            FdTarget::File(dst_idx) => {
+                match file::write_from_user(dst_idx, kaddr, n) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        return if total > 0 { (total as i64, 0) } else { (0, e) }
+                    }
+                }
+            }
+            _ => return (0, 9), // unreachable: dst filtered above
+        };
+        total += wrote;
+        if wrote < n {
+            break; // short write: report progress, caller retries
+        }
+    }
+    (total as i64, 0)
+}
+
+fn getcwd(path: u64, size: u64) -> (i64, u8) {
+    if size < 2 {
+        return (0, 34); // ERANGE
+    }
+    if !proc::user_range_ok(path, 2) {
+        return (0, 14);
+    }
+    unsafe {
+        (path as *mut u8).add(0).write(b'/');
+        (path as *mut u8).add(1).write(0);
     }
     (0, 0)
 }
