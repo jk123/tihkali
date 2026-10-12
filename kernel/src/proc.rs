@@ -20,12 +20,13 @@ const NO_PARENT: usize = usize::MAX;
 
 pub const ECHILD: u8 = 10;
 pub const EPERM_L: u8 = 1;
+pub const EPIPE_L: u8 = 32;
 pub const ENOMEM: u8 = 12;
 pub const EINVAL: u8 = 22;
 
 /// Signal support (v1): no masks, no SA_* flags, synchronous delivery at
 /// every return-to-EL0 boundary.
-pub const NSIG: usize = 32; // signals 1..31
+pub const NSIG: usize = 33; // signals 1..32 (canonical SIGPWR=32)
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
 const SIGKILL: usize = 9;
@@ -36,7 +37,13 @@ fn align_up(v: u64) -> u64 {
 
 /// Signals whose default action is process termination.
 fn default_is_term(sig: usize) -> bool {
-    matches!(sig, 1 | 2 | 3 | 9 | 15 | 30 | 31) // HUP INT QUIT KILL TERM USR1 USR2
+    // All canonical signals whose default action is terminate:
+    // HUP INT QUIT ILL TRAP ABRT EMT FPE KILL BUS SEGV SYS PIPE ALRM TERM
+    // (1..=15) + XCPU XFSZ VTALRM PROF (24..=27) + USR1 USR2 PWR (30..=32).
+    // STOP/TSTP/CONT/TTIN/TTOU (17..=22) and URG/IO/CHLD/WINCH are not
+    // terminate; stop signals are unimplemented v1 and fall through to
+    // the discard path in deliver_signals.
+    sig <= 15 || (24..=27).contains(&sig) || (30..=32).contains(&sig)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,6 +88,10 @@ pub struct Process {
     /// Absolute tick deadline while sleeping in a timed syscall
     /// (ppoll/nanosleep); None for untimed sleeps.
     pub wake_at: Option<u64>,
+    /// Saved TPIDR_EL0 (user TLS anchor). musl CRTs rewrite the register
+    /// on exec; without per-process save/restore a child's exec leaves
+    /// every other process reading TLS through a dangling pointer.
+    pub tpidr: u64,
 }
 
 struct ProcTable(UnsafeCell<Vec<Option<Process>>>);
@@ -170,6 +181,7 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         sig_linux: false,
         pgrp: 0,
         wake_at: None,
+        tpidr: crate::user::TPIDR_VAL,
     }));
     CURRENT.store(0, Ordering::Relaxed);
     NEXT_PID.store(1, Ordering::Relaxed);
@@ -178,6 +190,20 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
 /// Save the outgoing context (held in `frame`) into its process, pick the
 /// next Runnable process round-robin, and load its context. Returns false
 /// when nothing is runnable (caller enters kernel idle).
+fn read_tpidr() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) v, options(nomem, nostack));
+    }
+    v
+}
+
+fn write_tpidr(v: u64) {
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", "isb", in(reg) v, options(nomem, nostack));
+    }
+}
+
 pub fn schedule(frame: &mut TrapFrame) -> bool {
     schedule_ex(frame, true)
 }
@@ -191,6 +217,9 @@ pub fn schedule_ex(frame: &mut TrapFrame, save: bool) -> bool {
         if let Some(p) = &mut t[cur] {
             p.frame = *frame;
             p.sp_el0 = read_sp_el0();
+            // Capture the live TLS anchor (a child exec's CRT may have
+            // rewritten TPIDR_EL0 since our last switch-out).
+            p.tpidr = read_tpidr();
         }
     }
 
@@ -207,6 +236,7 @@ pub fn schedule_ex(frame: &mut TrapFrame, save: bool) -> bool {
         CURRENT.store(idx, Ordering::Relaxed);
         let p = t[idx].as_mut().unwrap();
         write_sp_el0(p.sp_el0);
+        write_tpidr(p.tpidr);
         switch_ttbr(p.tables[0]);
         *frame = p.frame;
         IDLE.store(false, Ordering::Relaxed);
@@ -216,12 +246,22 @@ pub fn schedule_ex(frame: &mut TrapFrame, save: bool) -> bool {
 }
 
 /// Signals that are pending AND not blocked (what delivery would act on).
+/// True when a pending signal would actually do something at the next
+/// return choke: run a handler, or terminate (DFL+term). Ignored and
+/// DFL-ignore signals are discarded there — they must NOT cause EINTR
+/// (that was a real bug: a pending SIGCHLD with no handler would
+/// interrupt read/ppoll with EINTR even though nothing observable runs).
 pub fn has_deliverable() -> bool {
     let cur = CURRENT.load(Ordering::Relaxed);
-    table()
-        .get(cur)
-        .and_then(|p| p.as_ref())
-        .is_some_and(|p| (p.pending & !p.blocked) != 0)
+    let Some(p) = table().get(cur).and_then(|p| p.as_ref()) else {
+        return false;
+    };
+    let deliv = p.pending & !p.blocked;
+    (0..NSIG).any(|s| {
+        let bit = 1u64 << s;
+        deliv & bit != 0
+            && (p.handlers[s] > SIG_IGN || (p.handlers[s] == SIG_DFL && default_is_term(s)))
+    })
 }
 
 /// Block the current process until someone wakes it (rewind-on-wake).
@@ -374,6 +414,8 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         sig_linux,
         pgrp: t[cur].as_ref().unwrap().pgrp, // children share the group
         wake_at: None,
+        // Child shares the parent's live TLS (COW pages keep it valid).
+        tpidr: read_tpidr(),
     });
     kprintln!("proc: fork pid {} (parent {})", pid, t[cur].as_ref().unwrap().pid);
     Ok(pid)
@@ -386,6 +428,10 @@ fn wake_parent(child_slot: usize) {
         return;
     }
     if let Some(par) = &mut t[parent_idx] {
+        // POSIX: child death raises SIGCHLD on the parent. Handlers get
+        // it at the next choke; DFL/IGN is discarded there (and must not
+        // EINTR — has_deliverable filters those).
+        par.pending |= 1 << 20; // SIGCHLD (canonical)
         if par.state == State::Sleeping {
             // Rewind the saved ELR so wait4 re-executes and re-checks;
             // registers still hold the original wait4 arguments.
@@ -398,6 +444,12 @@ fn wake_parent(child_slot: usize) {
 /// SYS_exit: mark zombie, wake a waiting parent, schedule away.
 pub fn sys_exit(frame: &mut TrapFrame, code: u64) {
     terminate(frame, code, false);
+}
+
+/// EL0 took a fault the kernel could not resolve: kill *only* the
+/// offending process (never halt the machine). `sig` is canonical.
+pub fn kill_from_fault(frame: &mut TrapFrame, sig: u64) {
+    terminate(frame, sig, true);
 }
 
 /// Terminate the current process (exit or fatal signal) and schedule away.
@@ -454,7 +506,16 @@ pub fn sys_wait4(frame: &mut TrapFrame, pid_arg: i64, status_ptr: u64, options: 
         let (pid, status) = {
             let c = t[slot].as_ref().unwrap();
             let st = if c.signaled {
-                (c.exit_code as u32) & 0x7f // killed-by-signal encoding
+                // Killed-by-signal encoding: the signum must be in the
+                // WAITER's numbering — a Linux parent would misread
+                // canonical USR1=30 as signal 30 (Linux PWR).
+                let sig = c.exit_code as usize;
+                let out = if t[cur].as_ref().unwrap().sig_linux {
+                    sig_to_user(sig, true) as u32
+                } else {
+                    sig as u32
+                };
+                out & 0x7f
             } else {
                 ((c.exit_code as u32) & 0xff) << 8
             };
@@ -571,7 +632,15 @@ pub fn sys_execve(frame: &mut TrapFrame, path_ptr: u64, argv_ptr: u64) -> Result
     switch_ttbr(new_tables[0]);
     let loaded = crate::fs::with_bytes(fs_idx, |elf| crate::user::load(elf, new_tables[0]));
     let (entry, image_end) = match loaded {
-        Ok(v) => v,
+        Ok(v) => {
+            // load() anchored TPIDR_EL0 for the new image — mirror it
+            // into the per-process slot so later switch-ins restore it.
+            table()[CURRENT.load(Ordering::Relaxed)]
+                .as_mut()
+                .unwrap()
+                .tpidr = crate::user::TPIDR_VAL;
+            v
+        }
         Err(msg) => {
             kprintln!("exec: load failed: {msg}");
             switch_ttbr(old_tables[0]);
@@ -598,8 +667,13 @@ pub fn sys_execve(frame: &mut TrapFrame, path_ptr: u64, argv_ptr: u64) -> Result
     {
         let p = table()[cur].as_mut().unwrap();
         p.tables = new_tables;
-        // POSIX: caught dispositions reset to DFL across exec; pending cleared.
-        p.handlers = [SIG_DFL; NSIG];
+        // POSIX: caught dispositions reset to DFL across exec, but
+        // *ignored* dispositions survive; pending cleared.
+        for h in p.handlers.iter_mut() {
+            if *h != SIG_IGN {
+                *h = SIG_DFL;
+            }
+        }
         p.pending = 0;
         p.sig_linux = false;
         let brk = align_up(image_end as u64);
@@ -756,13 +830,23 @@ pub fn sys_write(fd: usize, buf: u64, len: usize) -> Result<i64, u8> {
             tihkali_hal::console::write_bytes(bytes);
             Ok(len as i64)
         }
-        FdTarget::Pipe { slot, write_end: true } => match file::pipe_write(slot, buf, len) {
-            Ok(n) => {
-                // A reader may be asleep on this pipe.
-                wake_sleeping();
-                Ok(n as i64)
+        FdTarget::Pipe { slot, write_end: true } => {
+            if pipe_end_count(slot, false) == 0 {
+                // POSIX: EPIPE + SIGPIPE to the writer. The signal is
+                // pending; the return choke terminates (DFL) or the
+                // caller observes EPIPE (IGN/blocked).
+                let cur = CURRENT.load(Ordering::Relaxed);
+                table()[cur].as_mut().unwrap().pending |= 1 << 13; // SIGPIPE canonical
+                return Err(EPIPE_L);
             }
-            Err(e) => Err(e),
+            match file::pipe_write(slot, buf, len) {
+                Ok(n) => {
+                    // A reader may be asleep on this pipe.
+                    wake_sleeping();
+                    Ok(n as i64)
+                }
+                Err(e) => Err(e),
+            }
         },
         FdTarget::Pipe { write_end: false, .. } => Err(EBADF),
         FdTarget::File(i) => {
@@ -882,14 +966,39 @@ pub fn sys_kill(pid: i64, sig: u64) -> Result<(), u8> {
     }
     let cur = CURRENT.load(Ordering::Relaxed);
     let t = table();
-    let Some(slot) = t
-        .iter()
-        .position(|o| o.as_ref().is_some_and(|p| p.pid as i64 == pid && p.state != State::Zombie))
-    else {
-        return Err(ESRCH);
+    // POSIX group semantics: pid 0 = caller's group, pid < 0 = pgrp -pid.
+    let group: Option<usize> = if pid == 0 {
+        Some(t[cur].as_ref().unwrap().pgrp)
+    } else if pid < 0 {
+        Some(-pid as usize)
+    } else {
+        None
     };
-
-    signal_one(slot, cur, sig);
+    let slots: alloc::vec::Vec<usize> = match group {
+        Some(pgrp) => t
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| {
+                o.as_ref()
+                    .is_some_and(|p| p.pgrp == pgrp && p.state != State::Zombie)
+            })
+            .map(|(i, _)| i)
+            .collect(),
+        None => {
+            let Some(slot) = t.iter().position(|o| {
+                o.as_ref().is_some_and(|p| p.pid as i64 == pid && p.state != State::Zombie)
+            }) else {
+                return Err(ESRCH);
+            };
+            alloc::vec![slot]
+        }
+    };
+    if slots.is_empty() {
+        return Err(ESRCH);
+    }
+    for slot in slots {
+        signal_one(slot, cur, sig);
+    }
     Ok(())
 }
 
@@ -918,13 +1027,19 @@ fn signal_one(slot: usize, cur: usize, sig: u64) {
             file::release_all(&p.fds);
             kprintln!("proc: pid {pid} killed by signal {sig}");
             wake_parent(slot);
-        } else {
-            // Wake so delivery happens on resume; rewind ELR so the
-            // interrupted syscall re-executes after the handler's
-            // sigreturn (restart semantics).
+        } else if action > SIG_IGN {
+            // Catchable handler: wake so delivery happens on resume;
+            // rewind ELR so the interrupted syscall re-executes after
+            // the handler's sigreturn (restart semantics).
             p.frame.elr = p.frame.elr.wrapping_sub(4);
             p.state = State::Runnable;
+        } else if !masked {
+            // Unblocked but ignorable (SIG_IGN or DFL-ignore): discard
+            // now — a sleeper would never reach a choke to clear it.
+            p.pending &= !(1 << sig);
         }
+        // Blocked + not terminating: keep pending, stay asleep; the
+        // signal becomes deliverable when sigprocmask unblocks it.
     }
 }
 
@@ -1059,12 +1174,14 @@ pub fn sys_sigprocmask(how: i64, set: u64, oset: u64) -> Result<(), u8> {
 /// SYS_sigreturn (295 / 103): restore the frame pushed by delivery.
 /// Frame: x0..x30, elr, spsr (264 bytes) at the user SP.
 pub fn sys_sigreturn(frame: &mut TrapFrame) {
-    const SAVED: usize = 33 * 8;
+    // Layout coupled by hand to install_handler_frame (34 slots).
+    const SAVED: usize = 34 * 8;
     let sp = read_sp_el0() as usize;
     if !user_range_ok(sp as u64, SAVED) {
         terminate(frame, SIGKILL as u64, true);
         return;
     }
+    let saved_blocked = unsafe { *((sp + 33 * 8) as *const u64) };
     unsafe {
         let src = sp as *const u64;
         for i in 0..31 {
@@ -1075,6 +1192,11 @@ pub fn sys_sigreturn(frame: &mut TrapFrame) {
         frame.spsr = spsr & !0xf; // sanitize: force EL0t
     }
     write_sp_el0((sp + SAVED) as u64);
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if let Some(p) = table()[cur].as_mut() {
+        // Restore the mask the signal interrupted (SIGKILL never blockable).
+        p.blocked = saved_blocked & !((1 << 9) | 1);
+    }
 }
 
 /// Deliver pending signals to the current process. Called at every
@@ -1114,45 +1236,77 @@ pub fn deliver_signals(frame: &mut TrapFrame) {
 // ---------- signal-number ABI mapping (canonical = NetBSD) ----------
 
 /// Linux signo -> canonical (NetBSD) index; None = unsupported.
+/// Divergent pairs (asm-generic vs NetBSD signal.h): BUS 7<->10,
+/// USR1 10<->30, USR2 12<->31, SYS 31<->12, CHLD 17<->20, CONT 18<->19,
+/// STOP 19<->17, TSTP 20<->18, URG 23<->16, IO 29<->23, PWR 30<->32.
+/// Linux STKFLT(16) has no NetBSD counterpart -> EINVAL.
 pub fn sig_from_user(sig: i64, linux: bool) -> Option<usize> {
     if !linux {
-        return if (1..NSIG as i64).contains(&sig) { Some(sig as usize) } else { None };
+        return if (1..NSIG as i64).contains(&sig) {
+            Some(sig as usize)
+        } else {
+            None
+        };
     }
     let c = match sig {
+        7 => 10,  // BUS
         10 => 30, // USR1
         12 => 31, // USR2
+        16 => return None, // STKFLT: no NetBSD equivalent
         17 => 20, // CHLD
+        18 => 19, // CONT
+        19 => 17, // STOP
+        20 => 18, // TSTP
+        23 => 16, // URG
+        29 => 23, // IO
+        30 => 32, // PWR
+        31 => 12, // SYS
         s if (1..NSIG as i64).contains(&s) => s as _,
         _ => return None,
     };
     Some(c)
 }
 
-/// canonical -> Linux signo (for handler entry / oldact results).
+/// canonical -> Linux signo (for handler entry / wait4 status / oldact).
 pub fn sig_to_user(canonical: usize, linux: bool) -> i64 {
     if !linux {
         return canonical as i64;
     }
     match canonical {
-        30 => 10,
-        31 => 12,
-        20 => 17,
+        10 => 7,  // BUS
+        30 => 10, // USR1
+        31 => 12, // USR2
+        12 => 31, // SYS
+        20 => 17, // CHLD
+        19 => 18, // CONT
+        17 => 19, // STOP
+        18 => 20, // TSTP
+        16 => 23, // URG
+        23 => 29, // IO
+        32 => 30, // PWR
+        // Identity for the rest; canonical EMT(7) maps to Linux BUS —
+        // no Linux EMT exists and the kernel never raises it.
         s => s as i64,
     }
 }
 
-/// Record that the process talks the Linux signal ABI (set by rt_sigaction).
+/// Record that the process talks the Linux signal ABI (set on every
+/// Linux svc entry and by rt_sigaction).
 pub fn note_signal_abi(linux: bool) {
     let cur = CURRENT.load(Ordering::Relaxed);
     if let Some(p) = table()[cur].as_mut() {
-        p.sig_linux = linux;
+        if p.sig_linux != linux {
+            p.sig_linux = linux;
+        }
     }
 }
 
 /// Push the interrupted context onto the user stack and enter the handler:
 /// x0 = signal, x30 = sigreturn trampoline, fresh EL0 context.
 fn install_handler_frame(frame: &mut TrapFrame, sig: usize, handler: usize) {
-    const SAVED: usize = 33 * 8; // x0..x30, elr, spsr
+    // Layout (coupled by hand to sys_sigreturn): x0..x30 (slots 0..30),
+    // elr (31), spsr (32), caller's `blocked` mask (33).
+    const SAVED: usize = 34 * 8;
     let cur = CURRENT.load(Ordering::Relaxed);
     let sp = read_sp_el0() as usize;
     let Some(new_sp) = sp.checked_sub(SAVED) else {
@@ -1163,6 +1317,7 @@ fn install_handler_frame(frame: &mut TrapFrame, sig: usize, handler: usize) {
         terminate(frame, SIGKILL as u64, true);
         return;
     }
+    let old_blocked = table()[cur].as_ref().unwrap().blocked;
     unsafe {
         let dst = new_sp as *mut u64;
         for i in 0..31 {
@@ -1170,10 +1325,18 @@ fn install_handler_frame(frame: &mut TrapFrame, sig: usize, handler: usize) {
         }
         dst.add(31).write_volatile(frame.elr);
         dst.add(32).write_volatile(frame.spsr);
+        dst.add(33).write_volatile(old_blocked);
     }
     write_sp_el0(new_sp as u64);
+    {
+        let p = table()[cur].as_mut().unwrap();
+        p.pending &= !(1 << sig);
+        // POSIX default: the delivered signal is blocked while its
+        // handler runs (SA_NODEFER unsupported v1) — prevents the same
+        // signal from recursively re-entering the handler.
+        p.blocked |= 1 << sig;
+    }
     let linux_abi = table()[cur].as_mut().unwrap().sig_linux;
-    table()[cur].as_mut().unwrap().pending &= !(1 << sig);
 
     let mut x = [0u64; 31];
     x[0] = sig_to_user(sig, linux_abi) as u64;

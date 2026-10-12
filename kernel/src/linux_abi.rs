@@ -23,6 +23,9 @@ const MAP_ANONYMOUS: u64 = 0x20;
 /// early-returns for sleeps/exit/sigreturn where the frame is finished.
 pub fn svc(frame: &mut TrapFrame) {
     let nr = (frame.x[8] as u32) & 0xffff;
+    // Any process issuing svc#0 is Linux-ABI: wait4 status translation
+    // keys off this (set here so waiters need not have called sigaction).
+    proc::note_signal_abi(true);
     let (result, err): (i64, u8) = match nr {
         // --- process ---
         93 | 94 => {
@@ -151,7 +154,11 @@ pub fn svc(frame: &mut TrapFrame) {
                 Some(sig) => {
                     proc::note_signal_abi(true);
                     match proc::sys_sigaction(sig as u64, frame.x[1], frame.x[2]) {
-                        Ok(old) => (old as i64, 0),
+                        // Linux rt_sigaction returns 0 on success (the old
+                        // action goes to *oldact, written by sys_sigaction);
+                        // returning the old handler here made the SECOND
+                        // sigaction for a signal fail in musl (nonzero = error).
+                        Ok(_) => (0, 0),
                         Err(e) => (0, e),
                     }
                 }
@@ -226,6 +233,7 @@ pub fn svc(frame: &mut TrapFrame) {
         175 => (0, 0), // geteuid
         176 => (0, 0), // getgid
         177 => (0, 0), // getegid
+        178 => (proc::current_pid() as i64, 0), // gettid (tid == pid, 1-thread)
         135 => match proc::sys_sigprocmask(frame.x[0] as i64 + 1, frame.x[1], frame.x[2]) {
             // Linux how 0/1/2 -> NetBSD 1/2/3
             Ok(()) => (0, 0),

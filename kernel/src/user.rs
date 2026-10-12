@@ -16,6 +16,13 @@ pub const MMAP_FLOOR: usize = USER_BASE + 0x0014_0000;
 /// (`svc #295; b .`), mapped executable at every image load.
 pub const TRAMPOLINE: usize = USER_BASE + 0x001F_F000;
 
+/// Kernel-provided user TLS page (musl reads/writes errno relative to
+/// TPIDR_EL0; Linux sets it on exec — we must too). One zeroed,
+/// user-writable page below the trampoline with TP pointing at its
+/// middle, giving ±2 KiB of coverage (variant-II TLS lives below TP).
+pub const TLS_BASE: usize = USER_BASE + 0x001F_E000; // 0x1001FE000
+pub const TPIDR_VAL: u64 = (TLS_BASE + 0x800) as u64;
+
 /// Map + write the sigreturn trampoline into the (fresh) address space.
 pub fn install_trampoline(ttbr: usize) -> Result<(), &'static str> {
     crate::vm::map_page(ttbr, TRAMPOLINE).map_err(|_| "trampoline page alloc failed")?;
@@ -117,6 +124,13 @@ pub fn load(elf: &[u8], ttbr: usize) -> Result<(usize, usize), &'static str> {
     }
     if loaded == 0 {
         return Err("no PT_LOAD segments");
+    }
+    // Anchor TPIDR_EL0 for this image (fresh page, zeroed by map_page).
+    // Runs for pid0 boot and every execve — same constant value, so a
+    // forked child needs nothing (TPIDR_EL0 is a shared system register).
+    crate::vm::map_page(ttbr, TLS_BASE).map_err(|_| "out of frames while loading")?;
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", "isb", in(reg) TPIDR_VAL, options(nomem, nostack));
     }
     Ok((entry, image_end))
 }

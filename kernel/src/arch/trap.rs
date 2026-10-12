@@ -41,8 +41,20 @@ pub extern "C" fn rust_sync_handler(frame: &mut TrapFrame) {
         0x15 => svc_dispatch(frame), // SVC from AArch64
         0x20 | 0x21 => {
             // Instruction abort: nothing is mapped executable on demand.
-            kprintln!("exec fault at {:#x}", frame.elr);
-            fatal(frame)
+            if frame.spsr & 0xf == 0 {
+                // EL0: kill the offending process (SIGSEGV), keep the
+                // kernel alive — a jumping-to-nowhere busybox must not
+                // take the machine down.
+                kprintln!(
+                    "proc: pid {} insn fault at {:#x}",
+                    crate::proc::current_pid(),
+                    frame.elr
+                );
+                crate::proc::kill_from_fault(frame, 11); // SIGSEGV (canonical 11)
+            } else {
+                kprintln!("exec fault at {:#x}", frame.elr);
+                fatal(frame)
+            }
         }
         0x24 | 0x25 => {
             // Data abort (lower or same EL): demand-zero / copy-on-write.
@@ -55,12 +67,33 @@ pub extern "C" fn rust_sync_handler(frame: &mut TrapFrame) {
             match crate::vm::handle_fault(ttbr as usize, far, is_write) {
                 Ok(()) => {} // instruction retries (frame untouched)
                 Err(msg) => {
-                    kprintln!("unhandled data fault: {msg} (FAR={far:#x} WnR={is_write})");
-                    fatal(frame)
+                    if frame.spsr & 0xf == 0 {
+                        // EL0 fault outside any arena: SIGSEGV the process.
+                        kprintln!(
+                            "proc: pid {} data fault {msg} (FAR={far:#x} ELR={:#x})",
+                            crate::proc::current_pid(),
+                            frame.elr
+                        );
+                        crate::proc::kill_from_fault(frame, 11); // SIGSEGV
+                    } else {
+                        kprintln!("unhandled data fault: {msg} (FAR={far:#x} WnR={is_write})");
+                        fatal(frame)
+                    }
                 }
             }
         }
-        _ => fatal(frame),
+        _ => {
+            if frame.spsr & 0xf == 0 {
+                kprintln!(
+                    "proc: pid {} unknown exception ESR={esr:#x} ELR={:#x}",
+                    crate::proc::current_pid(),
+                    frame.elr
+                );
+                crate::proc::kill_from_fault(frame, 4); // SIGILL (canonical 4)
+            } else {
+                fatal(frame)
+            }
+        }
     }
     // Boundary: svc returns, resolved faults, and any frame a syscall
     // switched to are all eligible for signal delivery.
