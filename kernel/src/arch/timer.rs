@@ -40,6 +40,22 @@ pub fn init(hz: u64) {
     kprintln!("timer: {hz} Hz, CNTFRQ = {freq} Hz, interval = {interval} ticks");
 }
 
+/// Current monotonic tick count (HZ ticks per second).
+pub fn now() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// Effective tick rate set by `init`.
+pub fn hz() -> u64 {
+    let freq = unsafe { FREQ_HZ };
+    let interval = unsafe { INTERVAL_TICKS };
+    if interval == 0 {
+        100
+    } else {
+        (freq / interval).max(1)
+    }
+}
+
 /// Called from the IRQ handler in interrupt context.
 pub fn on_tick() {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;

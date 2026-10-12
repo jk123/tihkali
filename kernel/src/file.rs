@@ -73,6 +73,18 @@ pub enum PipeRead {
     WouldBlock,
 }
 
+/// Bytes queued in the pipe (poll readiness, no consumption).
+pub fn pipe_avail(slot: usize) -> usize {
+    let p = pipe(slot);
+    (p.head - p.tail) as usize
+}
+
+/// Free space in the pipe buffer.
+pub fn pipe_free(slot: usize) -> usize {
+    let p = pipe(slot);
+    (PIPESZ as u64 - (p.head - p.tail)) as usize
+}
+
 /// Pop up to `len` bytes into the user buffer.
 pub fn pipe_read(slot: usize, addr: u64, len: usize) -> Result<PipeRead, u8> {
     if !crate::proc::user_range_ok(addr, len.max(1)) {

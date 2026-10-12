@@ -19,6 +19,7 @@ use crate::vm;
 const NO_PARENT: usize = usize::MAX;
 
 pub const ECHILD: u8 = 10;
+pub const EPERM_L: u8 = 1;
 pub const ENOMEM: u8 = 12;
 pub const EINVAL: u8 = 22;
 
@@ -74,6 +75,12 @@ pub struct Process {
     /// Dispositions were installed via the Linux ABI (signal numbers seen
     /// by the handler must be converted back from canonical/NetBSD).
     pub sig_linux: bool,
+    /// Process group (job control); children inherit it. ^C targets the
+    /// tty's foreground group.
+    pub pgrp: usize,
+    /// Absolute tick deadline while sleeping in a timed syscall
+    /// (ppoll/nanosleep); None for untimed sleeps.
+    pub wake_at: Option<u64>,
 }
 
 struct ProcTable(UnsafeCell<Vec<Option<Process>>>);
@@ -96,6 +103,14 @@ pub fn is_idle() -> bool {
 
 fn table() -> &'static mut Vec<Option<Process>> {
     unsafe { &mut *PROCS.0.get() }
+}
+
+/// Process group of the running process.
+pub fn current_pgrp() -> usize {
+    table()[CURRENT.load(Ordering::Relaxed)]
+        .as_ref()
+        .map(|p| p.pgrp)
+        .unwrap_or(0)
 }
 
 pub fn current_pid() -> usize {
@@ -153,6 +168,8 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         brk,
         mmap_next: 0,
         sig_linux: false,
+        pgrp: 0,
+        wake_at: None,
     }));
     CURRENT.store(0, Ordering::Relaxed);
     NEXT_PID.store(1, Ordering::Relaxed);
@@ -199,7 +216,7 @@ pub fn schedule_ex(frame: &mut TrapFrame, save: bool) -> bool {
 }
 
 /// Signals that are pending AND not blocked (what delivery would act on).
-fn has_deliverable() -> bool {
+pub fn has_deliverable() -> bool {
     let cur = CURRENT.load(Ordering::Relaxed);
     table()
         .get(cur)
@@ -209,14 +226,69 @@ fn has_deliverable() -> bool {
 
 /// Block the current process until someone wakes it (rewind-on-wake).
 pub fn sleep_current(frame: &mut TrapFrame) {
-    table()[CURRENT.load(Ordering::Relaxed)]
-        .as_mut()
-        .unwrap()
-        .state = State::Sleeping;
+    sleep_inner(frame, None);
+}
+
+/// Sleep until an absolute tick deadline; the re-executed syscall observes
+/// the expiry via `deadline_passed`.
+pub fn sleep_timed(frame: &mut TrapFrame, deadline: u64) {
+    sleep_inner(frame, Some(deadline));
+}
+
+fn sleep_inner(frame: &mut TrapFrame, deadline: Option<u64>) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    {
+        let p = table()[cur].as_mut().unwrap();
+        p.state = State::Sleeping;
+        p.wake_at = deadline;
+    }
     if !schedule(frame) {
         let idle: extern "C" fn() -> ! = crate::kernel_idle;
         frame.elr = idle as *const () as u64;
         frame.spsr = 0x345;
+    }
+}
+
+/// True (and clears) when the current process's sleep deadline has passed.
+pub fn deadline_passed() -> bool {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let now = crate::arch::timer::now();
+    let Some(p) = table()[cur].as_mut() else { return false };
+    match p.wake_at {
+        Some(at) if now >= at => {
+            p.wake_at = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Clear a stale deadline (syscall completed without timing out).
+pub fn deadline_clear() {
+    if let Some(p) = table()[CURRENT.load(Ordering::Relaxed)].as_mut() {
+        p.wake_at = None;
+    }
+}
+
+/// Current sleep deadline, if one is armed.
+pub fn deadline() -> Option<u64> {
+    table()[CURRENT.load(Ordering::Relaxed)]
+        .as_ref()
+        .and_then(|p| p.wake_at)
+}
+
+/// Wake sleepers whose deadline expired (timer IRQ path).
+pub fn wake_expired() {
+    let now = crate::arch::timer::now();
+    let t = table();
+    for o in t.iter_mut() {
+        if let Some(p) = o {
+            if p.state == State::Sleeping && p.wake_at.is_some_and(|at| now >= at) {
+                p.state = State::Runnable;
+                p.frame.elr = p.frame.elr.wrapping_sub(4);
+                // wake_at stays: the re-executed syscall decides and clears.
+            }
+        }
     }
 }
 
@@ -300,6 +372,8 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         brk,
         mmap_next,
         sig_linux,
+        pgrp: t[cur].as_ref().unwrap().pgrp, // children share the group
+        wake_at: None,
     });
     kprintln!("proc: fork pid {} (parent {})", pid, t[cur].as_ref().unwrap().pid);
     Ok(pid)
@@ -815,38 +889,124 @@ pub fn sys_kill(pid: i64, sig: u64) -> Result<(), u8> {
         return Err(ESRCH);
     };
 
+    signal_one(slot, cur, sig);
+    Ok(())
+}
+
+/// Queue `sig` on `slot` with kill(2) semantics: running targets get the
+/// pending bit (delivered at their return boundary), sleeping targets are
+/// woken (catchable) or zombified at once (default-terminate) — otherwise
+/// a sleeper would never reach a return boundary to notice.
+fn signal_one(slot: usize, cur: usize, sig: u64) {
+    let t = table();
     if slot == cur {
         t[cur].as_mut().unwrap().pending |= 1 << sig;
-        return Ok(()); // delivered at this syscall's return boundary
+        return;
     }
-
     let action = t[slot].as_ref().unwrap().handlers[sig as usize];
     let term = sig == SIGKILL as u64 || (action == SIG_DFL && default_is_term(sig as usize));
-    {
-        let p = t[slot].as_mut().unwrap();
-        p.pending |= 1 << sig;
-        let masked = (p.blocked >> sig) & 1 == 1;
-        if p.state == State::Sleeping {
-            if term && !masked {
-                p.state = State::Zombie;
-                p.exit_code = sig as i32;
-                p.signaled = true;
-                p.pending = 0;
-                file::release_all(&p.fds);
-                wake_parent(slot);
-            } else if action > SIG_IGN {
-                // Catchable signal: wake so delivery happens on resume.
-                // Rewind ELR so an interrupted syscall re-executes after
-                // the handler's sigreturn (restart semantics).
-                p.frame.elr = p.frame.elr.wrapping_sub(4);
-                p.state = State::Runnable;
-            } else {
-                p.state = State::Runnable; // IGN by default: wake on resume
-                p.frame.elr = p.frame.elr.wrapping_sub(4);
-            }
+    let pid = t[slot].as_ref().unwrap().pid;
+    let p = t[slot].as_mut().unwrap();
+    p.pending |= 1 << sig;
+    let masked = (p.blocked >> sig) & 1 == 1;
+    if p.state == State::Sleeping {
+        if term && !masked {
+            p.state = State::Zombie;
+            p.exit_code = sig as i32;
+            p.signaled = true;
+            p.pending = 0;
+            file::release_all(&p.fds);
+            kprintln!("proc: pid {pid} killed by signal {sig}");
+            wake_parent(slot);
+        } else {
+            // Wake so delivery happens on resume; rewind ELR so the
+            // interrupted syscall re-executes after the handler's
+            // sigreturn (restart semantics).
+            p.frame.elr = p.frame.elr.wrapping_sub(4);
+            p.state = State::Runnable;
         }
     }
+}
+
+// ---------- job control: process groups + tty foreground ----------
+
+/// tty foreground process group; None = never set via TIOCSPGRP.
+/// ^C is dropped while unset (our own shell never establishes one).
+static FG_PGRP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+pub fn fg_pgrp() -> Option<usize> {
+    let v = FG_PGRP.load(Ordering::Relaxed);
+    (v != usize::MAX).then_some(v)
+}
+
+pub fn set_fg_pgrp(pgrp: usize) {
+    FG_PGRP.store(pgrp, Ordering::Relaxed);
+}
+
+/// tty ^C: SIGINT (canonical 2 — identical in both ABIs) to the
+/// foreground process group. No-op while no group is established.
+pub fn sigint_foreground() {
+    let Some(fg) = fg_pgrp() else { return };
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let slots: alloc::vec::Vec<usize> = table()
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| {
+            o.as_ref()
+                .is_some_and(|p| p.pgrp == fg && p.state != State::Zombie)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for slot in slots {
+        signal_one(slot, cur, 2); // SIGINT
+    }
+}
+
+/// Linux setpgid(pid, pgid): pid 0 = self, pgid 0 = make `pid` the leader.
+/// V1: may change self or own children only (POSIX session checks skipped).
+pub fn sys_setpgid(pid: i64, pgid: i64) -> Result<(), u8> {
+    if pgid < 0 {
+        return Err(EINVAL);
+    }
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let t = table();
+    let target_pid = if pid == 0 { t[cur].as_ref().unwrap().pid } else { pid as usize };
+    let Some(slot) = t
+        .iter()
+        .position(|o| o.as_ref().is_some_and(|p| p.pid == target_pid && p.state != State::Zombie))
+    else {
+        return Err(ESRCH);
+    };
+    if slot != cur && t[slot].as_ref().unwrap().parent != cur {
+        return Err(EPERM_L);
+    }
+    let new_pgrp = if pgid == 0 { target_pid } else { pgid as usize };
+    t[slot].as_mut().unwrap().pgrp = new_pgrp;
     Ok(())
+}
+
+/// Linux getpgid(pid): pid 0 = self.
+pub fn sys_getpgid(pid: i64) -> Result<usize, u8> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let t = table();
+    let target = if pid == 0 { t[cur].as_ref().unwrap().pid } else { pid as usize };
+    t.iter()
+        .find(|o| o.as_ref().is_some_and(|p| p.pid == target && p.state != State::Zombie))
+        .map(|o| o.as_ref().unwrap().pgrp)
+        .ok_or(ESRCH)
+}
+
+/// Linux setsid(2): become session + group leader (v1: no session state,
+/// just take own pgrp). EPERM if already a group leader.
+pub fn sys_setsid() -> Result<usize, u8> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let t = table();
+    let p = t[cur].as_mut().unwrap();
+    if p.pgrp == p.pid {
+        return Err(EPERM_L);
+    }
+    p.pgrp = p.pid;
+    Ok(p.pid)
 }
 
 /// SYS___sigaction_sigtramp (340): install/inspect a handler.

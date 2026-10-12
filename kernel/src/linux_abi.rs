@@ -40,6 +40,14 @@ pub fn svc(frame: &mut TrapFrame) {
                 Err(e) => (0, e),
             },
         },
+        130 => match proc::sig_from_user(frame.x[1] as i64, true) {
+            // tkill(tid, sig): single-threaded → kill(tid, sig)
+            None => (0, 22),
+            Some(sig) => match proc::sys_kill(frame.x[0] as i64, sig as u64) {
+                Ok(()) => (0, 0),
+                Err(e) => (0, e),
+            },
+        },
         131 => match proc::sig_from_user(frame.x[2] as i64, true) {
             // tgkill(tgid, tid, sig): single-threaded → kill(tid, sig)
             None => (0, 22),
@@ -115,7 +123,7 @@ pub fn svc(frame: &mut TrapFrame) {
         222 => {
             // mmap: anonymous bumps only (v1)
             if frame.x[3] & MAP_ANONYMOUS == 0 {
-                (0, 38) // ENOSYS: file-backed mappings
+                (0, 78) // ENOSYS (internal code; translated below)
             } else {
                 match proc::sys_mmap(frame.x[1]) {
                     Ok(base) => (base as i64, 0),
@@ -174,11 +182,50 @@ pub fn svc(frame: &mut TrapFrame) {
             frame.x[2],
             frame.x[3] as usize,
         ),
+        73 => match ppoll(frame, frame.x[0], frame.x[1], frame.x[2]) {
+            Io::Val(n) => (n, 0),
+            Io::Err(e) => (0, e),
+            Io::Slept => return,
+        },
+        101 => match nanosleep(frame, frame.x[0], frame.x[1]) {
+            Io::Val(n) => (n, 0),
+            Io::Err(e) => (0, e),
+            Io::Slept => return,
+        },
+        115 => {
+            // clock_nanosleep(clockid, flags, req, rem): relative only (v1)
+            if frame.x[1] & 1 != 0 {
+                (0, 22) // TIMER_ABSTIME unsupported
+            } else {
+                match nanosleep(frame, frame.x[2], frame.x[3]) {
+                    Io::Val(n) => (n, 0),
+                    Io::Err(e) => (0, e),
+                    Io::Slept => return,
+                }
+            }
+        }
+        154 => match proc::sys_setpgid(frame.x[0] as i64, frame.x[1] as i64) {
+            // setpgid
+            Ok(()) => (0, 0),
+            Err(e) => (0, e),
+        },
+        155 => match proc::sys_getpgid(frame.x[0] as i64) {
+            // getpgid
+            Ok(g) => (g as i64, 0),
+            Err(e) => (0, e),
+        },
+        157 => match proc::sys_setsid() {
+            // setsid
+            Ok(pid) => (pid as i64, 0),
+            Err(e) => (0, e),
+        },
         // Identity: single-user root. Observed from ash/musl startup.
         144 => (0, 0), // setgid
         146 => (0, 0), // setuid
         174 => (0, 0), // getuid
+        175 => (0, 0), // geteuid
         176 => (0, 0), // getgid
+        177 => (0, 0), // getegid
         135 => match proc::sys_sigprocmask(frame.x[0] as i64 + 1, frame.x[1], frame.x[2]) {
             // Linux how 0/1/2 -> NetBSD 1/2/3
             Ok(()) => (0, 0),
@@ -202,9 +249,204 @@ pub fn svc(frame: &mut TrapFrame) {
         );
     }
     if err != 0 {
-        frame.x[0] = (-(err as i64)) as u64;
+        frame.x[0] = (-(linux_errno(err) as i64)) as u64;
     } else {
         frame.x[0] = result as u64;
+    }
+}
+
+// ---------- ppoll / nanosleep (deadline-based sleeps) ----------
+
+const POLLIN: u16 = 0x001;
+const POLLOUT: u16 = 0x004;
+const POLLERR: u16 = 0x008;
+const POLLHUP: u16 = 0x010;
+const POLLNVAL: u16 = 0x020;
+
+/// Readiness of one fd for the events requested in `events`.
+fn poll_revents(fd: i32, events: u16) -> u16 {
+    if fd < 0 {
+        return 0; // negative fds are ignored per POSIX
+    }
+    let Some(target) = proc::current_target(fd as usize) else {
+        return POLLNVAL;
+    };
+    match target {
+        FdTarget::TtyIn => {
+            if crate::tty::has_data() {
+                events & POLLIN
+            } else {
+                0
+            }
+        }
+        FdTarget::TtyOut => events & POLLOUT,
+        // Regular files never block: always readable/writable.
+        FdTarget::File(_) => events & (POLLIN | POLLOUT),
+        FdTarget::Pipe { slot, write_end: false } => {
+            let data = file::pipe_avail(slot);
+            let mut r = events & POLLIN & if data > 0 { !0 } else { 0 };
+            if proc::pipe_end_count(slot, true) == 0 {
+                r |= POLLHUP; // no writers: hangup is reported unconditionally
+                if data == 0 {
+                    r |= events & POLLIN; // EOF: read would return 0
+                }
+            }
+            r
+        }
+        FdTarget::Pipe { slot, write_end: true } => {
+            if proc::pipe_end_count(slot, false) == 0 {
+                return POLLERR; // no readers
+            }
+            if file::pipe_free(slot) > 0 {
+                events & POLLOUT
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// ppoll(73): poll(fds, nfds, timeout*, sigmask*). timeout NULL = block
+/// until ready; {0,0} = return now; else deadline wake. sigmask ignored.
+fn ppoll(frame: &mut TrapFrame, fds: u64, nfds: u64, timeout: u64) -> Io {
+    if nfds > 64 {
+        return Io::Err(file::EINVAL);
+    }
+    let bytes = nfds as usize * 8;
+    if bytes != 0 && !proc::user_range_ok(fds, bytes) {
+        return Io::Err(file::EFAULT);
+    }
+    let mut nready = 0usize;
+    for i in 0..nfds as usize {
+        let base = fds + (i as u64) * 8;
+        let (fd, events) = unsafe {
+            (
+                *((base) as *const i32),
+                *((base + 4) as *const u16),
+            )
+        };
+        let revents = poll_revents(fd, events);
+        unsafe { *((base + 6) as *mut u16) = revents };
+        if revents != 0 {
+            nready += 1;
+        }
+    }
+    if nready > 0 {
+        proc::deadline_clear();
+        return Io::Val(nready as i64);
+    }
+    if proc::has_deliverable() {
+        proc::deadline_clear();
+        return Io::Err(file::EINTR);
+    }
+    if timeout == 0 {
+        // Infinite: sleep until an event (tty/pipe) rewinds us.
+        proc::deadline_clear();
+        proc::sleep_current(frame);
+        return Io::Slept;
+    }
+    if !proc::user_range_ok(timeout, 16) {
+        proc::deadline_clear();
+        return Io::Err(file::EFAULT);
+    }
+    let (sec, nsec) = unsafe {
+        (
+            *((timeout) as *const i64),
+            *((timeout + 8) as *const i64),
+        )
+    };
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        proc::deadline_clear();
+        return Io::Err(file::EINVAL);
+    }
+    if sec == 0 && nsec == 0 {
+        proc::deadline_clear();
+        return Io::Val(0);
+    }
+    // Reuse the armed deadline across event-driven re-entries so stray
+    // wakes can't postpone the timeout indefinitely.
+    match proc::deadline() {
+        Some(at) => {
+            if proc::deadline_passed() {
+                return Io::Val(0);
+            }
+            proc::sleep_timed(frame, at);
+            Io::Slept
+        }
+        None => {
+            let dur = deadline_ticks(sec, nsec);
+            let at = crate::arch::timer::now().saturating_add(dur);
+            proc::sleep_timed(frame, at);
+            Io::Slept
+        }
+    }
+}
+
+/// Convert a relative timespec to ticks (at least one, for nonzero input).
+fn deadline_ticks(sec: i64, nsec: i64) -> u64 {
+    let hz = crate::arch::timer::hz();
+    let ticks = sec as u64 * hz + (nsec as u64).div_ceil(1_000_000_000 / hz);
+    ticks.max(1)
+}
+
+/// nanosleep(101): relative sleep with deadline wake + EINTR semantics.
+fn nanosleep(frame: &mut TrapFrame, req: u64, rem: u64) -> Io {
+    if !proc::user_range_ok(req, 16) {
+        proc::deadline_clear();
+        return Io::Err(file::EFAULT);
+    }
+    let (sec, nsec) = unsafe { (*((req) as *const i64), *((req + 8) as *const i64)) };
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        proc::deadline_clear();
+        return Io::Err(file::EINVAL);
+    }
+    if proc::has_deliverable() {
+        write_rem(rem, sec, nsec);
+        proc::deadline_clear();
+        return Io::Err(file::EINTR);
+    }
+    if sec == 0 && nsec == 0 {
+        proc::deadline_clear();
+        return Io::Val(0);
+    }
+    match proc::deadline() {
+        Some(at) => {
+            if proc::deadline_passed() {
+                return Io::Val(0);
+            }
+            proc::sleep_timed(frame, at);
+            Io::Slept
+        }
+        None => {
+            let at = crate::arch::timer::now().saturating_add(deadline_ticks(sec, nsec));
+            proc::sleep_timed(frame, at);
+            Io::Slept
+        }
+    }
+}
+
+/// Report remaining time to the caller on EINTR (best effort).
+fn write_rem(rem: u64, sec: i64, nsec: i64) {
+    if rem == 0 || !proc::user_range_ok(rem, 16) {
+        return;
+    }
+    unsafe {
+        *((rem) as *mut i64) = sec;
+        *((rem + 8) as *mut i64) = nsec;
+    }
+}
+
+/// Kernel-internal errnos are NetBSD-coded (the NetBSD ABI is primary);
+/// asm-generic Linux diverges on a handful. Translate at the boundary so
+/// musl/strerror see the right names (ENOSYS 78-vs-38 showed up as
+/// "No error information" in ash).
+fn linux_errno(e: u8) -> u8 {
+    match e {
+        78 => 38, // ENOSYS
+        66 => 39, // ENOTEMPTY
+        35 => 11, // EAGAIN
+        63 => 36, // ENAMETOOLONG
+        other => other,
     }
 }
 
@@ -437,7 +679,32 @@ fn ioctl(fd: usize, cmd: u64, arg: u64) -> (i64, u8) {
             }
             (0, 0)
         }
-        _ => (0, 25), // ENOTTY
+        0x540F => {
+            // TIOCGPGRP: report the foreground group (caller's own when
+            // none established yet — matches a fresh controlling tty).
+            if !proc::user_range_ok(arg, 4) {
+                return (0, 14);
+            }
+            let g = proc::fg_pgrp().unwrap_or_else(proc::current_pgrp) as i32;
+            unsafe { (arg as *mut i32).write_volatile(g) };
+            (0, 0)
+        }
+        0x5410 => {
+            // TIOCSPGRP: establish the ^C target group.
+            if !proc::user_range_ok(arg, 4) {
+                return (0, 14);
+            }
+            let g = unsafe { (arg as *const i32).read_volatile() };
+            if g < 0 {
+                return (0, 22);
+            }
+            proc::set_fg_pgrp(g as usize);
+            (0, 0)
+        }
+        _ => {
+            kprintln!("[linux] ioctl ENOTTY cmd={:#x} fd={fd}", cmd);
+            (0, 25) // ENOTTY
+        }
     }
 }
 

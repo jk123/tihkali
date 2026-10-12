@@ -21,6 +21,12 @@ pub fn init() {
 pub fn on_rx() {
     while tihkali_hal::console::rx_pending() {
         let c = tihkali_hal::console::getc();
+        if c == 0x03 {
+            // Ctrl-C: line-discipline ISIG — SIGINT the foreground group
+            // instead of queueing the byte (v1: ISIG always on).
+            proc::sigint_foreground();
+            continue;
+        }
         unsafe {
             let (buf, inp) = (&raw mut BUF, &raw mut IN);
             if (*inp - OUT) < CAP {
@@ -30,6 +36,11 @@ pub fn on_rx() {
         }
     }
     proc::wake_sleeping();
+}
+
+/// True when unread input is queued (poll readiness; no consumption).
+pub fn has_data() -> bool {
+    unsafe { (*&raw const IN) != (*&raw const OUT) }
 }
 
 /// Pop up to `len` bytes into the (already validated) user buffer.

@@ -59,7 +59,7 @@ fi
 
 echo "== session 1: fs ops + write-back"
 S1="$T/s1.log"
-( sleep 1.5
+( sleep 3
   printf 'mkdir /w\n';      sleep 0.3
   printf 'save /w/a alpha data\n'; sleep 0.3
   printf 'sync\n';          sleep 2.0
@@ -72,7 +72,7 @@ gate_bad  "s1" "$S1"
 
 echo "== session 2: persistence across reboot"
 S2="$T/s2.log"
-( sleep 1.5
+( sleep 3
   printf 'ls /w\n';          sleep 0.3
   printf 'cat /w/a\n';       sleep 0.3
   printf 'rm /w/a\n';        sleep 0.3
@@ -86,7 +86,7 @@ gate_bad  "s2" "$S2"
 
 echo "== session 3: signals + mask + jobs"
 S3="$T/s3.log"
-( sleep 1.5
+( sleep 3
   printf 'trap 15\n';        sleep 0.3
   printf 'kill 15\n';        sleep 0.5
   printf 'sigblock 15\n';    sleep 0.3
@@ -108,7 +108,7 @@ gate_bad  "s3" "$S3"
 
 echo "== session 4: embedded fallback (--no-drive)"
 S4="$T/s4.log"
-( sleep 1.5
+( sleep 3
   printf 'ls /bin\n';        sleep 0.3
   printf 'cat /etc/motd\n';  sleep 0.3
   printf 'exit\n'
@@ -121,7 +121,7 @@ gate_bad  "s4" "$S4"
 
 echo "== session 5: Linux ABI personality"
 S5="$T/s5.log"
-( sleep 1.5
+( sleep 3
   printf 'linux-hello\n'
   sleep 2.0
   printf 'exit\n'
@@ -133,7 +133,7 @@ gate_bad  "s5" "$S5"
 
 echo "== session 6: Raspberry Pi 3 (raspi3b, embedded initramfs)"
 S6="$T/s6.log"
-( sleep 2
+( sleep 3
   printf 'ls /bin\n';    sleep 0.6
   printf 'greet\n';      sleep 1.5
   printf 'exit\n'
@@ -149,7 +149,7 @@ gate_bad  "s6" "$S6"
 
 echo "== session 7: Linux ABI depth + Alpine busybox"
 S7="$T/s7.log"
-( sleep 1.5
+( sleep 3
   printf 'linux-probe\n'
   sleep 3
   printf 'busybox echo hello-from-alpine\n'
@@ -170,7 +170,7 @@ gate_bad  "s7" "$S7"
 
 echo "== session 8: busybox ash (POSIX shell: script + pipeline + applets)"
 S8="$T/s8.log"
-( sleep 1.8
+( sleep 3
   printf 'busybox ash /etc/demo.sh\n'
   sleep 3
   printf 'busybox cat /etc/motd\n'
@@ -186,6 +186,32 @@ gate_has "s8: file cat via sendfile"    "$S8" 'Welcome to tihkali'
 gate_has "s8: applet symlink ls"        "$S8" 'linux-hello'
 gate_count "s8: no ENOSYS noise"        "$S8" 'ENOSYS' 0
 gate_bad  "s8" "$S8"
+
+echo "== session 9: job control — interactive ash, ppoll line editing, Ctrl-C"
+S9="$T/s9.log"
+( sleep 3
+  printf 'busybox ash\n'
+  sleep 3
+  printf 'echo interactive-ok\n'
+  sleep 2
+  printf 'sleep 100\n'
+  sleep 2
+  printf '\003'
+  sleep 2
+  printf 'echo alive-after-ctrlc\n'
+  sleep 2
+  printf 'exit\n'
+  sleep 1.5
+  printf 'exit\n'
+) | timeout 20 ./tools/run.sh >"$S9" 2>&1
+gate_has "s9: interactive line editing (ppoll)" "$S9" 'interactive-ok'
+gate_has "s9: ^C killed fg sleep"               "$S9" 'proc: pid [0-9]+ killed by signal 2'
+gate_has "s9: ash survived ^C"                  "$S9" 'alive-after-ctrlc'
+gate_count "s9: job control enabled"           "$S9" 'job control turned off' 0
+gate_count "s9: no ENOSYS noise"                "$S9" 'ENOSYS' 0
+gate_has "s9: ash exited 0"                     "$S9" 'sh: busybox exited 0'
+gate_has "s9: clean exit"                       "$S9" 'proc: pid 0 exited \(0\)'
+gate_bad  "s9" "$S9"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

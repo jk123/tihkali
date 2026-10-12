@@ -12,10 +12,14 @@ space lives at VA 4 GiB, kernel identity-maps all RAM in every address space).
 warning is a failure. Sessions use scripted stdin:
 
 ```sh
-(sleep 1.5; printf 'ls\n'; sleep 0.5; printf 'exit\n') | timeout 12 ./tools/run.sh
+(sleep 3; printf 'ls\n'; sleep 0.5; printf 'exit\n') | timeout 12 ./tools/run.sh
 ```
 
-Input must start after ~1.5 s (kernel enables the UART receiver late).
+First input must start after **3 s**: run.sh runs `cargo build` first, and a
+rebuild (triggered by `sync` rewriting target/initramfs.img in a previous
+session) takes ~1.5 s on top of boot — anything earlier races the UART init
+and drops the first byte (symptom: `trap` → `rap`). Mid-session sleeps can
+stay short.
 
 ## Commands
 

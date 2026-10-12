@@ -247,7 +247,10 @@ pub extern "C" fn rust_irq_handler(frame: &mut TrapFrame) {
     let id = iar & 0x00ff_ffff;
     match id {
         gic::SPURIOUS => return,
-        gic::PPI_PHYS_TIMER => timer::on_tick(),
+        gic::PPI_PHYS_TIMER => {
+            timer::on_tick();
+            crate::proc::wake_expired();
+        }
         crate::tty::UART0_SPI => crate::tty::on_rx(),
         other => kprintln!("[irq] unhandled INTID {other}"),
     }
