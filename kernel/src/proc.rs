@@ -816,6 +816,8 @@ pub fn sys_read(frame: &mut TrapFrame, fd: usize, buf: u64, len: usize) -> Io {
             if has_deliverable() {
                 return Io::Err(EINTR);
             }
+            #[cfg(feature = "net")]
+            crate::net::poll_tick(); // service the NIC before checking the queue
             let user = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
             match crate::net::sock_recv(slot, user, None) {
                 Ok(0) => Io::Val(0), // TCP FIN → EOF

@@ -22,15 +22,27 @@ fi
 # raspi3 has no virtio — the embedded initramfs is used).
 QEMU_ARGS=()
 MODE=virt
-for a in "$@"; do
+HOSTFWD=""
+i=1
+while [ "$i" -le "$#" ]; do
+    a="$1"
     if [ "$a" = "--no-drive" ]; then
         DRIVE_ARGS=()
     elif [ "$a" = "--rpi" ]; then
         MODE=rpi
         DRIVE_ARGS=()
+    elif [ "$a" = "--hostfwd" ]; then
+        # Consume the next arg: a SLIRP hostfwd rule body, e.g.
+        # "tcp:127.0.0.1:18082-10.0.2.15:18082". Attached to the -netdev
+        # user line so the host can reach a guest port.
+        shift
+        HOSTFWD="$1"
+        i=$((i+1))
     else
         QEMU_ARGS+=("$a")
     fi
+    shift
+    i=$((i+1))
 done
 
 if [ "$MODE" = "rpi" ]; then
@@ -59,6 +71,7 @@ exec "$QEMU" \
     -display none -serial stdio -monitor none \
     -global virtio-mmio.force-legacy=false \
     "${DRIVE_ARGS[@]}" \
-    -device virtio-net-device,netdev=n0 -netdev user,id=n0 \
+    -device virtio-net-device,netdev=n0 \
+    $( [ -n "$HOSTFWD" ] && echo "-netdev user,id=n0,hostfwd=$HOSTFWD" || echo "-netdev user,id=n0" ) \
     -kernel "$BIN" \
     "${QEMU_ARGS[@]}"

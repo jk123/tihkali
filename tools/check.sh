@@ -324,6 +324,37 @@ gate_count "s14: no ENOSYS"   "$S14" 'ENOSYS' 0
 gate_has   "s14: clean exit"  "$S14" 'proc: pid 0 exited \(0\)'
 gate_bad   "s14" "$S14"
 
+echo "== session 15: TCP listen/accept — host connects to guest server (N4)"
+S15="$T/s15.log"
+S15H="$T/s15host.log"
+python3 - "$S15H" <<'PY' &
+import socket, time, sys
+out = open(sys.argv[1], "w")
+time.sleep(6)  # let the guest boot + start listening
+try:
+    s = socket.create_connection(("127.0.0.1", 18082), timeout=15)
+    s.sendall(b"X")
+    time.sleep(0.5)  # let the guest echo + FIN settle before the read
+    got = s.recv(16)
+    out.write(f"s15host: echo={got!r}\n")
+    s.close()
+except Exception as e:
+    out.write(f"s15host: connect failed: {e}\n")
+out.close()
+PY
+HOSTP=$!
+( sleep 4
+  printf 'netserver\n'; sleep 14
+  printf '\n'; sleep 1
+  printf 'exit\n'; sleep 4
+) | timeout 45 ./tools/run.sh --hostfwd "tcp:127.0.0.1:18082-10.0.2.15:18082" >"$S15" 2>&1
+wait "$HOSTP" 2>/dev/null
+gate_has   "s15: accepted peer" "$S15" 'netserver: peer port'
+gate_has   "s15: host echo"     "$S15H" "s15host: echo=b'X'"
+gate_count "s15: no ENOSYS"     "$S15" 'ENOSYS' 0
+gate_has   "s15: clean exit"    "$S15" 'proc: pid 0 exited \(0\)'
+gate_bad   "s15" "$S15"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

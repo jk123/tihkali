@@ -442,6 +442,57 @@ pub fn svc(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
+        201 => {
+            // listen(fd, backlog)
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => match crate::net::sock_listen(slot, frame.x[1] as i32) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (0, e),
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        202 => {
+            // accept(fd, addr* out, addrlen* out): blocks via sleep/wake —
+            // each wake re-enters and re-checks the listener's state.
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => {
+                    crate::net::poll_tick(); // flush anything queued
+                    match crate::net::sock_accept(slot) {
+                        Err(e) => (0, e),
+                        Ok(crate::net::Acc::Done((peer, data_slot))) => {
+                            // Fill the out-params with the peer's address.
+                            if frame.x[1] != 0 && proc::user_range_ok(frame.x[1], 16) {
+                                let _ = write_sockaddr_out(frame.x[1], frame.x[2], &peer.0, peer.1);
+                            }
+                            // smoltcp serves one connection per socket, so the
+                            // accepted connection lives in `data_slot` (the
+                            // same slot as the listener). Hand the caller a
+                            // fresh fd for it; the listener re-enters LISTEN
+                            // when that fd is closed (see `sock_close`).
+                            match proc::install_fd(FdTarget::Socket(data_slot)) {
+                                Ok(newfd) => (newfd as i64, 0),
+                                Err(e) => {
+                                    crate::net::sock_close(data_slot);
+                                    (0, e)
+                                }
+                            }
+                        }
+                        Ok(crate::net::Acc::Progress) => {
+                            if proc::has_deliverable() {
+                                (0, 4) // EINTR
+                            } else {
+                                proc::sleep_current(frame);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
         206 => {
             // sendto(fd, buf, len, flags, addr*, addrlen) — also plain
             // send() with a NULL address (TCP write path).

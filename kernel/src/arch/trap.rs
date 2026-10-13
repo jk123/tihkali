@@ -292,6 +292,61 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
+        106 => {
+            // SYS_listen(fd, backlog)
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => match crate::net::sock_listen(slot, frame.x[1] as i32) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (-1, e),
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        30 => {
+            // SYS_accept(fd, laddr, laddrp): blocking, mirrors Linux 202.
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => {
+                    crate::net::poll_tick();
+                    match crate::net::sock_accept(slot) {
+                        Err(e) => (-1, e),
+                        Ok(crate::net::Acc::Done((peer, data_slot))) => {
+                            if frame.x[1] != 0 && crate::proc::user_range_ok(frame.x[1], 16) {
+                                crate::net::write_netbsd_sockaddr_out(
+                                    frame.x[1],
+                                    frame.x[2],
+                                    peer.0,
+                                    peer.1,
+                                );
+                            }
+                            // smoltcp serves one connection per socket: the
+                            // accepted connection lives in `data_slot`. Hand
+                            // the caller a *fresh fd* for it; the listening
+                            // slot keeps listening for the next peer.
+                            match crate::proc::install_fd(crate::file::FdTarget::Socket(
+                                data_slot,
+                            )) {
+                                Ok(newfd) => (newfd as i64, 0),
+                                Err(e) => {
+                                    crate::net::sock_close(data_slot);
+                                    (-1, e)
+                                }
+                            }
+                        }
+                        Ok(crate::net::Acc::Progress) => {
+                            if crate::proc::has_deliverable() {
+                                (-1, 4) // EINTR
+                            } else {
+                                crate::proc::sleep_current(frame);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
         104 => {
             // SYS_bind(fd, sockaddr, addrlen)
             match crate::linux_abi::sock_slot(frame.x[0] as usize) {

@@ -26,7 +26,7 @@ use smoltcp::socket::udp;
 use smoltcp::storage::RingBuffer;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
 };
 
 use tihkali_hal::kprintln;
@@ -95,6 +95,8 @@ struct SockMeta {
     lport: u16,
     /// ICMP: peer set by connect() — used by NULL-dest send/sendto.
     peer_ip: [u8; 4],
+    /// TCP: listen(2) has been called on this slot.
+    listening: bool,
 }
 const SOCK_META_EMPTY: SockMeta = SockMeta {
     used: false,
@@ -104,6 +106,7 @@ const SOCK_META_EMPTY: SockMeta = SockMeta {
     connected: false,
     lport: 0,
     peer_ip: [0; 4],
+    listening: false,
 };
 static SOCK_META: NetCell<[SockMeta; NSOCK]> =
     NetCell(UnsafeCell::new([SOCK_META_EMPTY; NSOCK]));
@@ -439,6 +442,17 @@ pub fn poll_tick() {
     }
 }
 
+/// Service the NIC against the persistent socket pool WITHOUT waking
+/// sleepers (a send flush must not spuriously unblock an accept). Used
+/// by `sock_send` to push queued bytes to the wire inline.
+fn service_iface() {
+    let Some(iface) = iface_mut() else { return };
+    let mut dev = NetDev;
+    let store = sock_store();
+    let mut set = SocketSet::new(&mut store[..]);
+    let _ = iface.poll(Instant::from_millis(now_ms()), &mut dev, &mut set);
+}
+
 /// Run `f` against a SocketSet view of the persistent pool.
 fn with_set<R>(f: impl FnOnce(&mut SocketSet<'static>) -> R) -> R {
     let store = sock_store();
@@ -546,6 +560,7 @@ pub fn sock_open(kind: u32) -> Result<usize, u8> {
     meta[slot].connected = false;
     meta[slot].lport = 0;
     meta[slot].peer_ip = [0; 4];
+    meta[slot].listening = false;
     Ok(slot)
 }
 
@@ -558,11 +573,31 @@ pub fn sock_close(slot: usize) {
     if slot >= NSOCK || !meta[slot].used {
         return;
     }
+    // A close of an *accepted* connection on a listening slot hands the
+    // slot back to LISTEN (the listener owns the pool slot; see sock_accept).
+    let was_accepting = meta[slot].listening && meta[slot].connected;
     let handle = meta[slot].handle.expect("used slot has a handle");
     with_set(|set| {
         set.remove(handle);
+        if was_accepting {
+            // Re-open a fresh listener socket in the same slot: install a
+            // new socket, keep the listen endpoint, clear the per-connection
+            // flags.
+            let port = meta[slot].lport;
+            let nh = set.add(tcp::Socket::new(
+                RingBuffer::new(tcp_buf(slot, false)),
+                RingBuffer::new(tcp_buf(slot, true)),
+            ));
+            meta[slot] = SOCK_META_EMPTY;
+            meta[slot].used = true;
+            meta[slot].kind = SockKind::Tcp;
+            meta[slot].lport = port;
+            meta[slot].listening = true;
+            meta[slot].handle = Some(nh);
+        } else {
+            meta[slot] = SOCK_META_EMPTY;
+        }
     });
-    meta[slot] = SOCK_META_EMPTY;
 }
 
 fn tcp_sock<'a>(set: &'a mut SocketSet<'static>, slot: usize) -> &'a mut tcp::Socket<'static> {
@@ -713,6 +748,94 @@ pub fn sock_connect(slot: usize, ip: [u8; 4], port: u16) -> Result<Conn, u8> {
     }
 }
 
+/// listen(2): put a TCP socket into the LISTEN state. smoltcp accepts one
+/// connection per listen call, so after an accept the socket must be
+/// re-listened (see `sock_accept`). `backlog` is accepted but ignored
+/// (smoltcp has no queue).
+pub fn sock_listen(slot: usize, backlog: i32) -> Result<(), u8> {
+    let _ = backlog;
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used || meta[slot].kind != SockKind::Tcp {
+        return Err(EBADF);
+    }
+    let port = meta[slot].lport;
+    if port == 0 {
+        // No local port from bind(); pick one so listen() is addressable.
+        meta[slot].lport = EPHEMERAL_PORT + slot as u16;
+    }
+    with_set(|set| {
+        let s = tcp_sock(set, slot);
+        s.listen(IpListenEndpoint {
+            // addr: None = bind any (0.0.0.0). Passing UNSPECIFIED as a
+            // concrete addr makes smoltcp's accepts() require
+            // dst==0.0.0.0, which no real SYN carries.
+            addr: None,
+            port: meta[slot].lport,
+        })
+        .map_err(|_| EINVAL)
+    })?;
+    meta[slot].listening = true;
+    meta[slot].connected = false;
+    meta[slot].connecting = false;
+    Ok(())
+}
+
+pub enum Acc {
+    /// A peer connected and is now being served by the *same* slot — the
+    /// payload is `(remote peer, slot index)`. Read/write the slot directly.
+    Done((([u8; 4], u16), usize)),
+    /// Still waiting for a SYN — caller should sleep.
+    Progress,
+}
+
+/// accept(2) on a listening TCP socket. smoltcp serves **one connection at a
+/// time** on a listener, so this is not a backlogged accept that hands out a
+/// distinct fd: the caller's *listening* fd becomes the live data socket once
+/// a peer connects, and the kernel re-enters LISTEN only after the caller has
+/// consumed that connection (i.e. on the next `accept` after the socket is
+/// closed/reset). Idempotent across ELR rewinds — each re-entry just re-checks
+/// the smoltcp state machine.
+pub fn sock_accept(slot: usize) -> Result<Acc, u8> {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used || meta[slot].kind != SockKind::Tcp {
+        return Err(EBADF);
+    }
+    if !meta[slot].listening {
+        return Err(ENOTCONN);
+    }
+    with_set(|set| {
+        let s = tcp_sock(set, slot);
+        use tcp::State;
+        match s.state() {
+            State::Established => {
+                // This slot is now the live data connection (smoltcp serves
+                // one at a time). Report the peer + the slot that owns the
+                // connection. The slot stays in Established; `sock_close`
+                // re-enters LISTEN when the data fd is closed.
+                let peer = s.remote_endpoint().map(|e| {
+                    let IpAddress::Ipv4(a) = e.addr;
+                    (a.octets(), e.port)
+                });
+                let peer = peer.unwrap_or(([0u8; 4], 0));
+                meta[slot].connected = true;
+                Ok(Acc::Done((peer, slot)))
+            }
+            State::Closed => {
+                // The listener was aborted (e.g. connection reset / timed
+                // out). Re-enter LISTEN so the next SYN is accepted, and keep
+                // waiting.
+                s.listen(IpListenEndpoint {
+                    addr: None,
+                    port: meta[slot].lport,
+                })
+                .ok();
+                Ok(Acc::Progress)
+            }
+            _ => Ok(Acc::Progress), // Listen / SynReceived / waiting for ACK
+        }
+    })
+}
+
 /// send(2)/sendto(2) on a TCP socket: queues bytes (partial counts as
 /// success; a full buffer → EAGAIN for the caller to surface).
 pub fn sock_send(slot: usize, data: &[u8]) -> Result<usize, u8> {
@@ -726,20 +849,29 @@ pub fn sock_send(slot: usize, data: &[u8]) -> Result<usize, u8> {
             let peer = meta[slot].peer_ip;
             icmp_send(slot, data, peer)
         }
-        SockKind::Tcp => with_set(|set| {
-            let s = tcp_sock(set, slot);
-            match s.send_slice(data) {
-                Ok(0) if !data.is_empty() => Err(EAGAIN_L),
-                Ok(n) => Ok(n),
-                Err(tcp::SendError::InvalidState) => {
-                    Err(if meta[slot].connected {
-                        ECONNRESET
-                    } else {
-                        ENOTCONN
-                    })
+        SockKind::Tcp => {
+            let res = with_set(|set| {
+                let s = tcp_sock(set, slot);
+                match s.send_slice(data) {
+                    Ok(0) if !data.is_empty() => Err(EAGAIN_L),
+                    Ok(n) => Ok(n),
+                    Err(tcp::SendError::InvalidState) => {
+                        Err(if meta[slot].connected {
+                            ECONNRESET
+                        } else {
+                            ENOTCONN
+                        })
+                    }
                 }
+            });
+            // Transmit the queued bytes now — otherwise they sit in the tx
+            // ring until the next svc-tail / idle poll_tick, which may never
+            // come for a process that closes its socket right after writing.
+            if res.is_ok() {
+                service_iface();
             }
-        }),
+            res
+        }
     }
 }
 
