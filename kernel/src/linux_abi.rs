@@ -112,6 +112,11 @@ pub fn svc(frame: &mut TrapFrame) {
         29 => ioctl(frame.x[0] as usize, frame.x[1], frame.x[2]),
         17 => getcwd(frame.x[0], frame.x[1]), // getcwd(path, size)
         173 => (proc::current_ppid(), 0),     // getppid
+        23 => match proc::sys_dup3(frame.x[0] as i64, frame.x[1] as i64) {
+            // dup2(old, new) = dup3 without the flags
+            Ok(fd) => (fd as i64, 0),
+            Err(e) => (0, e),
+        },
         24 => match proc::sys_dup3(frame.x[0] as i64, frame.x[1] as i64) {
             // dup3(old, new, flags)
             Ok(fd) => (fd as i64, 0),
@@ -145,6 +150,17 @@ pub fn svc(frame: &mut TrapFrame) {
         },
         // --- time ---
         113 => clock_gettime(frame.x[0] as i32, frame.x[1]),
+        103 => {
+            // setitimer: accepted as a no-op (real timer+SIGALRM in N4);
+            // zero the old-struct out-param so callers see "no old timer".
+            let old_ptr = frame.x[2];
+            if old_ptr != 0 && proc::user_range_ok(old_ptr, 32) {
+                unsafe {
+                    (old_ptr as *mut u8).write_bytes(0, 32);
+                }
+            }
+            (0, 0)
+        }
         169 => gettimeofday(frame.x[0], frame.x[1]),
         160 => uname(frame.x[0]),
         // --- signals ---
@@ -366,15 +382,21 @@ pub fn svc(frame: &mut TrapFrame) {
             if frame.x[0] as i64 != 2 {
                 (0, crate::net::EAFNOSUPPORT) // AF_INET only
             } else {
-                match crate::net::sock_open((frame.x[1] & 0xf) as u32) {
-                    Ok(slot) => match proc::install_fd(FdTarget::Socket(slot)) {
-                        Ok(fd) => (fd as i64, 0),
-                        Err(e) => {
-                            crate::net::sock_close(slot);
-                            (0, e)
-                        }
+                match crate::net::socket_kind(
+                    (frame.x[1] & 0xf) as u32,
+                    frame.x[2] as u32,
+                ) {
+                    None => (0, crate::net::EAFNOSUPPORT),
+                    Some(kind) => match crate::net::sock_open(kind) {
+                        Ok(slot) => match proc::install_fd(FdTarget::Socket(slot)) {
+                            Ok(fd) => (fd as i64, 0),
+                            Err(e) => {
+                                crate::net::sock_close(slot);
+                                (0, e)
+                            }
+                        },
+                        Err(e) => (0, e),
                     },
-                    Err(e) => (0, e),
                 }
             }
         }
@@ -774,7 +796,7 @@ fn linux_errno(e: u8) -> u8 {
 
 /// Current process's fd → net pool slot (None if not a socket fd).
 #[cfg(feature = "net")]
-fn sock_slot(fd: usize) -> Option<usize> {
+pub fn sock_slot(fd: usize) -> Option<usize> {
     match proc::current_target(fd) {
         Some(FdTarget::Socket(s)) => Some(s),
         _ => None,

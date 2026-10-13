@@ -238,6 +238,168 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 crate::proc::Wait4::Err(e) => (-1, e),
             }
         }
+        #[cfg(feature = "net")]
+        394 | 97 => {
+            // SYS___socket30 / SYS_compat_30_socket (domain, type, proto)
+            match crate::net::socket_kind(
+                (frame.x[1] & 0xf) as u32,
+                frame.x[2] as u32,
+            ) {
+                None => (-1, crate::net::EAFNOSUPPORT),
+                Some(kind) => match crate::net::sock_open(kind) {
+                    Ok(slot) => match crate::proc::install_fd(
+                        crate::file::FdTarget::Socket(slot),
+                    ) {
+                        Ok(fd) => (fd as i64, 0),
+                        Err(e) => {
+                            crate::net::sock_close(slot);
+                            (-1, e)
+                        }
+                    },
+                    Err(e) => (-1, e),
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        98 => {
+            // SYS_connect(fd, sockaddr, addrlen): blocking on TCP — each
+            // wake re-enters the state machine (same contract as Linux 203).
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => {
+                    match crate::net::parse_netbsd_sockaddr_in(frame.x[1], frame.x[2]) {
+                        Err(e) => (-1, e),
+                        Ok((ip, port)) => {
+                            crate::net::poll_tick();
+                            match crate::net::sock_connect(slot, ip, port) {
+                                Err(e) => (-1, e),
+                                Ok(crate::net::Conn::Done) => (0, 0),
+                                Ok(crate::net::Conn::Failed) => {
+                                    (-1, crate::net::ECONNREFUSED)
+                                }
+                                Ok(crate::net::Conn::Progress) => {
+                                    if crate::proc::has_deliverable() {
+                                        (-1, 4) // EINTR
+                                    } else {
+                                        crate::proc::sleep_current(frame);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        104 => {
+            // SYS_bind(fd, sockaddr, addrlen)
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => match crate::net::parse_netbsd_sockaddr_in(frame.x[1], frame.x[2]) {
+                    Err(e) => (-1, e),
+                    Ok((ip, port)) => match crate::net::sock_bind(slot, ip, port) {
+                        Ok(()) => (0, 0),
+                        Err(e) => (-1, e),
+                    },
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        105 => {
+            // SYS_setsockopt: accepted, options ignored (polish in N4+).
+            (0, 0)
+        }
+        #[cfg(feature = "net")]
+        118 => {
+            // SYS_getsockopt: report a zero-length result.
+            let optlen_ptr = frame.x[4];
+            if optlen_ptr != 0 && crate::proc::user_range_ok(optlen_ptr, 4) {
+                unsafe {
+                    (optlen_ptr as *mut i32).write_unaligned(0);
+                }
+            }
+            (0, 0)
+        }
+        #[cfg(feature = "net")]
+        133 => {
+            // SYS_sendto(fd, buf, len, flags, to, tolen)
+            let len = frame.x[2] as usize;
+            if len == 0 {
+                (0, 0)
+            } else if !crate::proc::user_range_ok(frame.x[1], len) {
+                (-1, 14) // EFAULT
+            } else {
+                match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                    None => (-1, crate::file::EBADF),
+                    Some(slot) => {
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(frame.x[1] as *const u8, len)
+                        };
+                        if frame.x[4] == 0 {
+                            match crate::net::sock_send(slot, bytes) {
+                                Ok(n) => (n as i64, 0),
+                                Err(e) => (-1, e),
+                            }
+                        } else {
+                            match crate::net::parse_netbsd_sockaddr_in(frame.x[4], frame.x[5]) {
+                                Err(e) => (-1, e),
+                                Ok((ip, port)) => {
+                                    match crate::net::sock_send_to(slot, bytes, ip, port) {
+                                        Ok(n) => (n as i64, 0),
+                                        Err(e) => (-1, e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        29 => {
+            // SYS_recvfrom(fd, buf, len, flags, from, fromlen): blocking.
+            let len = frame.x[2] as usize;
+            if len == 0 {
+                (0, 0)
+            } else if !crate::proc::user_range_ok(frame.x[1], len) {
+                (-1, 14) // EFAULT
+            } else {
+                match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                    None => (-1, crate::file::EBADF),
+                    Some(slot) => {
+                        if crate::proc::has_deliverable() {
+                            (-1, 4) // EINTR
+                        } else {
+                            let want_from = frame.x[4] != 0;
+                            let mut src = ([0u8; 4], 0u16);
+                            let user = unsafe {
+                                core::slice::from_raw_parts_mut(frame.x[1] as *mut u8, len)
+                            };
+                            let from = if want_from { Some(&mut src) } else { None };
+                            match crate::net::sock_recv(slot, user, from) {
+                                Ok(n) => {
+                                    if want_from {
+                                        crate::net::write_netbsd_sockaddr_out(
+                                            frame.x[4],
+                                            frame.x[5],
+                                            src.0,
+                                            src.1,
+                                        );
+                                    }
+                                    (n as i64, 0)
+                                }
+                                Err(crate::net::EAGAIN_L) => {
+                                    crate::proc::sleep_current(frame);
+                                    return;
+                                }
+                                Err(e) => (-1, e),
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => {
             kprintln!("[user] unknown syscall {nr} at ELR {:#x}", frame.elr);
             (-1, 78) // ENOSYS

@@ -301,6 +301,29 @@ gate_count "s13: no ENOSYS"    "$S13" 'ENOSYS' 0
 gate_has   "s13: clean exit"   "$S13" 'proc: pid 0 exited \(0\)'
 gate_bad   "s13" "$S13"
 
+echo "== session 14: busybox ping/wget + NetBSD-door nettest (N3)"
+S14="$T/s14.log"
+N3DIR=$(mktemp -d)
+echo "tihkali-n3-ok" > "$N3DIR/n3.txt"
+python3 -m http.server 18081 --bind 127.0.0.1 --directory "$N3DIR" >/dev/null 2>&1 &
+HTTP=$!
+sleep 1
+( sleep 4
+  printf 'busybox ping -c 1 10.0.2.2\n'; sleep 4
+  printf 'busybox wget -O - http://10.0.2.2:18081/n3.txt\n'; sleep 4
+  printf 'nettest\n'; sleep 4
+  printf 'exit\n'; sleep 1
+) | timeout 30 ./tools/run.sh >"$S14" 2>&1
+kill "$HTTP" 2>/dev/null
+wait "$HTTP" 2>/dev/null
+rm -rf "$N3DIR"
+gate_has   "s14: ping reply"  "$S14" '64 bytes from 10.0.2.2'
+gate_has   "s14: wget body"   "$S14" 'tihkali-n3-ok'
+gate_has   "s14: nettest ok"  "$S14" 'nettest: ok'
+gate_count "s14: no ENOSYS"   "$S14" 'ENOSYS' 0
+gate_has   "s14: clean exit"  "$S14" 'proc: pid 0 exited \(0\)'
+gate_bad   "s14" "$S14"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

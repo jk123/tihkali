@@ -15,3 +15,7 @@ path = "src/greet.rs"
 [[bin]]
 name = "tihkali-sh"
 path = "src/sh.rs"
+
+[[bin]]
+name = "tihkali-nettest"
+path = "src/nettest.rs"

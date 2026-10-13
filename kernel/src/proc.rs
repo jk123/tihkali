@@ -978,7 +978,11 @@ pub fn sys_close(fd: usize) -> Result<(), u8> {
     match target {
         FdTarget::File(i) => file::close(i)?,
         #[cfg(feature = "net")]
-        FdTarget::Socket(s) => crate::net::sock_close(s),
+        // N3: a socket pool slot may be shared by dup'd fds (busybox ping
+        // dup2s its socket onto fd 0 then closes the original). Only the
+        // process exit (release_all) destroys the slot — without refcounts,
+        // closing one fd must not tear down the others (N4: refcounts).
+        FdTarget::Socket(_) => {}
         _ => {}
     }
     Ok(())

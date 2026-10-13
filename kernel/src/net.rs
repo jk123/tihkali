@@ -19,7 +19,7 @@ use smoltcp::iface::{Config, Interface, PollResult, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::icmp::{
     Endpoint as IcmpEndpoint, PacketBuffer as IcmpBuffer, PacketMetadata as IcmpMeta,
-    Socket as IcmpSocket,
+    RecvError as IcmpRecvError, SendError as IcmpSendError, Socket as IcmpSocket,
 };
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
@@ -78,6 +78,7 @@ static SOCK_STORE: NetCell<[SocketStorage<'static>; NSOCK]> =
 pub enum SockKind {
     Tcp,
     Udp,
+    Icmp,
 }
 struct SockMeta {
     used: bool,
@@ -92,6 +93,8 @@ struct SockMeta {
     connected: bool,
     /// UDP/TCP: local port chosen by bind() (0 = ephemeral at connect).
     lport: u16,
+    /// ICMP: peer set by connect() — used by NULL-dest send/sendto.
+    peer_ip: [u8; 4],
 }
 const SOCK_META_EMPTY: SockMeta = SockMeta {
     used: false,
@@ -100,6 +103,7 @@ const SOCK_META_EMPTY: SockMeta = SockMeta {
     connecting: false,
     connected: false,
     lport: 0,
+    peer_ip: [0; 4],
 };
 static SOCK_META: NetCell<[SockMeta; NSOCK]> =
     NetCell(UnsafeCell::new([SOCK_META_EMPTY; NSOCK]));
@@ -112,6 +116,16 @@ static UDP_RX_PAY: NetCell<[u8; NSOCK * UDP_PAY]> = NetCell(UnsafeCell::new([0; 
 static UDP_TX_META: NetCell<[udp::PacketMetadata; NSOCK * UDP_META]> =
     NetCell(UnsafeCell::new([udp::PacketMetadata::EMPTY; NSOCK * UDP_META]));
 static UDP_TX_PAY: NetCell<[u8; NSOCK * UDP_PAY]> = NetCell(UnsafeCell::new([0; NSOCK * UDP_PAY]));
+const ICMP_META: usize = 4;
+const ICMP_PAY: usize = 1024;
+static ICMP_RX_META: NetCell<[IcmpMeta; NSOCK * ICMP_META]> =
+    NetCell(UnsafeCell::new([IcmpMeta::EMPTY; NSOCK * ICMP_META]));
+static ICMP_RX_PAY: NetCell<[u8; NSOCK * ICMP_PAY]> =
+    NetCell(UnsafeCell::new([0; NSOCK * ICMP_PAY]));
+static ICMP_TX_META: NetCell<[IcmpMeta; NSOCK * ICMP_META]> =
+    NetCell(UnsafeCell::new([IcmpMeta::EMPTY; NSOCK * ICMP_META]));
+static ICMP_TX_PAY: NetCell<[u8; NSOCK * ICMP_PAY]> =
+    NetCell(UnsafeCell::new([0; NSOCK * ICMP_PAY]));
 
 fn iface_mut() -> Option<&'static mut Interface> {
     unsafe { (*IFACE.0.get()).as_mut() }
@@ -434,8 +448,59 @@ fn with_set<R>(f: impl FnOnce(&mut SocketSet<'static>) -> R) -> R {
 
 // ---------- socket pool ops (called from syscall arms) ----------
 
-/// socket(AF_INET, type) → pool slot. `kind`: 1=SOCK_STREAM, 2=SOCK_DGRAM
-/// (Linux and BSD share these values; higher bits are flags).
+/// Map a caller's (socket type, protocol) to a pool kind: 1=TCP, 2=UDP,
+/// 3=ICMP. Linux and NetBSD share the socket type values; only
+/// SOCK_RAW + IPPROTO_ICMP maps to the ICMP pool kind (busybox ping).
+pub fn socket_kind(ty: u32, proto: u32) -> Option<u32> {
+    match (ty & 0xf, proto) {
+        (1, _) => Some(1), // SOCK_STREAM
+        (2, _) => Some(2), // SOCK_DGRAM
+        (3, 1) => Some(3), // SOCK_RAW + IPPROTO_ICMP
+        _ => None,
+    }
+}
+
+/// NetBSD `struct sockaddr_in` (16 bytes): sa_len u8 @0, sa_family u8
+/// @1 (AF_INET=2), sin_port u16 BE @2, sin_addr u32 BE @4.
+pub fn parse_netbsd_sockaddr_in(user: u64, len: u64) -> Result<([u8; 4], u16), u8> {
+    if len < 8 || !crate::proc::user_range_ok(user, 8) {
+        return Err(EINVAL);
+    }
+    unsafe {
+        let p = user as *const u8;
+        if *p.add(1) != 2 {
+            return Err(EAFNOSUPPORT);
+        }
+        Ok((
+            [*p.add(4), *p.add(5), *p.add(6), *p.add(7)],
+            u16::from_be_bytes([*p.add(2), *p.add(3)]),
+        ))
+    }
+}
+
+/// Fill the `from` out-param of a NetBSD recvfrom: 16-byte sockaddr_in
+/// (sa_len=16, AF_INET) plus the socklen_t word.
+pub fn write_netbsd_sockaddr_out(dst: u64, outlen: u64, ip: [u8; 4], port: u16) {
+    if dst != 0 && crate::proc::user_range_ok(dst, 16) {
+        unsafe {
+            let p = dst as *mut u8;
+            p.write_bytes(0, 16);
+            p.write_volatile(16); // sa_len
+            p.add(1).write_volatile(2); // sa_family = AF_INET
+            p.add(2).write_volatile((port >> 8) as u8);
+            p.add(3).write_volatile(port as u8);
+            core::ptr::copy_nonoverlapping(ip.as_ptr(), p.add(4), 4);
+        }
+    }
+    if outlen != 0 && crate::proc::user_range_ok(outlen, 4) {
+        unsafe {
+            (outlen as *mut u32).write_volatile(16);
+        }
+    }
+}
+
+/// socket(AF_INET, type, proto) → pool slot. `kind`: 1=TCP, 2=UDP,
+/// 3=ICMP (see `socket_kind`).
 pub fn sock_open(kind: u32) -> Result<usize, u8> {
     if iface_mut().is_none() {
         return Err(EIO);
@@ -443,6 +508,7 @@ pub fn sock_open(kind: u32) -> Result<usize, u8> {
     let k = match kind {
         1 => SockKind::Tcp,
         2 => SockKind::Udp,
+        3 => SockKind::Icmp,
         _ => return Err(EINVAL),
     };
     let meta = meta();
@@ -466,6 +532,12 @@ pub fn sock_open(kind: u32) -> Result<usize, u8> {
             );
             set.add(s)
         }
+        SockKind::Icmp => {
+            let (rm, rp) = icmp_bufs(slot, false);
+            let (tm, tp) = icmp_bufs(slot, true);
+            let s = IcmpSocket::new(IcmpBuffer::new(rm, rp), IcmpBuffer::new(tm, tp));
+            set.add(s)
+        }
     });
     meta[slot].handle = Some(handle);
     meta[slot].used = true;
@@ -473,6 +545,7 @@ pub fn sock_open(kind: u32) -> Result<usize, u8> {
     meta[slot].connecting = false;
     meta[slot].connected = false;
     meta[slot].lport = 0;
+    meta[slot].peer_ip = [0; 4];
     Ok(slot)
 }
 
@@ -502,6 +575,34 @@ fn udp_sock<'a>(set: &'a mut SocketSet<'static>, slot: usize) -> &'a mut udp::So
     set.get_mut::<udp::Socket>(h)
 }
 
+fn icmp_bufs(i: usize, tx: bool) -> (&'static mut [IcmpMeta], &'static mut [u8]) {
+    let (meta_base, pay_base) = if tx {
+        (
+            ICMP_TX_META.0.get() as *mut IcmpMeta,
+            ICMP_TX_PAY.0.get() as *mut u8,
+        )
+    } else {
+        (
+            ICMP_RX_META.0.get() as *mut IcmpMeta,
+            ICMP_RX_PAY.0.get() as *mut u8,
+        )
+    };
+    unsafe {
+        (
+            core::slice::from_raw_parts_mut(meta_base.add(i * ICMP_META), ICMP_META),
+            core::slice::from_raw_parts_mut(pay_base.add(i * ICMP_PAY), ICMP_PAY),
+        )
+    }
+}
+
+fn icmp_sock<'a>(
+    set: &'a mut SocketSet<'static>,
+    slot: usize,
+) -> &'a mut IcmpSocket<'static> {
+    let h = meta()[slot].handle.expect("used slot has a handle");
+    set.get_mut::<IcmpSocket>(h)
+}
+
 /// bind(2): UDP binds for real; TCP records the local port for connect.
 pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
     let meta = meta();
@@ -524,6 +625,21 @@ pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
             ))
             .map_err(|_| EINVAL)
         }),
+        SockKind::Icmp => {
+            // `port` carries the echo identifier; 0 = stay unbound (the
+            // ident is captured from the first send).
+            if port == 0 {
+                Ok(())
+            } else {
+                with_set(|set| {
+                    let s = icmp_sock(set, slot);
+                    if s.is_open() {
+                        return Err(EINVAL);
+                    }
+                    s.bind(IcmpEndpoint::Ident(port)).map_err(|_| EINVAL)
+                })
+            }
+        }
     }
 }
 
@@ -537,53 +653,64 @@ pub enum Conn {
 /// each wake (ELR rewind) until ESTABLISHED / failure.
 pub fn sock_connect(slot: usize, ip: [u8; 4], port: u16) -> Result<Conn, u8> {
     let meta = meta();
-    if slot >= NSOCK || !meta[slot].used || meta[slot].kind != SockKind::Tcp {
+    if slot >= NSOCK || !meta[slot].used {
         return Err(EBADF);
     }
-    if port == 0 {
-        return Err(EINVAL);
-    }
-    if meta[slot].connected {
-        return Err(EISCONN);
-    }
-    with_set(|set| {
-        if !meta[slot].connecting {
-            let remote = IpEndpoint::new(
-                IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
-                port,
-            );
-            let local = if meta[slot].lport != 0 {
-                meta[slot].lport
-            } else {
-                EPHEMERAL_PORT + slot as u16
-            };
-            let iface = iface_mut().expect("iface");
-            let cx = iface.context();
-            let s = tcp_sock(set, slot);
-            match s.connect(cx, remote, local) {
-                Ok(()) => meta[slot].connecting = true,
-                Err(tcp::ConnectError::Unaddressable) => return Err(EINVAL),
-                Err(tcp::ConnectError::InvalidState) => {
-                    // Re-entry in an odd state: fall through to state check.
+    match meta[slot].kind {
+        SockKind::Icmp => {
+            // No handshake: record the peer for NULL-dest sends.
+            meta[slot].peer_ip = ip;
+            meta[slot].connected = true;
+            Ok(Conn::Done)
+        }
+        SockKind::Udp => Err(EINVAL),
+        SockKind::Tcp => {
+            if port == 0 {
+                return Err(EINVAL);
+            }
+            if meta[slot].connected {
+                return Err(EISCONN);
+            }
+            with_set(|set| {
+                if !meta[slot].connecting {
+                    let remote = IpEndpoint::new(
+                        IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
+                        port,
+                    );
+                    let local = if meta[slot].lport != 0 {
+                        meta[slot].lport
+                    } else {
+                        EPHEMERAL_PORT + slot as u16
+                    };
+                    let iface = iface_mut().expect("iface");
+                    let cx = iface.context();
+                    let s = tcp_sock(set, slot);
+                    match s.connect(cx, remote, local) {
+                        Ok(()) => meta[slot].connecting = true,
+                        Err(tcp::ConnectError::Unaddressable) => return Err(EINVAL),
+                        Err(tcp::ConnectError::InvalidState) => {
+                            // Re-entry in an odd state: fall through to state check.
+                        }
+                    }
                 }
-            }
+                let st = tcp_sock(set, slot).state();
+                use tcp::State;
+                match st {
+                    State::Established => {
+                        meta[slot].connecting = false;
+                        meta[slot].connected = true;
+                        Ok(Conn::Done)
+                    }
+                    State::Closed if meta[slot].connecting => {
+                        // smoltcp aborted (RST refused, or the connect timeout).
+                        meta[slot].connecting = false;
+                        Ok(Conn::Failed)
+                    }
+                    _ => Ok(Conn::Progress),
+                }
+            })
         }
-        let st = tcp_sock(set, slot).state();
-        use tcp::State;
-        match st {
-            State::Established => {
-                meta[slot].connecting = false;
-                meta[slot].connected = true;
-                Ok(Conn::Done)
-            }
-            State::Closed if meta[slot].connecting => {
-                // smoltcp aborted (RST refused, or the connect timeout).
-                meta[slot].connecting = false;
-                Ok(Conn::Failed)
-            }
-            _ => Ok(Conn::Progress),
-        }
-    })
+    }
 }
 
 /// send(2)/sendto(2) on a TCP socket: queues bytes (partial counts as
@@ -595,6 +722,10 @@ pub fn sock_send(slot: usize, data: &[u8]) -> Result<usize, u8> {
     }
     match meta[slot].kind {
         SockKind::Udp => Err(EINVAL), // UDP needs sendto's destination
+        SockKind::Icmp => {
+            let peer = meta[slot].peer_ip;
+            icmp_send(slot, data, peer)
+        }
         SockKind::Tcp => with_set(|set| {
             let s = tcp_sock(set, slot);
             match s.send_slice(data) {
@@ -612,42 +743,73 @@ pub fn sock_send(slot: usize, data: &[u8]) -> Result<usize, u8> {
     }
 }
 
-/// sendto(2) on a UDP socket (auto-binds an ephemeral local port first).
+/// ICMP send: `data` is a *complete* ICMPv4 message — smoltcp parses it
+/// with ChecksumCapabilities::ignored and passes it to the wire
+/// unchanged, so the caller's own checksum is what gets sent.
+fn icmp_send(slot: usize, data: &[u8], ip: [u8; 4]) -> Result<usize, u8> {
+    if data.len() < 8 {
+        return Err(EINVAL);
+    }
+    if ip == [0u8; 4] {
+        return Err(ENOTCONN);
+    }
+    with_set(|set| {
+        let s = icmp_sock(set, slot);
+        if !s.is_open() {
+            // First send on this socket: bind the echo identifier out of
+            // the message so the rx filter accepts its replies.
+            let ident = u16::from_be_bytes([data[4], data[5]]);
+            s.bind(IcmpEndpoint::Ident(ident)).map_err(|_| EINVAL)?;
+        }
+        match s.send_slice(
+            data,
+            IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
+        ) {
+            Ok(()) => Ok(data.len()),
+            Err(IcmpSendError::BufferFull) => Err(EAGAIN_L),
+            Err(IcmpSendError::Unaddressable) => Err(EINVAL),
+        }
+    })
+}
+
+/// sendto(2): UDP auto-binds an ephemeral local port first; ICMP routes
+/// to the explicit destination (or the connected peer via sock_send).
 pub fn sock_send_to(slot: usize, data: &[u8], ip: [u8; 4], port: u16) -> Result<usize, u8> {
     let meta = meta();
     if slot >= NSOCK || !meta[slot].used {
         return Err(EBADF);
     }
-    if meta[slot].kind != SockKind::Udp {
-        return Err(EINVAL);
-    }
-    with_set(|set| {
-        let s = udp_sock(set, slot);
-        if !s.is_open() {
-            let p = if meta[slot].lport != 0 {
-                meta[slot].lport
-            } else {
-                40_000 + slot as u16
-            };
-            if s.bind((
-                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
-                p,
-            ))
-            .is_err()
-            {
-                return Err(EINVAL);
+    match meta[slot].kind {
+        SockKind::Icmp => icmp_send(slot, data, ip),
+        SockKind::Tcp => Err(EINVAL),
+        SockKind::Udp => with_set(|set| {
+            let s = udp_sock(set, slot);
+            if !s.is_open() {
+                let p = if meta[slot].lport != 0 {
+                    meta[slot].lport
+                } else {
+                    40_000 + slot as u16
+                };
+                if s.bind((
+                    IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                    p,
+                ))
+                .is_err()
+                {
+                    return Err(EINVAL);
+                }
             }
-        }
-        let ep = IpEndpoint::new(
-            IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
-            port,
-        );
-        match s.send_slice(data, ep) {
-            Ok(()) => Ok(data.len()),
-            Err(udp::SendError::BufferFull) => Err(EAGAIN_L),
-            Err(udp::SendError::Unaddressable) => Err(EINVAL),
-        }
-    })
+            let ep = IpEndpoint::new(
+                IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
+                port,
+            );
+            match s.send_slice(data, ep) {
+                Ok(()) => Ok(data.len()),
+                Err(udp::SendError::BufferFull) => Err(EAGAIN_L),
+                Err(udp::SendError::Unaddressable) => Err(EINVAL),
+            }
+        }),
+    }
 }
 
 /// recv(2)/recvfrom(2): copies into the caller's user buffer (already
@@ -692,6 +854,46 @@ pub fn sock_recv(
                 Err(_) => Err(EAGAIN_L), // empty → caller sleeps
             }
         }),
+        SockKind::Icmp => {
+            // Linux raw-ICMP delivery: the recv buffer starts with the
+            // 20-byte IPv4 header (busybox ping unpacks `ihl` from byte 0),
+            // then the full ICMP message smoltcp buffered.
+            if buf.len() < 20 {
+                return Err(EINVAL);
+            }
+            let rest = &mut buf[20..];
+            let res: Result<([u8; 4], u8), u8> = with_set(|set| {
+                let s = icmp_sock(set, slot);
+                match s.recv_slice(rest) {
+                    Ok((n, src)) => {
+                        let IpAddress::Ipv4(a) = src;
+                        Ok((a.octets(), n as u8))
+                    }
+                    Err(IcmpRecvError::Exhausted | IcmpRecvError::Truncated) => {
+                        Err(EAGAIN_L) // empty → caller sleeps
+                    }
+                }
+            });
+            match res {
+                Err(e) => Err(e),
+                Ok((src_ip, n)) => {
+                    let mut hdr = [0u8; 20];
+                    hdr[0] = 0x45; // v4, ihl 5
+                    hdr[2] = ((20 + n as usize) >> 8) as u8;
+                    hdr[3] = n as u8;
+                    hdr[8] = 64; // ttl
+                    hdr[9] = 1; // IPPROTO_ICMP
+                    hdr[12..16].copy_from_slice(&IP); // saddr
+                    hdr[16..20].copy_from_slice(&src_ip); // daddr
+                    buf[..20].copy_from_slice(&hdr);
+                    if let Some(from) = from {
+                        from.0 = src_ip;
+                        from.1 = 0; // no meaningful port on ICMP
+                    }
+                    Ok(20 + n as usize)
+                }
+            }
+        }
     }
 }
 
@@ -710,6 +912,10 @@ pub fn sock_poll(slot: usize) -> Option<(bool, bool)> {
         }
         SockKind::Udp => {
             let s = udp_sock(set, slot);
+            Some((s.can_recv(), s.can_send()))
+        }
+        SockKind::Icmp => {
+            let s = icmp_sock(set, slot);
             Some((s.can_recv(), s.can_send()))
         }
     })
