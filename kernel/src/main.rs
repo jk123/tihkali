@@ -120,6 +120,11 @@ pub extern "C" fn kernel_idle() -> ! {
     }
     proc::set_idle(true);
     loop {
+        // Service the NIC while every process sleeps: RX data can only
+        // arrive via the polled driver, and the wake happens here (the
+        // next timer tick, ≤10 ms, does the scheduling).
+        #[cfg(feature = "net")]
+        crate::net::poll_tick();
         unsafe { core::arch::asm!("wfe") }
     }
 }

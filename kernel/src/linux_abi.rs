@@ -358,6 +358,162 @@ pub fn svc(frame: &mut TrapFrame) {
             }
         }
         88 => utimensat(frame.x[0] as i64, frame.x[1], frame.x[2]),
+        // --- sockets (Linux ABI only; NetBSD socket arms land in N3) ---
+        // Fall through to the default ENOSYS arm in rpi3 builds (no net).
+        #[cfg(feature = "net")]
+        198 => {
+            // socket(domain, type, proto)
+            if frame.x[0] as i64 != 2 {
+                (0, crate::net::EAFNOSUPPORT) // AF_INET only
+            } else {
+                match crate::net::sock_open((frame.x[1] & 0xf) as u32) {
+                    Ok(slot) => match proc::install_fd(FdTarget::Socket(slot)) {
+                        Ok(fd) => (fd as i64, 0),
+                        Err(e) => {
+                            crate::net::sock_close(slot);
+                            (0, e)
+                        }
+                    },
+                    Err(e) => (0, e),
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        200 => {
+            // bind(fd, sockaddr, addrlen)
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => match parse_sockaddr_in(frame.x[1], frame.x[2]) {
+                    Err(e) => (0, e),
+                    Ok((ip, port)) => match crate::net::sock_bind(slot, ip, port) {
+                        Ok(()) => (0, 0),
+                        Err(e) => (0, e),
+                    },
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        203 => {
+            // connect(fd, sockaddr, addrlen): blocking via sleep/wake —
+            // each wake re-enters and re-checks the smoltcp state machine.
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => match parse_sockaddr_in(frame.x[1], frame.x[2]) {
+                    Err(e) => (0, e),
+                    Ok((ip, port)) => {
+                        crate::net::poll_tick(); // flush anything queued
+                        match crate::net::sock_connect(slot, ip, port) {
+                            Err(e) => (0, e),
+                            Ok(crate::net::Conn::Done) => (0, 0),
+                            Ok(crate::net::Conn::Failed) => (0, crate::net::ECONNREFUSED),
+                            Ok(crate::net::Conn::Progress) => {
+                                if proc::has_deliverable() {
+                                    (0, 4) // EINTR
+                                } else {
+                                    proc::sleep_current(frame);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        206 => {
+            // sendto(fd, buf, len, flags, addr*, addrlen) — also plain
+            // send() with a NULL address (TCP write path).
+            let len = frame.x[2] as usize;
+            if len == 0 {
+                (0, 0)
+            } else if !proc::user_range_ok(frame.x[1], len) {
+                (0, file::EFAULT)
+            } else {
+                match sock_slot(frame.x[0] as usize) {
+                    None => (0, file::EBADF),
+                    Some(slot) => {
+                        let bytes =
+                            unsafe { core::slice::from_raw_parts(frame.x[1] as *const u8, len) };
+                        if frame.x[4] == 0 {
+                            match crate::net::sock_send(slot, bytes) {
+                                Ok(n) => (n as i64, 0),
+                                Err(e) => (0, e),
+                            }
+                        } else {
+                            match parse_sockaddr_in(frame.x[4], frame.x[5]) {
+                                Err(e) => (0, e),
+                                Ok((ip, port)) => {
+                                    match crate::net::sock_send_to(slot, bytes, ip, port) {
+                                        Ok(n) => (n as i64, 0),
+                                        Err(e) => (0, e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        207 => {
+            // recvfrom(fd, buf, len, flags, addr* out, addrlen* out)
+            let len = frame.x[2] as usize;
+            if len == 0 {
+                (0, 0)
+            } else if !proc::user_range_ok(frame.x[1], len) {
+                (0, file::EFAULT)
+            } else {
+                match sock_slot(frame.x[0] as usize) {
+                    None => (0, file::EBADF),
+                    Some(slot) => {
+                        if proc::has_deliverable() {
+                            (0, 4) // EINTR
+                        } else {
+                            let want_from = frame.x[4] != 0;
+                            let mut src = ([0u8; 4], 0u16);
+                            let res = {
+                                let user = unsafe {
+                                    core::slice::from_raw_parts_mut(frame.x[1] as *mut u8, len)
+                                };
+                                let from = if want_from { Some(&mut src) } else { None };
+                                crate::net::sock_recv(slot, user, from)
+                            };
+                            match res {
+                                Ok(n) => {
+                                    if want_from {
+                                        write_sockaddr_out(frame.x[4], frame.x[5], &src.0, src.1);
+                                    }
+                                    (n as i64, 0)
+                                }
+                                Err(crate::net::EAGAIN_L) => {
+                                    proc::sleep_current(frame);
+                                    return;
+                                }
+                                Err(e) => (0, e),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        208 => (0, 0), // setsockopt: accepted, options ignored (v1)
+        #[cfg(feature = "net")]
+        209 => {
+            // getsockopt: report a zero-length result (enough for SO_ERROR
+            // style probes; real option plumbing is N3+).
+            let optlen_ptr = frame.x[4];
+            if optlen_ptr != 0 {
+                if !proc::user_range_ok(optlen_ptr, 4) {
+                    (0, file::EFAULT)
+                } else {
+                    unsafe { (optlen_ptr as *mut i32).write_unaligned(0) };
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            }
+        }
         // Identity: single-user root. Observed from ash/musl startup.
         144 => (0, 0), // setgid
         146 => (0, 0), // setuid
@@ -443,6 +599,22 @@ fn poll_revents(fd: i32, events: u16) -> u16 {
                 0
             }
         }
+        #[cfg(feature = "net")]
+        FdTarget::Socket(s) => match crate::net::sock_poll(s) {
+            None => POLLNVAL,
+            Some((recv, send)) => {
+                let mut r = 0;
+                if recv {
+                    r |= events & POLLIN;
+                }
+                if send {
+                    r |= events & POLLOUT;
+                }
+                r
+            }
+        },
+        #[cfg(not(feature = "net"))]
+        FdTarget::Socket(_) => POLLNVAL,
     }
 }
 
@@ -582,11 +754,70 @@ fn write_rem(rem: u64, sec: i64, nsec: i64) {
 /// "No error information" in ash).
 fn linux_errno(e: u8) -> u8 {
     match e {
-        78 => 38, // ENOSYS
-        66 => 39, // ENOTEMPTY
-        35 => 11, // EAGAIN
-        63 => 36, // ENAMETOOLONG
+        78 => 38,  // ENOSYS
+        66 => 39,  // ENOTEMPTY
+        35 => 11,  // EAGAIN
+        63 => 36,  // ENAMETOOLONG
+        47 => 97,  // EAFNOSUPPORT
+        38 => 88,  // ENOTSOCK
+        57 => 107, // ENOTCONN
+        56 => 106, // EISCONN
+        54 => 104, // ECONNRESET
+        61 => 111, // ECONNREFUSED
+        60 => 110, // ETIMEDOUT
+        48 => 98,  // EADDRINUSE
         other => other,
+    }
+}
+
+// ---------- socket helpers ----------
+
+/// Current process's fd → net pool slot (None if not a socket fd).
+#[cfg(feature = "net")]
+fn sock_slot(fd: usize) -> Option<usize> {
+    match proc::current_target(fd) {
+        Some(FdTarget::Socket(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Linux `struct sockaddr_in` (16 bytes): family u16 LE, port u16 BE,
+/// IPv4 u32 BE, 8 bytes padding. Returns ([u8; 4], port).
+#[cfg(feature = "net")]
+fn parse_sockaddr_in(ptr: u64, len: u64) -> Result<([u8; 4], u16), u8> {
+    if len < 16 {
+        return Err(file::EINVAL);
+    }
+    if !proc::user_range_ok(ptr, 16) {
+        return Err(file::EFAULT);
+    }
+    let b = unsafe { core::slice::from_raw_parts(ptr as *const u8, 16) };
+    let fam = u16::from_le_bytes([b[0], b[1]]);
+    if fam as i64 != 2 {
+        return Err(crate::net::EAFNOSUPPORT); // AF_INET
+    }
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    Ok(([b[4], b[5], b[6], b[7]], port))
+}
+
+/// recvfrom: write the sender's sockaddr_in back to user memory
+/// (best-effort; silently skipped on bad pointers — POSIX allows it? No,
+/// but a wrong pointer here only loses the optional source address).
+#[cfg(feature = "net")]
+fn write_sockaddr_out(ptr: u64, len_ptr: u64, ip: &[u8; 4], port: u16) {
+    if ptr == 0 || !proc::user_range_ok(ptr, 16) {
+        return;
+    }
+    let b = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, 16) };
+    b[0] = 2; // AF_INET LE
+    b[1] = 0;
+    b[2..4].copy_from_slice(&port.to_be_bytes());
+    b[4..8].copy_from_slice(ip);
+    for x in b[8..16].iter_mut() {
+        *x = 0;
+    }
+    if len_ptr != 0 && proc::user_range_ok(len_ptr, 4) {
+        unsafe { (len_ptr as *mut i32).write_unaligned(16) };
     }
 }
 

@@ -90,6 +90,21 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=../linux/probe.c");
 
+    // N2 TCP probe (packed as /bin/linux-tcp).
+    let tcp_out = Path::new(&out).join("linux-tcp");
+    let tcp_src = Path::new(&dir).join("../linux/tcp.c");
+    let status = Command::new(&gcc)
+        .args(["-static", "-no-pie", "-O2", "-Wl,-Ttext-segment=0x100000000", "-o"])
+        .arg(&tcp_out)
+        .arg(&tcp_src)
+        .status();
+    match status {
+        Ok(st) if st.success() => {}
+        Ok(_) => panic!("linux tcp probe compile failed"),
+        Err(e) => panic!("musl gcc not runnable ({e})"),
+    }
+    println!("cargo:rerun-if-changed=../linux/tcp.c");
+
     // Alpine busybox (static ET_EXEC at 0x400000): shift all VAs into the
     // user window. Static aarch64 code addresses everything PC-relatively
     // (adrp/add), so only entry/phdrs and .{init,fini,preinit}_array
@@ -176,6 +191,7 @@ fn main() {
     let greet_bytes = std::fs::read(&greet).expect("read tihkali-greet");
     let linux_bytes = std::fs::read(&linux_out).expect("read linux-hello");
     let probe_bytes = std::fs::read(&probe_out).expect("read linux-probe");
+    let tcp_bytes = std::fs::read(&tcp_out).expect("read linux-tcp");
     let busybox_bytes = std::fs::read(&busybox_out).expect("read busybox");
 
     let motd = std::fs::read(Path::new(&dir).join("assets/motd")).expect("read motd");
@@ -190,6 +206,7 @@ fn main() {
         CpioEntry::file("bin/greet", &greet_bytes),
         CpioEntry::file("bin/linux-hello", &linux_bytes),
         CpioEntry::file("bin/linux-probe", &probe_bytes),
+        CpioEntry::file("bin/linux-tcp", &tcp_bytes),
         CpioEntry::exe("bin/busybox", &busybox_bytes),
         CpioEntry::file("etc/motd", &motd),
         CpioEntry::file("etc/demo.sh", &demo_sh),

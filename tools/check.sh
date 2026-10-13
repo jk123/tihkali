@@ -273,6 +273,34 @@ gate_count "s12: no ENOSYS"      "$S12" 'ENOSYS' 0
 gate_has   "s12: clean exit"     "$S12" 'proc: pid 0 exited \(0\)'
 gate_bad   "s12" "$S12"
 
+echo "== session 13: TCP connect to host listener via SLIRP (N2)"
+S13="$T/s13.log"
+python3 -c '
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 18080))
+s.listen(1)
+c, _ = s.accept()
+c.recv(64)
+c.sendall(b"tihkali-tcp-ok")
+c.close()
+s.close()
+' >/dev/null 2>&1 &
+SRV=$!
+sleep 1
+( sleep 4
+  printf 'linux-tcp\n'; sleep 3
+  printf 'exit\n'; sleep 1
+) | timeout 20 ./tools/run.sh >"$S13" 2>&1
+kill "$SRV" 2>/dev/null
+wait "$SRV" 2>/dev/null
+gate_has   "s13: tcp all ok"   "$S13" 'tcp: all ok'
+gate_has   "s13: probe exit 0" "$S13" 'sh: linux-tcp exited 0'
+gate_count "s13: no ENOSYS"    "$S13" 'ENOSYS' 0
+gate_has   "s13: clean exit"   "$S13" 'proc: pid 0 exited \(0\)'
+gate_bad   "s13" "$S13"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

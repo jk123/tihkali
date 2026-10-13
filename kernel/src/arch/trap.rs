@@ -96,7 +96,12 @@ pub extern "C" fn rust_sync_handler(frame: &mut TrapFrame) {
         }
     }
     // Boundary: svc returns, resolved faults, and any frame a syscall
-    // switched to are all eligible for signal delivery.
+    // switched to are all eligible for signal delivery. Network servicing
+    // runs first so a recv/connect woken by a fresh packet re-runs in the
+    // same trap exit (and anything still waiting is woken for the next
+    // schedule).
+    #[cfg(feature = "net")]
+    crate::net::poll_tick();
     crate::proc::deliver_signals(frame);
 }
 

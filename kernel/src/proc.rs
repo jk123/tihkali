@@ -811,6 +811,24 @@ pub fn sys_read(frame: &mut TrapFrame, fd: usize, buf: u64, len: usize) -> Io {
             }
         }
         FdTarget::Pipe { write_end: true, .. } => Io::Err(EBADF),
+        #[cfg(feature = "net")]
+        FdTarget::Socket(slot) => {
+            if has_deliverable() {
+                return Io::Err(EINTR);
+            }
+            let user = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+            match crate::net::sock_recv(slot, user, None) {
+                Ok(0) => Io::Val(0), // TCP FIN → EOF
+                Ok(n) => Io::Val(n as i64),
+                Err(crate::net::EAGAIN_L) => {
+                    sleep_current(frame);
+                    Io::Slept
+                }
+                Err(e) => Io::Err(e),
+            }
+        }
+        #[cfg(not(feature = "net"))]
+        FdTarget::Socket(_) => Io::Err(EBADF),
     }
 }
 
@@ -856,6 +874,16 @@ pub fn sys_write(fd: usize, buf: u64, len: usize) -> Result<i64, u8> {
             file::write_from_user(i, buf, len).map(|n| n as i64)
         }
         FdTarget::TtyIn => Err(EBADF),
+        #[cfg(feature = "net")]
+        FdTarget::Socket(slot) => {
+            if !user_range_ok(buf, len) {
+                return Err(EFAULT);
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+            crate::net::sock_send(slot, bytes).map(|n| n as i64)
+        }
+        #[cfg(not(feature = "net"))]
+        FdTarget::Socket(_) => Err(EBADF),
     }
 }
 
@@ -892,10 +920,9 @@ pub fn sys_sync() -> Result<(), u8> {
     }
 }
 
-/// SYS_open(path, flags): O_RDONLY / O_WRONLY / O_RDWR with
-/// O_CREAT/O_TRUNC/O_APPEND/O_EXCL (NetBSD values, verified).
-pub fn sys_open(path: &str, flags: u64) -> Result<usize, u8> {
-    let file_idx = file::open(path, flags)?;
+/// Install `target` into the current process's fd table, reusing the
+/// lowest free slot. Shared by open(2) and socket(2).
+pub fn install_fd(target: FdTarget) -> Result<usize, u8> {
     let t = table();
     let cur = CURRENT.load(Ordering::Relaxed);
     let p = t[cur].as_mut().unwrap();
@@ -906,8 +933,15 @@ pub fn sys_open(path: &str, flags: u64) -> Result<usize, u8> {
             p.fds.len() - 1
         }
     };
-    p.fds[slot] = Some(FdTarget::File(file_idx));
+    p.fds[slot] = Some(target);
     Ok(slot)
+}
+
+/// SYS_open(path, flags): O_RDONLY / O_WRONLY / O_RDWR with
+/// O_CREAT/O_TRUNC/O_APPEND/O_EXCL (NetBSD values, verified).
+pub fn sys_open(path: &str, flags: u64) -> Result<usize, u8> {
+    let file_idx = file::open(path, flags)?;
+    install_fd(FdTarget::File(file_idx))
 }
 
 /// SYS___getdents30(fd, buf, len): directory enumeration.
@@ -941,8 +975,11 @@ pub fn sys_close(fd: usize) -> Result<(), u8> {
     let p = t[cur].as_mut().unwrap();
     let slot = p.fds.get_mut(fd).ok_or(EBADF)?;
     let Some(target) = slot.take() else { return Err(EBADF) };
-    if let FdTarget::File(i) = target {
-        file::close(i)?;
+    match target {
+        FdTarget::File(i) => file::close(i)?,
+        #[cfg(feature = "net")]
+        FdTarget::Socket(s) => crate::net::sock_close(s),
+        _ => {}
     }
     Ok(())
 }

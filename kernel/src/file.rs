@@ -37,6 +37,10 @@ pub enum FdTarget {
     File(usize),
     /// Anonymous pipe: (buffer slot, is this the write end?)
     Pipe { slot: usize, write_end: bool },
+    /// Network socket: index into the kernel net.rs pool (N2).
+    /// (Never constructed without the `net` feature — hence the allow.)
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    Socket(usize),
 }
 
 /// Fixed pool of anonymous pipes (v1: 8 × 512 B).
@@ -292,8 +296,13 @@ pub fn getdents_to_user(idx: usize, addr: u64, len: usize) -> Result<usize, u8> 
 /// refcounting: pipe EOF is decided by scanning live fds in proc).
 pub fn release_all(targets: &[Option<FdTarget>]) {
     for t in targets {
-        if let Some(FdTarget::File(i)) = t {
-            let _ = close(*i);
+        match t {
+            Some(FdTarget::File(i)) => {
+                let _ = close(*i);
+            }
+            #[cfg(feature = "net")]
+            Some(FdTarget::Socket(s)) => crate::net::sock_close(*s),
+            _ => {}
         }
     }
 }
