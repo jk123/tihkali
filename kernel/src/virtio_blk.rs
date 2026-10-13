@@ -26,7 +26,7 @@ const DEVICE_FEATURES: usize = 0x010;
 const DEVICE_FEATURES_SEL: usize = 0x014;
 const DRIVER_FEATURES: usize = 0x020;
 const DRIVER_FEATURES_SEL: usize = 0x024;
-const QUEUE_SEL: usize = 0x028;
+const QUEUE_SEL: usize = 0x030; // linux/virtio_mmio.h (was 0x028 = legacy GuestPageSize)
 const QUEUE_NUM_MAX: usize = 0x034;
 const QUEUE_NUM: usize = 0x038;
 const QUEUE_READY: usize = 0x044;

@@ -263,6 +263,16 @@ gate_count "s11: no ENOSYS"              "$S11" 'ENOSYS' 0
 gate_has "s11: clean exit"               "$S11" 'proc: pid 0 exited \(0\)'
 gate_bad  "s11" "$S11"
 
+echo "== session 12: net smoke (virtio-net + slirp ARP/ICMP)"
+S12="$T/s12.log"
+( sleep 3; printf 'exit\n' ) | timeout 12 ./tools/run.sh >"$S12" 2>&1
+gate_has   "s12: link up"        "$S12" 'net: link up, 10\.0\.2\.15'
+gate_has   "s12: arp resolved"   "$S12" 'net: arp 10\.0\.2\.2 -> ([0-9a-f]{2}:){5}[0-9a-f]{2}'
+gate_has   "s12: icmp reply"     "$S12" 'net: icmp reply from 10\.0\.2\.2, .* rtt'
+gate_count "s12: no ENOSYS"      "$S12" 'ENOSYS' 0
+gate_has   "s12: clean exit"     "$S12" 'proc: pid 0 exited \(0\)'
+gate_bad   "s12" "$S12"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

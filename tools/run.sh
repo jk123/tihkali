@@ -59,5 +59,6 @@ exec "$QEMU" \
     -display none -serial stdio -monitor none \
     -global virtio-mmio.force-legacy=false \
     "${DRIVE_ARGS[@]}" \
+    -device virtio-net-device,netdev=n0 -netdev user,id=n0 \
     -kernel "$BIN" \
     "${QEMU_ARGS[@]}"

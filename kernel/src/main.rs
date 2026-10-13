@@ -11,11 +11,15 @@ mod file;
 mod fs;
 mod kmem;
 mod linux_abi;
+#[cfg(feature = "net")]
+mod net;
 mod mm;
 mod proc;
 mod tty;
 mod user;
 mod virtio_blk;
+#[cfg(feature = "net")]
+mod virtio_net;
 mod vm;
 
 use core::panic::PanicInfo;
@@ -77,6 +81,9 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     };
     let n = fs::mount(img);
     kprintln!("initramfs: mounted, {n} entries");
+
+    #[cfg(feature = "net")]
+    net::smoke(); // boot-time ARP/ICMP smoke; prints `net:` lines, never panics
 
     let Some(sh) = fs::lookup("/bin/sh") else {
         panic!("initramfs: no /bin/sh");
