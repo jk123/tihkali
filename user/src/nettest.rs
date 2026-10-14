@@ -131,6 +131,51 @@ unsafe fn exit(code: i64) -> ! {
     }
 }
 
+/// `shutdown(fd, how)` → 0 or -errno (NetBSD svc #134).
+unsafe fn shutdown(fd: i64, how: i64) -> i64 {
+    let ret: i64;
+    let err: u64;
+    unsafe {
+        asm!(
+            "svc #134",
+            "cset {err}, hs",
+            inlateout("x0") fd => ret,
+            in("x1") how,
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 {
+        -(err as i64)
+    } else {
+        ret
+    }
+}
+
+/// `setitimer(ITIMER_REAL, new, old)` → 0 or -errno (NetBSD svc #83,
+/// SYS_compat_50_setitimer). x0 = 0 (ITIMER_REAL), x1 = new (null =
+/// disarm), x2 = old (null ok). itimerval layout: {u64 sec, u64 usec}
+/// for it_value and it_interval (this probe uses it_value only).
+unsafe fn setitimer(new: *const u64, old: *mut u64) -> i64 {
+    let err: u64;
+    unsafe {
+        asm!(
+            "svc #83",
+            "cset {err}, hs",
+            in("x0") 0i64,
+            in("x1") new as i64,
+            in("x2") old as i64,
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 {
+        -(err as i64)
+    } else {
+        0
+    }
+}
+
 fn fail(msg: &str, code: i64) -> ! {
     unsafe {
         write(2, msg);
@@ -200,6 +245,31 @@ pub extern "C" fn _start(_: u64, _: u64) -> ! {
         || out[ic + 7] != 1
     {
         fail("nettest: bad reply\n", 5);
+    }
+
+    // 7. N5: shut down the send half of the live socket (svc #134).
+    let sh = unsafe { shutdown(fd, 1) };
+    if sh < 0 {
+        fail("nettest: shutdown failed\n", 6);
+    }
+
+    // 8. N5: arm a 3 s ITIMER_REAL deadline via setitimer(83), then
+    // disarm it — exercises the proc itimer plumbing. arm → disarming
+    // within the window means no SIGALRM is actually delivered.
+    let mut itim = [0u64; 4];
+    itim[0] = 3; // it_value.tv_sec
+    itim[1] = 0; // it_value.tv_usec
+    let mut old_itim = [0u64; 4];
+    let r = unsafe { setitimer(itim.as_ptr(), old_itim.as_mut_ptr()) };
+    if r < 0 {
+        fail("nettest: setitimer arm failed\n", 7);
+    }
+    // It value 0 disarms the pending timer.
+    itim[0] = 0;
+    itim[1] = 0;
+    let r = unsafe { setitimer(itim.as_ptr(), old_itim.as_mut_ptr()) };
+    if r < 0 {
+        fail("nettest: setitimer disarm failed\n", 7);
     }
 
     unsafe {

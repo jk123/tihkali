@@ -355,6 +355,25 @@ gate_count "s15: no ENOSYS"     "$S15" 'ENOSYS' 0
 gate_has   "s15: clean exit"    "$S15" 'proc: pid 0 exited \(0\)'
 gate_bad   "s15" "$S15"
 
+echo "== session 16: busybox HTTP client via SLIRP (N5 sendmsg/recvmsg)"
+S16="$T/s16.log"
+N5DIR=$(mktemp -d)
+echo "tihkali-n5-ok" > "$N5DIR/n5.txt"
+python3 -m http.server 18083 --bind 127.0.0.1 --directory "$N5DIR" >/dev/null 2>&1 &
+HTTP=$!
+sleep 1
+( sleep 4
+  printf 'wget -O - http://10.0.2.2:18083/n5.txt\n'; sleep 4
+  printf 'exit\n'; sleep 1
+) | timeout 40 ./tools/run.sh >"$S16" 2>&1
+kill "$HTTP" 2>/dev/null
+wait "$HTTP" 2>/dev/null
+rm -rf "$N5DIR"
+gate_has   "s16: wget body"   "$S16" 'tihkali-n5-ok'
+gate_count "s16: no ENOSYS"   "$S16" 'ENOSYS' 0
+gate_has   "s16: clean exit"  "$S16" 'proc: pid 0 exited \(0\)'
+gate_bad   "s16" "$S16"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

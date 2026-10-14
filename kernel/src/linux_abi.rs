@@ -151,15 +151,40 @@ pub fn svc(frame: &mut TrapFrame) {
         // --- time ---
         113 => clock_gettime(frame.x[0] as i32, frame.x[1]),
         103 => {
-            // setitimer: accepted as a no-op (real timer+SIGALRM in N4);
-            // zero the old-struct out-param so callers see "no old timer".
+            // setitimer(which, new, old): ITIMER_REAL only — arms a
+            // per-process deadline; the tick fires SIGALRM at it (v1).
+            // Zero the old struct so callers see "no prior timer".
             let old_ptr = frame.x[2];
             if old_ptr != 0 && proc::user_range_ok(old_ptr, 32) {
                 unsafe {
                     (old_ptr as *mut u8).write_bytes(0, 32);
                 }
             }
-            (0, 0)
+            if frame.x[0] as i32 != 0 {
+                // not ITIMER_REAL: accept and ignore
+                (0, 0)
+            } else {
+                // new = itimerval; it_value.tv_sec/u64 is at +0, .tv_usec
+                // at +8 (musl aarch64 itimerval layout).
+                let new = frame.x[1];
+                if new == 0 || !proc::user_range_ok(new, 16) {
+                    (0, 0)
+                } else {
+                    let sec = unsafe { (new as *const u32).read_unaligned() as u64 };
+                    let usec = unsafe { (new as *const u32).add(2).read_unaligned() as u64 };
+                    if sec == 0 && usec == 0 {
+                        // Disarm: clear the deadline, keep returning 0.
+                        proc::proc_set_itimer(proc::current_slot(), None);
+                    } else {
+                        let ticks = proc::arch_timer_hz();
+                        let deadline = proc::arch_timer_now()
+                            + sec * ticks
+                            + usec * ticks / 1_000_000;
+                        proc::proc_set_itimer(proc::current_slot(), Some(deadline));
+                    }
+                    (0, 0)
+                }
+            }
         }
         169 => gettimeofday(frame.x[0], frame.x[1]),
         160 => uname(frame.x[0]),
@@ -571,6 +596,93 @@ pub fn svc(frame: &mut TrapFrame) {
         }
         #[cfg(feature = "net")]
         208 => (0, 0), // setsockopt: accepted, options ignored (v1)
+        #[cfg(feature = "net")]
+        210 => {
+            // shutdown(fd, how)
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => match crate::net::sock_shutdown(slot, frame.x[1] as i32) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (0, e),
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        211 => {
+            // sendmsg(fd, msg, flags): scatter-gather into one send.
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => {
+                    let iov = frame.x[1];
+                    let iovlen = if iov == 0 {
+                        0
+                    } else if !proc::user_range_ok(iov, 8) {
+                        0
+                    } else {
+                        unsafe { core::ptr::read_unaligned((iov as *const u32).add(9)) as usize }
+                    };
+                    match crate::net::sock_sendmsg(slot, iov, iovlen) {
+                        Ok(n) => (n as i64, 0),
+                        Err(e) => (0, e),
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        212 => {
+            // recvmsg(fd, msg, flags): one coalesced recv into iovec[0].
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => {
+                    let iov = frame.x[1];
+                    let iovlen = if iov == 0 {
+                        0
+                    } else if !proc::user_range_ok(iov, 8) {
+                        0
+                    } else {
+                        unsafe { core::ptr::read_unaligned((iov as *const u32).add(9)) as usize }
+                    };
+                    let iov_base = if iov == 0 {
+                        0u64
+                    } else {
+                        unsafe { (iov as *const u64).read_unaligned() }
+                    };
+                    let iov_len = if iov == 0 {
+                        0usize
+                    } else {
+                        unsafe { ((iov as *const u64).add(1)).read_unaligned() as usize }
+                    };
+                    let want_from = iov_base != 0;
+                    let mut src = ([0u8; 4], 0u16);
+                    let from = if want_from { Some(&mut src) } else { None };
+                    let res = if iov == 0 || iovlen == 0 {
+                        Ok(0)
+                    } else if !proc::user_range_ok(iov_base, iov_len) {
+                        Err(file::EFAULT)
+                    } else {
+                        crate::net::sock_recvmsg(slot, iov, iovlen, from)
+                    };
+                    match res {
+                        Ok(n) => {
+                            if want_from {
+                                write_sockaddr_out(
+                                    unsafe { (iov as *const u64).read_unaligned() },
+                                    0,
+                                    &src.0,
+                                    src.1,
+                                );
+                            }
+                            (n as i64, 0)
+                        }
+                        Err(crate::net::EAGAIN_L) => {
+                            proc::sleep_current(frame);
+                            return;
+                        }
+                        Err(e) => (0, e),
+                    }
+                }
+            }
+        }
         #[cfg(feature = "net")]
         209 => {
             // getsockopt: report a zero-length result (enough for SO_ERROR

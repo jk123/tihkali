@@ -57,6 +57,9 @@ pub const EBADF: u8 = 9;
 pub const EAFNOSUPPORT: u8 = 47;
 pub const ENOTCONN: u8 = 57;
 pub const ECONNREFUSED: u8 = 61;
+/// EPIPE (NetBSD/Linux 32) — reserved for socket shutdown semantics.
+#[allow(dead_code)]
+pub const EPIPE: u8 = 32;
 const ECONNRESET: u8 = 54;
 const EISCONN: u8 = 56;
 const EIO: u8 = 5;
@@ -847,6 +850,7 @@ pub fn sock_send(slot: usize, data: &[u8]) -> Result<usize, u8> {
         SockKind::Udp => Err(EINVAL), // UDP needs sendto's destination
         SockKind::Icmp => {
             let peer = meta[slot].peer_ip;
+            // Raw sockets are datagram: transmit on the spot.
             icmp_send(slot, data, peer)
         }
         SockKind::Tcp => {
@@ -873,6 +877,24 @@ pub fn sock_send(slot: usize, data: &[u8]) -> Result<usize, u8> {
             res
         }
     }
+}
+
+/// send(2) on a raw/ICMP socket: like  but the destination
+/// is the connected peer (set by ). The byte string is a full
+/// ICMPv4 message; it goes out on the spot (no queue to flush later).
+pub fn sock_send_raw(slot: usize, data: &[u8]) -> Result<usize, u8> {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used {
+        return Err(EBADF);
+    }
+    let peer = meta[slot].peer_ip;
+    icmp_send(slot, data, peer)
+}
+
+/// True when `slot` is a raw/ICMP socket (datagram, transmitted inline).
+pub fn sock_kind_is_raw(slot: usize) -> bool {
+    let meta = meta();
+    slot < NSOCK && meta[slot].used && meta[slot].kind == SockKind::Icmp
 }
 
 /// ICMP send: `data` is a *complete* ICMPv4 message — smoltcp parses it
@@ -1027,6 +1049,91 @@ pub fn sock_recv(
             }
         }
     }
+}
+
+/// SHUT_WR (how==1): shut down the send half of a TCP connection (FIN).
+/// Non-TCP sockets (UDP/ICMP) and `how != 1` are no-ops (Ok), matching
+/// the lenient v1 socket policy. The FIN is flushed by the servicing
+/// `poll_tick` (svc-tail / idle loop) — an inline re-service of the same
+/// slot after `close()` trips the smoltcp `socket_set` handle check.
+pub fn sock_shutdown(slot: usize, how: i32) -> Result<(), u8> {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used {
+        return Err(EBADF);
+    }
+    if how != 1 || meta[slot].kind != SockKind::Tcp {
+        return Ok(()); // RCVALL/SNDRCV and non-TCP: no-op
+    }
+    with_set(|set| {
+        let s = tcp_sock(set, slot);
+        if s.is_active() {
+            s.close(); // queue a graceful FIN; the next poll_tick emits it
+        }
+        Ok::<_, u8>(())
+    })?;
+    meta[slot].connected = false;
+    Ok(())
+}
+
+/// sendmsg(2): scatter-gather over the socket. `iov` is the user iovec
+/// array (Linux aarch64: {base ptr, len u64}, 16 bytes each); coalesces
+/// into one send on the data socket.
+pub fn sock_sendmsg(slot: usize, iov: u64, iovlen: usize) -> Result<usize, u8> {
+    if iovlen == 0 {
+        return Ok(0);
+    }
+    let mut total = 0usize;
+    for i in 0..iovlen {
+        let p = iov as *const u64;
+        let len = unsafe { p.add(i * 2 + 1).read_unaligned() as usize };
+        total += len;
+    }
+    if total > 8192 {
+        return Err(EINVAL);
+    }
+    let mut flat = [0u8; 8192];
+    let mut off = 0usize;
+    let p = iov as *const u64;
+    for i in 0..iovlen {
+        let base = unsafe { p.add(i * 2).read_unaligned() };
+        let len = unsafe { p.add(i * 2 + 1).read_unaligned() as usize };
+        if base == 0 || len == 0 {
+            continue;
+        }
+        if !crate::proc::user_range_ok(base, len) {
+            return Err(EBADF);
+        }
+        let seg = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+        let n = len.min(8192 - off);
+        flat[off..off + n].copy_from_slice(&seg[..n]);
+        off += n;
+    }
+    sock_send(slot, &flat[..off])
+}
+
+/// recvmsg(2): one coalesced receive into the caller's iovec[0]
+/// (base, len) — enough for the busybox/wget consumers; multi-iovec
+/// scatter on the receive side is an N5+ refinement.
+pub fn sock_recvmsg(
+    slot: usize,
+    iov: u64,
+    iovlen: usize,
+    from: Option<&mut ([u8; 4], u16)>,
+) -> Result<usize, u8> {
+    if iovlen == 0 {
+        return Ok(0);
+    }
+    let p = iov as *const u64;
+    let base = unsafe { p.read_unaligned() };
+    let len = unsafe { p.add(1).read_unaligned() as usize };
+    if base == 0 || len == 0 {
+        return Ok(0);
+    }
+    if !crate::proc::user_range_ok(base, len) {
+        return Err(EBADF);
+    }
+    let user = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
+    sock_recv(slot, user, from)
 }
 
 /// poll(2) readiness for a socket fd: (POLLIN-ish, POLLOUT-ish).

@@ -43,13 +43,32 @@ pub extern "C" fn rust_sync_handler(frame: &mut TrapFrame) {
             // Instruction abort: nothing is mapped executable on demand.
             if frame.spsr & 0xf == 0 {
                 // EL0: kill the offending process (SIGSEGV), keep the
-                // kernel alive — a jumping-to-nowhere busybox must not
-                // take the machine down.
-                kprintln!(
-                    "proc: pid {} insn fault at {:#x}",
-                    crate::proc::current_pid(),
-                    frame.elr
-                );
+            // kernel alive — a jumping-to-nowhere busybox must not
+            // take the machine down.
+            let sp: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack));
+            }
+            kprintln!(
+                "proc: pid {} insn fault at {:#x} esr={:#x} spsr={:#x} sp_el0={:#x} x8={:#x} x10={:#x} x13={:#x}",
+                crate::proc::current_pid(),
+                frame.elr,
+                esr,
+                frame.spsr,
+                sp,
+                frame.x[8],
+                frame.x[10],
+                frame.x[13]
+            );
+            {
+                for i in 0..30 {
+                    kprint!("x{i:<2}={:#018x} ", frame.x[i]);
+                    if i % 4 == 3 {
+                        kprintln!();
+                    }
+                }
+                kprintln!();
+            }
                 crate::proc::kill_from_fault(frame, 11); // SIGSEGV (canonical 11)
             } else {
                 kprintln!("exec fault at {:#x}", frame.elr);
@@ -203,6 +222,49 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 Err(e) => (-1, e),
             }
         }
+        83 => {
+            // SYS_compat_50_setitimer(which, new, old): ITIMER_REAL only.
+            // NetBSD aarch64 itimerval = {it_value.tv_sec u64, it_value.tv_usec u64,
+            // it_interval.tv_sec u64, it_interval.tv_usec u64} — same layout as
+            // the Linux arm reads; arm a per-process deadline, tick fires
+            // SIGALRM (canonical 14) via wake_itimers().
+            let which = frame.x[0] as i32;
+            let new = frame.x[1];
+            let old = frame.x[2];
+            // Zero the old out-param (32 bytes) if non-null and in range.
+            if old != 0 && crate::proc::user_range_ok(old, 32) {
+                unsafe {
+                    (old as *mut u8).write_bytes(0, 32);
+                }
+            }
+            if which != 0 {
+                // Not ITIMER_REAL: accept and ignore (v1).
+                (0, 0)
+            } else if new == 0 {
+                // Null new = disarm.
+                crate::proc::proc_set_itimer(crate::proc::current_slot(), None);
+                (0, 0)
+            } else if !crate::proc::user_range_ok(new, 16) {
+                (-1, 14) // EFAULT
+            } else {
+                // NetBSD aarch64 itimerval = {tv_sec u64, tv_usec u64, …}.
+                let sec = unsafe { (new as *const u64).read_unaligned() };
+                let usec =
+                    unsafe { (new as *const u64).add(1).read_unaligned() } as u64;
+                if sec == 0 && usec == 0 {
+                    crate::proc::proc_set_itimer(crate::proc::current_slot(), None);
+                } else {
+                    let ticks = crate::proc::arch_timer_hz();
+                    let deadline =
+                        crate::proc::arch_timer_now() + sec * ticks + usec * ticks / 1_000_000;
+                    crate::proc::proc_set_itimer(
+                        crate::proc::current_slot(),
+                        Some(deadline),
+                    );
+                }
+                (0, 0)
+            }
+        }
         103 | 295 => {
             // SYS_sigreturn / __sigreturn14: frame fully rebuilt.
             crate::proc::sys_sigreturn(frame);
@@ -347,6 +409,76 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
+        134 => {
+            // SYS_shutdown(fd, how)
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => match crate::net::sock_shutdown(slot, frame.x[1] as i32) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (-1, e),
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        28 => {
+            // SYS_sendmsg(fd, msg, flags): scatter into one send.
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => {
+                    let iov = frame.x[1];
+                    let iovlen = if iov == 0 {
+                        0
+                    } else if !crate::proc::user_range_ok(iov, 8) {
+                        0
+                    } else {
+                        unsafe { core::ptr::read_unaligned((iov as *const u32).add(9)) as usize }
+                    };
+                    let res = if iov == 0 || iovlen == 0 {
+                        Ok(0)
+                    } else if !crate::proc::user_range_ok(iov, 8) {
+                        Err(14) // EFAULT
+                    } else {
+                        crate::net::sock_sendmsg(slot, iov, iovlen)
+                    };
+                    match res {
+                        Ok(n) => (n as i64, 0),
+                        Err(e) => (-1, e),
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        27 => {
+            // SYS_recvmsg(fd, msg, flags): one coalesced recv.
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => {
+                    let iov = frame.x[1];
+                    let iovlen = if iov == 0 {
+                        0
+                    } else if !crate::proc::user_range_ok(iov, 8) {
+                        0
+                    } else {
+                        unsafe { core::ptr::read_unaligned((iov as *const u32).add(9)) as usize }
+                    };
+                    let mut src = ([0u8; 4], 0u16);
+                    let res = if iov == 0 || iovlen == 0 {
+                        Ok(0)
+                    } else {
+                        crate::net::sock_recvmsg(slot, iov, iovlen, Some(&mut src))
+                    };
+                    match res {
+                        Ok(n) => (n as i64, 0),
+                        Err(crate::net::EAGAIN_L) => {
+                            crate::proc::sleep_current(frame);
+                            return;
+                        }
+                        Err(e) => (-1, e),
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
         104 => {
             // SYS_bind(fd, sockaddr, addrlen)
             match crate::linux_abi::sock_slot(frame.x[0] as usize) {
@@ -391,10 +523,19 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                         let bytes = unsafe {
                             core::slice::from_raw_parts(frame.x[1] as *const u8, len)
                         };
+                        // NULL dest → the connected peer; raw/ICMP sockets
+                        // send datagram-style to that peer, TCP/UDP to queue.
                         if frame.x[4] == 0 {
-                            match crate::net::sock_send(slot, bytes) {
-                                Ok(n) => (n as i64, 0),
-                                Err(e) => (-1, e),
+                            if crate::net::sock_kind_is_raw(slot) {
+                                match crate::net::sock_send_raw(slot, bytes) {
+                                    Ok(n) => (n as i64, 0),
+                                    Err(e) => (-1, e),
+                                }
+                            } else {
+                                match crate::net::sock_send(slot, bytes) {
+                                    Ok(n) => (n as i64, 0),
+                                    Err(e) => (-1, e),
+                                }
                             }
                         } else {
                             match crate::net::parse_netbsd_sockaddr_in(frame.x[4], frame.x[5]) {
@@ -505,6 +646,7 @@ pub extern "C" fn rust_irq_handler(frame: &mut TrapFrame) {
         gic::PPI_PHYS_TIMER => {
             timer::on_tick();
             crate::proc::wake_expired();
+            crate::proc::wake_itimers();
         }
         crate::tty::UART0_SPI => crate::tty::on_rx(),
         other => kprintln!("[irq] unhandled INTID {other}"),

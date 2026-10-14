@@ -92,6 +92,9 @@ pub struct Process {
     /// on exec; without per-process save/restore a child's exec leaves
     /// every other process reading TLS through a dangling pointer.
     pub tpidr: u64,
+    /// setitimer(ITIMER_REAL): absolute tick deadline, armed when the
+    /// process's own timer fires SIGALRM. None = no timer set.
+    pub itimer_at: Option<u64>,
 }
 
 struct ProcTable(UnsafeCell<Vec<Option<Process>>>);
@@ -126,6 +129,12 @@ pub fn current_pgrp() -> usize {
 
 pub fn current_pid() -> usize {
     table()[CURRENT.load(Ordering::Relaxed)].as_ref().map_or(0, |p| p.pid)
+}
+
+/// Table index of the running process (the proc-table slot, not the
+/// guest-visible pid).
+pub fn current_slot() -> usize {
+    CURRENT.load(Ordering::Relaxed)
 }
 
 fn read_sp_el0() -> u64 {
@@ -182,6 +191,7 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         pgrp: 0,
         wake_at: None,
         tpidr: crate::user::TPIDR_VAL,
+        itimer_at: None,
     }));
     CURRENT.store(0, Ordering::Relaxed);
     NEXT_PID.store(1, Ordering::Relaxed);
@@ -264,6 +274,46 @@ pub fn has_deliverable() -> bool {
     })
 }
 
+/// Queue `sig` (1..32) as pending on pid `pid` (no delivery here — the
+/// delivery boundary `deliver_signals` / next svc tail picks it up).
+#[allow(dead_code)]
+pub fn raise(pid: usize, sig: u8) {
+    let t = table();
+    let p = t.get_mut(pid).and_then(|slot| slot.as_mut());
+    if let Some(p) = p {
+        p.pending |= 1u64 << sig;
+    }
+}
+
+/// Set `sig` pending on the current process (delivery at the next
+/// svc-tail / tick boundary, like `raise`).
+#[allow(dead_code)]
+pub fn self_raise(sig: u8) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    raise(cur, sig);
+}
+
+/// Arm or clear the current process's ITIMER_REAL deadline. `None`
+/// disarms. Returns the previous deadline (for the setitimer out-param).
+pub fn proc_set_itimer(pid: usize, at: Option<u64>) -> Option<u64> {
+    let t = table();
+    let p = t.get_mut(pid).and_then(|slot| slot.as_mut()).expect("process exists");
+    let prev = p.itimer_at;
+    p.itimer_at = at;
+    prev
+}
+
+/// Absolute timer ticks now (wraps to i64 at the 2^62 boundary, ~5.8e11
+/// ticks at 62.5 MHz — the EL1 time rule: use the raw counter, not TICKS).
+pub fn arch_timer_now() -> u64 {
+    crate::arch::timer::now()
+}
+
+/// Ticks per second (the timer frequency).
+pub fn arch_timer_hz() -> u64 {
+    crate::arch::timer::hz()
+}
+
 /// Block the current process until someone wakes it (rewind-on-wake).
 pub fn sleep_current(frame: &mut TrapFrame) {
     sleep_inner(frame, None);
@@ -327,6 +377,23 @@ pub fn wake_expired() {
                 p.state = State::Runnable;
                 p.frame.elr = p.frame.elr.wrapping_sub(4);
                 // wake_at stays: the re-executed syscall decides and clears.
+            }
+        }
+    }
+}
+
+/// Fire SIGALRM on every process whose setitimer(ITIMER_REAL) deadline
+/// has passed; the tick IRQ calls this alongside `wake_expired`.
+pub fn wake_itimers() {
+    let now = crate::arch::timer::now();
+    let t = table();
+    for o in t.iter_mut() {
+        if let Some(p) = o {
+            if let Some(at) = p.itimer_at {
+                if now >= at {
+                    p.itimer_at = None;
+                    p.pending |= 1u64 << 14; // SIGALRM (canonical 14)
+                }
             }
         }
     }
@@ -416,6 +483,7 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         wake_at: None,
         // Child shares the parent's live TLS (COW pages keep it valid).
         tpidr: read_tpidr(),
+        itimer_at: None, // ITIMER_REAL does not survive fork()
     });
     kprintln!("proc: fork pid {} (parent {})", pid, t[cur].as_ref().unwrap().pid);
     Ok(pid)
@@ -882,7 +950,14 @@ pub fn sys_write(fd: usize, buf: u64, len: usize) -> Result<i64, u8> {
                 return Err(EFAULT);
             }
             let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-            crate::net::sock_send(slot, bytes).map(|n| n as i64)
+            // Raw/ICMP fds write to their connected peer (datagram,
+            // transmitted inline); TCP/UDP fds go through the queue+flush
+            // path.
+            if crate::net::sock_kind_is_raw(slot) {
+                crate::net::sock_send_raw(slot, bytes).map(|n| n as i64)
+            } else {
+                crate::net::sock_send(slot, bytes).map(|n| n as i64)
+            }
         }
         #[cfg(not(feature = "net"))]
         FdTarget::Socket(_) => Err(EBADF),
