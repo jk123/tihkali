@@ -416,7 +416,7 @@ pub fn svc(frame: &mut TrapFrame) {
                         Ok(slot) => match proc::install_fd(FdTarget::Socket(slot)) {
                             Ok(fd) => (fd as i64, 0),
                             Err(e) => {
-                                crate::net::sock_close(slot);
+                                crate::net::sock_ref_dec(slot);
                                 (0, e)
                             }
                         },
@@ -498,9 +498,13 @@ pub fn svc(frame: &mut TrapFrame) {
                             // fresh fd for it; the listener re-enters LISTEN
                             // when that fd is closed (see `sock_close`).
                             match proc::install_fd(FdTarget::Socket(data_slot)) {
-                                Ok(newfd) => (newfd as i64, 0),
+                                Ok(newfd) => {
+                                    // A second fd now points at this slot; bump the refcount.
+                                    crate::net::sock_ref_inc(data_slot);
+                                    (newfd as i64, 0)
+                                }
                                 Err(e) => {
-                                    crate::net::sock_close(data_slot);
+                                    crate::net::sock_ref_dec(data_slot);
                                     (0, e)
                                 }
                             }
@@ -610,20 +614,22 @@ pub fn svc(frame: &mut TrapFrame) {
         #[cfg(feature = "net")]
         211 => {
             // sendmsg(fd, msg, flags): scatter-gather into one send.
+            // `frame.x[1]` is the msghdr; msg_iov is at byte 16 and
+            // msg_iovlen (u32) at byte 24 on aarch64-LE.
             match sock_slot(frame.x[0] as usize) {
                 None => (0, file::EBADF),
                 Some(slot) => {
-                    let iov = frame.x[1];
-                    let iovlen = if iov == 0 {
-                        0
-                    } else if !proc::user_range_ok(iov, 8) {
-                        0
+                    let msg = frame.x[1];
+                    if msg == 0 || !proc::user_range_ok(msg, 32) {
+                        (0, file::EFAULT)
                     } else {
-                        unsafe { core::ptr::read_unaligned((iov as *const u32).add(9)) as usize }
-                    };
-                    match crate::net::sock_sendmsg(slot, iov, iovlen) {
-                        Ok(n) => (n as i64, 0),
-                        Err(e) => (0, e),
+                        let iov = unsafe { (msg as *const u64).add(2).read_unaligned() };
+                        let iovlen =
+                            unsafe { (msg as *const u32).add(6).read_unaligned() as usize };
+                        match crate::net::sock_sendmsg(slot, iov, iovlen) {
+                            Ok(n) => (n as i64, 0),
+                            Err(e) => (0, e),
+                        }
                     }
                 }
             }
@@ -631,54 +637,49 @@ pub fn svc(frame: &mut TrapFrame) {
         #[cfg(feature = "net")]
         212 => {
             // recvmsg(fd, msg, flags): one coalesced recv into iovec[0].
+            // Same msghdr offsets as arm 211.
             match sock_slot(frame.x[0] as usize) {
                 None => (0, file::EBADF),
                 Some(slot) => {
-                    let iov = frame.x[1];
-                    let iovlen = if iov == 0 {
-                        0
-                    } else if !proc::user_range_ok(iov, 8) {
-                        0
+                    let msg = frame.x[1];
+                    if msg == 0 || !proc::user_range_ok(msg, 32) {
+                        (0, file::EFAULT)
                     } else {
-                        unsafe { core::ptr::read_unaligned((iov as *const u32).add(9)) as usize }
-                    };
-                    let iov_base = if iov == 0 {
-                        0u64
-                    } else {
-                        unsafe { (iov as *const u64).read_unaligned() }
-                    };
-                    let iov_len = if iov == 0 {
-                        0usize
-                    } else {
-                        unsafe { ((iov as *const u64).add(1)).read_unaligned() as usize }
-                    };
-                    let want_from = iov_base != 0;
-                    let mut src = ([0u8; 4], 0u16);
-                    let from = if want_from { Some(&mut src) } else { None };
-                    let res = if iov == 0 || iovlen == 0 {
-                        Ok(0)
-                    } else if !proc::user_range_ok(iov_base, iov_len) {
-                        Err(file::EFAULT)
-                    } else {
-                        crate::net::sock_recvmsg(slot, iov, iovlen, from)
-                    };
-                    match res {
-                        Ok(n) => {
-                            if want_from {
-                                write_sockaddr_out(
-                                    unsafe { (iov as *const u64).read_unaligned() },
-                                    0,
-                                    &src.0,
-                                    src.1,
-                                );
+                        let iov = unsafe { (msg as *const u64).add(2).read_unaligned() };
+                        let iovlen =
+                            unsafe { (msg as *const u32).add(6).read_unaligned() as usize };
+                        let (iov_base, iov_len) = if iovlen == 0 || iov == 0 {
+                            (0u64, 0usize)
+                        } else {
+                            (
+                                unsafe { (iov as *const u64).read_unaligned() },
+                                unsafe { (iov as *const u64).add(1).read_unaligned() as usize },
+                            )
+                        };
+                        let mut src = ([0u8; 4], 0u16);
+                        let res = if iovlen == 0 {
+                            Ok(0)
+                        } else if !proc::user_range_ok(iov_base, iov_len) {
+                            Err(file::EFAULT)
+                        } else {
+                            crate::net::sock_recvmsg(slot, iov, iovlen, Some(&mut src))
+                        };
+                        match res {
+                            Ok(n) => {
+                                // msg_name is msghdr byte 0 (absent here).
+                                // Inline-flush so an echo right after the
+                                // recvmsg reaches the peer (N4 fix).
+                                if n > 0 {
+                                    crate::net::service_iface();
+                                }
+                                (n as i64, 0)
                             }
-                            (n as i64, 0)
+                            Err(crate::net::EAGAIN_L) => {
+                                proc::sleep_current(frame);
+                                return;
+                            }
+                            Err(e) => (0, e),
                         }
-                        Err(crate::net::EAGAIN_L) => {
-                            proc::sleep_current(frame);
-                            return;
-                        }
-                        Err(e) => (0, e),
                     }
                 }
             }

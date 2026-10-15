@@ -460,6 +460,10 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         if let FdTarget::File(i) = target {
             file::dup(*i);
         }
+        #[cfg(feature = "net")]
+        if let FdTarget::Socket(slot) = target {
+            crate::net::sock_ref_inc(*slot);
+        }
     }
 
     t[slot] = Some(Process {
@@ -1055,11 +1059,11 @@ pub fn sys_close(fd: usize) -> Result<(), u8> {
     match target {
         FdTarget::File(i) => file::close(i)?,
         #[cfg(feature = "net")]
-        // N3: a socket pool slot may be shared by dup'd fds (busybox ping
-        // dup2s its socket onto fd 0 then closes the original). Only the
-        // process exit (release_all) destroys the slot — without refcounts,
-        // closing one fd must not tear down the others (N4: refcounts).
-        FdTarget::Socket(_) => {}
+        // N5: socket pool slots carry a refcount; close drops one ref and
+        // tears down the slot only when the last fd is closed.
+        FdTarget::Socket(slot) => {
+            crate::net::sock_ref_dec(slot);
+        }
         _ => {}
     }
     Ok(())
@@ -1600,12 +1604,23 @@ pub fn sys_dup3(oldfd: i64, newfd: i64) -> Result<usize, u8> {
         p.fds.push(None);
     }
     if let Some(old) = p.fds[newfd as usize].take() {
-        if let FdTarget::File(i) = old {
-            let _ = file::close(i);
+        match old {
+            FdTarget::File(i) => {
+                let _ = file::close(i);
+            }
+            #[cfg(feature = "net")]
+            FdTarget::Socket(s) => {
+                crate::net::sock_ref_dec(s);
+            }
+            _ => {}
         }
     }
     if let FdTarget::File(i) = target {
         file::dup(i);
+    }
+    #[cfg(feature = "net")]
+    if let FdTarget::Socket(s) = target {
+        crate::net::sock_ref_inc(s);
     }
     p.fds[newfd as usize] = Some(target);
     Ok(newfd as usize)
@@ -1627,6 +1642,10 @@ pub fn sys_dupfd(oldfd: i64, min: i64) -> Result<usize, u8> {
         .ok_or(EINVAL)?;
     if let FdTarget::File(i) = target {
         file::dup(i);
+    }
+    #[cfg(feature = "net")]
+    if let FdTarget::Socket(s) = target {
+        crate::net::sock_ref_inc(s);
     }
     p.fds[slot] = Some(target);
     Ok(slot)

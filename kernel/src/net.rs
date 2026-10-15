@@ -100,6 +100,9 @@ struct SockMeta {
     peer_ip: [u8; 4],
     /// TCP: listen(2) has been called on this slot.
     listening: bool,
+    /// Number of live fd references to this slot (dup/fork/close).
+    /// Teardown happens only at zero.
+    refs: u8,
 }
 const SOCK_META_EMPTY: SockMeta = SockMeta {
     used: false,
@@ -110,6 +113,7 @@ const SOCK_META_EMPTY: SockMeta = SockMeta {
     lport: 0,
     peer_ip: [0; 4],
     listening: false,
+    refs: 0,
 };
 static SOCK_META: NetCell<[SockMeta; NSOCK]> =
     NetCell(UnsafeCell::new([SOCK_META_EMPTY; NSOCK]));
@@ -448,7 +452,7 @@ pub fn poll_tick() {
 /// Service the NIC against the persistent socket pool WITHOUT waking
 /// sleepers (a send flush must not spuriously unblock an accept). Used
 /// by `sock_send` to push queued bytes to the wire inline.
-fn service_iface() {
+pub fn service_iface() {
     let Some(iface) = iface_mut() else { return };
     let mut dev = NetDev;
     let store = sock_store();
@@ -564,13 +568,34 @@ pub fn sock_open(kind: u32) -> Result<usize, u8> {
     meta[slot].lport = 0;
     meta[slot].peer_ip = [0; 4];
     meta[slot].listening = false;
+    meta[slot].refs = 1;
     Ok(slot)
 }
 
-/// Close a pool slot (close(2)/process exit). NOTE (N2): fd tables are
-/// copy-on-fork without refcounts, so a socket fd shared across fork
-/// would be freed by whichever process exits first — the N2 userland
-/// never does that; revisit with fd refcounts when jobs+sockets mix.
+/// Increment one reference to a live pool slot (dup/fork).
+pub fn sock_ref_inc(slot: usize) {
+    let meta = meta();
+    if slot < NSOCK && meta[slot].used {
+        meta[slot].refs = meta[slot].refs.saturating_add(1);
+    }
+}
+
+/// Decrement one reference to a pool slot (close(2)). Teardown happens
+/// only when the last reference is dropped.
+pub fn sock_ref_dec(slot: usize) {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used {
+        return;
+    }
+    meta[slot].refs = meta[slot].refs.saturating_sub(1);
+    if meta[slot].refs == 0 {
+        sock_close(slot);
+    }
+}
+
+/// Fully tear down a pool slot (last-ref / process exit / rollback).
+/// Also re-listens when an accepted connection on a listener slot is
+/// closed, so the listener can accept the next peer.
 pub fn sock_close(slot: usize) {
     let meta = meta();
     if slot >= NSOCK || !meta[slot].used {
@@ -579,13 +604,12 @@ pub fn sock_close(slot: usize) {
     // A close of an *accepted* connection on a listening slot hands the
     // slot back to LISTEN (the listener owns the pool slot; see sock_accept).
     let was_accepting = meta[slot].listening && meta[slot].connected;
+    // Re-listen keeps one outstanding ref (the listener fd); plain close frees.
+    let keep_ref = was_accepting;
     let handle = meta[slot].handle.expect("used slot has a handle");
     with_set(|set| {
         set.remove(handle);
-        if was_accepting {
-            // Re-open a fresh listener socket in the same slot: install a
-            // new socket, keep the listen endpoint, clear the per-connection
-            // flags.
+        if keep_ref {
             let port = meta[slot].lport;
             let nh = set.add(tcp::Socket::new(
                 RingBuffer::new(tcp_buf(slot, false)),
@@ -597,6 +621,7 @@ pub fn sock_close(slot: usize) {
             meta[slot].lport = port;
             meta[slot].listening = true;
             meta[slot].handle = Some(nh);
+            meta[slot].refs = 1;
         } else {
             meta[slot] = SOCK_META_EMPTY;
         }
@@ -1082,6 +1107,9 @@ pub fn sock_sendmsg(slot: usize, iov: u64, iovlen: usize) -> Result<usize, u8> {
     if iovlen == 0 {
         return Ok(0);
     }
+    if !crate::proc::user_range_ok(iov, iovlen * 16) {
+        return Err(14); // EFAULT
+    }
     let mut total = 0usize;
     for i in 0..iovlen {
         let p = iov as *const u64;
@@ -1108,7 +1136,11 @@ pub fn sock_sendmsg(slot: usize, iov: u64, iovlen: usize) -> Result<usize, u8> {
         flat[off..off + n].copy_from_slice(&seg[..n]);
         off += n;
     }
-    sock_send(slot, &flat[..off])
+    let res = sock_send(slot, &flat[..off]);
+    if res.is_ok() {
+        service_iface();
+    }
+    res
 }
 
 /// recvmsg(2): one coalesced receive into the caller's iovec[0]
@@ -1123,6 +1155,9 @@ pub fn sock_recvmsg(
     if iovlen == 0 {
         return Ok(0);
     }
+    if !crate::proc::user_range_ok(iov, 16) {
+        return Err(14); // EFAULT
+    }
     let p = iov as *const u64;
     let base = unsafe { p.read_unaligned() };
     let len = unsafe { p.add(1).read_unaligned() as usize };
@@ -1130,7 +1165,7 @@ pub fn sock_recvmsg(
         return Ok(0);
     }
     if !crate::proc::user_range_ok(base, len) {
-        return Err(EBADF);
+        return Err(14); // EFAULT
     }
     let user = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, len) };
     sock_recv(slot, user, from)

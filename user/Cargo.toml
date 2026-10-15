@@ -23,3 +23,7 @@ path = "src/nettest.rs"
 [[bin]]
 name = "tihkali-netserver"
 path = "src/netserver.rs"
+
+[[bin]]
+name = "tihkali-netsend"
+path = "src/netsend.rs"

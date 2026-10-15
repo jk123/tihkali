@@ -301,7 +301,9 @@ pub fn release_all(targets: &[Option<FdTarget>]) {
                 let _ = close(*i);
             }
             #[cfg(feature = "net")]
-            Some(FdTarget::Socket(s)) => crate::net::sock_close(*s),
+            // Each fd entry drops exactly one socket reference; the pool
+            // slot tears down when the last distinct reference is gone.
+            Some(FdTarget::Socket(s)) => crate::net::sock_ref_dec(*s),
             _ => {}
         }
     }

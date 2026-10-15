@@ -374,6 +374,38 @@ gate_count "s16: no ENOSYS"   "$S16" 'ENOSYS' 0
 gate_has   "s16: clean exit"  "$S16" 'proc: pid 0 exited \(0\)'
 gate_bad   "s16" "$S16"
 
+echo "== session 17: guest TCP sendmsg/recvmsg/shutdown probe (N5)"
+S17="$T/s17.log"
+S17H="$T/s17host.log"
+python3 - "$S17H" <<'PY' &
+import socket, time, sys
+out = open(sys.argv[1], "w")
+time.sleep(6)  # let the guest boot + start listening
+try:
+    s = socket.create_connection(("127.0.0.1", 18086), timeout=15)
+    s.sendall(b"n5-msg")
+    time.sleep(0.5)
+    got = s.recv(16)
+    out.write(f"s17host: echo={got!r}\n")
+    s.close()
+except Exception as e:
+    out.write(f"s17host: connect failed: {e}\n")
+out.close()
+PY
+HOSTP=$!
+( sleep 4
+  printf 'netsend\n'; sleep 10
+  printf '\n'; sleep 1
+  printf 'exit\n'; sleep 3
+) | timeout 45 ./tools/run.sh --hostfwd "tcp:127.0.0.1:18086-10.0.2.15:18086" >"$S17" 2>&1
+wait "$HOSTP" 2>/dev/null
+gate_has   "s17: recvmsg echo" "$S17" 'netsend: recv=[0-9]+'
+gate_has   "s17: probe exit 0" "$S17" 'sh: netsend exited 0'
+gate_has   "s17: host echo"    "$S17H" "s17host: echo=b'n5-msg'"
+gate_count "s17: no ENOSYS"    "$S17" 'ENOSYS' 0
+gate_has   "s17: clean exit"   "$S17" 'proc: pid 0 exited \(0\)'
+gate_bad   "s17" "$S17"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"
