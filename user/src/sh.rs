@@ -725,16 +725,26 @@ pub extern "C" fn _start() -> ! {
                 unsafe { close(fd) };
             }
             other => {
-                // Generic: fork + exec /bin/<cmd>.
+                // Generic: fork + exec. A bare name resolves to /bin/<cmd>;
+                // an absolute path is used verbatim (prefixing it again
+                // would look up /bin//bin/<cmd> and miss).
                 let cl = other.len();
                 let mut path = [0u8; 64];
-                if cl == 0 || cl > 58 {
+                let abs = other.as_bytes().first() == Some(&b'/');
+                let plen = if abs {
+                    cl
+                } else {
+                    cl + 5
+                };
+                if plen == 0 || plen > 63 {
                     unsafe { write(1, "sh: bad command\n") };
                     continue;
                 }
-                path[..5].copy_from_slice(b"/bin/");
-                path[5..5 + cl].copy_from_slice(other.as_bytes());
-                let path_s = core::str::from_utf8(&path[..5 + cl]).unwrap_or("?");
+                if !abs {
+                    path[..5].copy_from_slice(b"/bin/");
+                }
+                path[plen - cl..plen].copy_from_slice(other.as_bytes());
+                let path_s = core::str::from_utf8(&path[..plen]).unwrap_or("?");
 
                 // Full argv: cmd + remaining words (busybox needs `busybox
                 // echo hi` to see "echo hi", not just argv[0]).
