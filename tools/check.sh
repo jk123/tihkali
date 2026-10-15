@@ -406,6 +406,33 @@ gate_count "s17: no ENOSYS"    "$S17" 'ENOSYS' 0
 gate_has   "s17: clean exit"   "$S17" 'proc: pid 0 exited \(0\)'
 gate_bad   "s17" "$S17"
 
+echo "== session 18: setsockopt/getsockopt SO_* options probe (N5c)"
+S18="$T/s18.log"
+( sleep 3
+  printf 'sockopt\n'; sleep 6
+  printf 'exit\n'; sleep 3
+) | timeout 45 ./tools/run.sh >"$S18" 2>&1
+gate_has   "s18: SO_TYPE"        "$S18" 'so_type=1'
+gate_has   "s18: SO_REUSEADDR"   "$S18" 'so_reuseaddr=1'
+gate_has   "s18: SO_KEEPALIVE"   "$S18" 'so_keepalive=1'
+gate_has   "s18: SO_BROADCAST"   "$S18" 'so_broadcast=1'
+gate_has   "s18: SO_SNDBUF dflt" "$S18" 'so_sndbuf_def=[1-9][0-9]*'
+gate_has   "s18: SO_SNDBUF set"  "$S18" 'so_sndbuf=16384'
+gate_has   "s18: SO_RCVBUF dflt" "$S18" 'so_rcvbuf_def=[1-9][0-9]*'
+gate_has   "s18: SO_RCVBUF set"  "$S18" 'so_rcvbuf=32768'
+gate_has   "s18: SO_ERROR clear" "$S18" 'so_error=0'
+gate_has   "s18: SO_ERROR latch" "$S18" 'so_error_after=[1-9][0-9]*'
+gate_has   "s18: SO_ERROR cleard" "$S18" 'so_error_cleared=0'
+gate_has   "s18: readonly EINVAL" "$S18" 'ro_errno=0'
+gate_has   "s18: readonly msg"   "$S18" 'sockopt: readonly rejected'
+gate_has   "s18: EBADF"          "$S18" 'sockopt: ebadf ok'
+gate_has   "s18: probe ok"       "$S18" 'sockopt: ok'
+gate_has   "s18: exit 0"         "$S18" 'sh: sockopt exited 0'
+gate_count "s18: no EINVAL spam" "$S18" '\[linux\] EINVAL' 0
+gate_count "s18: no ENOSYS"      "$S18" 'ENOSYS' 0
+gate_has   "s18: clean exit"     "$S18" 'proc: pid 0 exited \(0\)'
+gate_bad   "s18" "$S18"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

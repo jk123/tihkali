@@ -499,19 +499,65 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         }
         #[cfg(feature = "net")]
         105 => {
-            // SYS_setsockopt: accepted, options ignored (polish in N4+).
-            (0, 0)
+            // SYS_setsockopt(fd, level, name, value, len)
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (0, crate::file::EBADF),
+                Some(slot) => {
+                    if frame.x[1] as i32 != crate::linux_abi::SOL_SOCKET_N {
+                        (0, 0) // unknown level: lenient
+                    } else {
+                        match crate::linux_abi::netbsd_opt(frame.x[2] as i32) {
+                            None => (0, 0),
+                            Some(opt) => {
+                                match crate::net::sock_setopt(
+                                    slot,
+                                    opt,
+                                    frame.x[3],
+                                    frame.x[4] as usize,
+                                ) {
+                                    Ok(()) => (0, 0),
+                                    Err(e) => (0, e),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         #[cfg(feature = "net")]
         118 => {
-            // SYS_getsockopt: report a zero-length result.
-            let optlen_ptr = frame.x[4];
-            if optlen_ptr != 0 && crate::proc::user_range_ok(optlen_ptr, 4) {
-                unsafe {
-                    (optlen_ptr as *mut i32).write_unaligned(0);
+            // SYS_getsockopt(fd, level, name, value, len*)
+            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                None => (0, crate::file::EBADF),
+                Some(slot) => {
+                    if frame.x[1] as i32 != crate::linux_abi::SOL_SOCKET_N {
+                        (0, 0)
+                    } else {
+                        match crate::linux_abi::netbsd_opt(frame.x[2] as i32) {
+                            None => {
+                                let optlen_ptr = frame.x[4];
+                                if optlen_ptr != 0 && crate::proc::user_range_ok(optlen_ptr, 4) {
+                                    unsafe {
+                                        (optlen_ptr as *mut u32).write_unaligned(0);
+                                    }
+                                }
+                                (0, 0)
+                            }
+                            Some(opt) => {
+                                match crate::net::sock_getopt(
+                                    slot,
+                                    opt,
+                                    frame.x[3],
+                                    frame.x[4],
+                                ) {
+                                    Ok(()) => (0, 0),
+                                    Err(e) => (0, e),
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            (0, 0)
         }
         #[cfg(feature = "net")]
         133 => {

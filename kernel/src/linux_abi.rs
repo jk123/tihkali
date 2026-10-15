@@ -599,7 +599,59 @@ pub fn svc(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        208 => (0, 0), // setsockopt: accepted, options ignored (v1)
+        208 => {
+            // setsockopt(fd, level, optname, optval, optlen)
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => {
+                    // Unknown level or optname: accept and ignore (lenient policy).
+                    if frame.x[1] as i32 != SOL_SOCKET_L {
+                        (0, 0)
+                    } else {
+                        match linux_opt(frame.x[2] as i32) {
+                            None => (0, 0),
+                            Some(opt) => match crate::net::sock_setopt(
+                                slot,
+                                opt,
+                                frame.x[3],
+                                frame.x[4] as usize,
+                            ) {
+                                Ok(()) => (0, 0),
+                                Err(e) => (0, e),
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        209 => {
+            // getsockopt(fd, level, optname, optval, optlen*)
+            match sock_slot(frame.x[0] as usize) {
+                None => (0, file::EBADF),
+                Some(slot) => {
+                    if frame.x[1] as i32 != SOL_SOCKET_L {
+                        (0, 0)
+                    } else {
+                        match linux_opt(frame.x[2] as i32) {
+                            None => {
+                                // Unknown option: zero-length result, as v1 did.
+                                if frame.x[4] != 0 && proc::user_range_ok(frame.x[4], 4) {
+                                    unsafe { (frame.x[4] as *mut u32).write_volatile(0) };
+                                }
+                                (0, 0)
+                            }
+                            Some(opt) => {
+                                match crate::net::sock_getopt(slot, opt, frame.x[3], frame.x[4]) {
+                                    Ok(()) => (0, 0),
+                                    Err(e) => (0, e),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         #[cfg(feature = "net")]
         210 => {
             // shutdown(fd, how)
@@ -684,22 +736,6 @@ pub fn svc(frame: &mut TrapFrame) {
                 }
             }
         }
-        #[cfg(feature = "net")]
-        209 => {
-            // getsockopt: report a zero-length result (enough for SO_ERROR
-            // style probes; real option plumbing is N3+).
-            let optlen_ptr = frame.x[4];
-            if optlen_ptr != 0 {
-                if !proc::user_range_ok(optlen_ptr, 4) {
-                    (0, file::EFAULT)
-                } else {
-                    unsafe { (optlen_ptr as *mut i32).write_unaligned(0) };
-                    (0, 0)
-                }
-            } else {
-                (0, 0)
-            }
-        }
         // Identity: single-user root. Observed from ash/musl startup.
         144 => (0, 0), // setgid
         146 => (0, 0), // setuid
@@ -724,7 +760,11 @@ pub fn svc(frame: &mut TrapFrame) {
 
     // Linux epilogue: x0 = value or -errno; carry flags untouched (musl
     // tests with `cmp x0, #-4095` in user space).
-    if err == 22 {
+    //
+    // EINVAL is an expected return from several arms now (setsockopt on a
+    // read-only option, for one), so only trace it where it still signals
+    // a real defect.
+    if err == 22 && matches!(nr, 221 | 222 | 226) {
         kprintln!(
             "[linux] EINVAL nr={nr} x0={:#x} x1={:#x} x2={:#x} elr={:#x}",
             frame.x[0], frame.x[1], frame.x[2], frame.elr
@@ -965,6 +1005,54 @@ pub fn sock_slot(fd: usize) -> Option<usize> {
         Some(FdTarget::Socket(s)) => Some(s),
         _ => None,
     }
+}
+
+/// Linux `SOL_SOCKET` (asm-generic/socket.h).
+#[cfg(feature = "net")]
+const SOL_SOCKET_L: i32 = 1;
+
+/// Map a Linux `SO_*` optname onto the ABI-neutral `net::OPT_*` value.
+/// `None` means the option is not one we plumb through; the caller decides
+/// how to treat it (lenient accept-and-ignore for setsockopt, zero-length
+/// for getsockopt).
+#[cfg(feature = "net")]
+fn linux_opt(name: i32) -> Option<i32> {
+    use crate::net::{OPT_SO_BROADCAST, OPT_SO_ERROR, OPT_SO_KEEPALIVE, OPT_SO_RCVBUF,
+                     OPT_SO_REUSEADDR, OPT_SO_SNDBUF, OPT_SO_TYPE};
+    Some(match name {
+        3 => OPT_SO_TYPE,          // SO_TYPE
+        4 => OPT_SO_ERROR,         // SO_ERROR
+        2 => OPT_SO_REUSEADDR,     // SO_REUSEADDR
+        6 => OPT_SO_BROADCAST,     // SO_BROADCAST
+        7 => OPT_SO_SNDBUF,        // SO_SNDBUF
+        8 => OPT_SO_RCVBUF,        // SO_RCVBUF
+        9 => OPT_SO_KEEPALIVE,     // SO_KEEPALIVE
+        _ => return None,
+    })
+}
+
+/// NetBSD `SOL_SOCKET` is 0xffff — NOT the Linux 1. (sys/socket.h)
+#[cfg(feature = "net")]
+pub const SOL_SOCKET_N: i32 = 0xffff;
+
+/// Map a NetBSD `SO_*` name onto the ABI-neutral `net::OPT_*` value.
+/// NetBSD numbers the boolean flags as low `so_options` bits (SO_REUSEADDR
+/// 0x0004, SO_BROADCAST 0x0020, SO_KEEPALIVE 0x0008) and the extra options
+/// high (SO_SNDBUF 0x1001, SO_RCVBUF 0x1002, SO_ERROR 0x1007, SO_TYPE 0x1008).
+#[cfg(feature = "net")]
+pub fn netbsd_opt(name: i32) -> Option<i32> {
+    use crate::net::{OPT_SO_BROADCAST, OPT_SO_ERROR, OPT_SO_KEEPALIVE, OPT_SO_RCVBUF,
+                     OPT_SO_REUSEADDR, OPT_SO_SNDBUF, OPT_SO_TYPE};
+    Some(match name {
+        0x1008 => OPT_SO_TYPE,      // SO_TYPE
+        0x1007 => OPT_SO_ERROR,     // SO_ERROR
+        0x0004 => OPT_SO_REUSEADDR, // SO_REUSEADDR
+        0x0020 => OPT_SO_BROADCAST, // SO_BROADCAST
+        0x1001 => OPT_SO_SNDBUF,    // SO_SNDBUF
+        0x1002 => OPT_SO_RCVBUF,    // SO_RCVBUF
+        0x0008 => OPT_SO_KEEPALIVE, // SO_KEEPALIVE
+        _ => return None,
+    })
 }
 
 /// Linux `struct sockaddr_in` (16 bytes): family u16 LE, port u16 BE,

@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../user/src/nettest.rs");
     println!("cargo:rerun-if-changed=../user/src/netserver.rs");
     println!("cargo:rerun-if-changed=../user/src/netsend.rs");
+    println!("cargo:rerun-if-changed=../user/src/sockopt.rs");
     println!("cargo:rerun-if-changed=../user/user.ld");
     println!("cargo:rerun-if-changed=assets/motd");
     println!("cargo:rerun-if-changed=assets/demo.sh");
@@ -49,7 +50,8 @@ fn main() {
     let nettest = bindir.join("tihkali-nettest");
     let netserver = bindir.join("tihkali-netserver");
     let netsend = bindir.join("tihkali-netsend");
-    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend] {
+    let sockopt = bindir.join("tihkali-sockopt");
+    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt] {
         assert!(p.exists(), "user binary not produced at {}", p.display());
     }
     // Still used by main.rs until M4 switches pid0/exec to the VFS.
@@ -198,6 +200,7 @@ fn main() {
     let nettest_bytes = std::fs::read(&nettest).expect("read tihkali-nettest");
     let netserver_bytes = std::fs::read(&netserver).expect("read tihkali-netserver");
     let netsend_bytes = std::fs::read(&netsend).expect("read tihkali-netsend");
+    let sockopt_bytes = std::fs::read(&sockopt).expect("read tihkali-sockopt");
     let linux_bytes = std::fs::read(&linux_out).expect("read linux-hello");
     let probe_bytes = std::fs::read(&probe_out).expect("read linux-probe");
     let tcp_bytes = std::fs::read(&tcp_out).expect("read linux-tcp");
@@ -216,6 +219,7 @@ fn main() {
         CpioEntry::file("bin/nettest", &nettest_bytes),
         CpioEntry::file("bin/netserver", &netserver_bytes),
         CpioEntry::file("bin/netsend", &netsend_bytes),
+        CpioEntry::file("bin/sockopt", &sockopt_bytes),
         CpioEntry::file("bin/linux-hello", &linux_bytes),
         CpioEntry::file("bin/linux-probe", &probe_bytes),
         CpioEntry::file("bin/linux-tcp", &tcp_bytes),

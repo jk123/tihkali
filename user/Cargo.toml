@@ -27,3 +27,7 @@ path = "src/netserver.rs"
 [[bin]]
 name = "tihkali-netsend"
 path = "src/netsend.rs"
+
+[[bin]]
+name = "tihkali-sockopt"
+path = "src/sockopt.rs"

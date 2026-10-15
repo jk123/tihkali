@@ -65,6 +65,12 @@ const EISCONN: u8 = 56;
 const EIO: u8 = 5;
 const ENOBUFS: u8 = 55;
 
+// Boolean socket options, kept in NetBSD's `so_options` bit numbering so the
+// stored mask is ABI-neutral; each arm translates its own option ids.
+const SO_REUSEADDR: u16 = 0x0004;
+const SO_KEEPALIVE: u16 = 0x0008;
+const SO_BROADCAST: u16 = 0x0020;
+
 /// Gateway MAC sniffed off the wire: bit 63 = seen, bits 0..47 = address.
 static ARP_GW: AtomicU64 = AtomicU64::new(0);
 
@@ -103,6 +109,15 @@ struct SockMeta {
     /// Number of live fd references to this slot (dup/fork/close).
     /// Teardown happens only at zero.
     refs: u8,
+    /// Sticky SO_ERROR: a failed connect/accept/send records the errno and
+    /// `getsockopt(SO_ERROR)` reports-then-clears it (POSIX semantics).
+    so_error: u8,
+    /// Bitmask of the boolean SO_* flags (SO_REUSEADDR/SO_BROADCAST/
+    /// SO_KEEPALIVE), in NetBSD's so_options numbering.
+    so_flags: u16,
+    /// SO_SNDBUF / SO_RCVBUF as set by the user (0 = kernel default).
+    so_sndbuf: u32,
+    so_rcvbuf: u32,
 }
 const SOCK_META_EMPTY: SockMeta = SockMeta {
     used: false,
@@ -114,6 +129,10 @@ const SOCK_META_EMPTY: SockMeta = SockMeta {
     peer_ip: [0; 4],
     listening: false,
     refs: 0,
+    so_error: 0,
+    so_flags: 0,
+    so_sndbuf: 0,
+    so_rcvbuf: 0,
 };
 static SOCK_META: NetCell<[SockMeta; NSOCK]> =
     NetCell(UnsafeCell::new([SOCK_META_EMPTY; NSOCK]));
@@ -766,7 +785,10 @@ pub fn sock_connect(slot: usize, ip: [u8; 4], port: u16) -> Result<Conn, u8> {
                     }
                     State::Closed if meta[slot].connecting => {
                         // smoltcp aborted (RST refused, or the connect timeout).
+                        // POSIX: an async connect failure is reported by
+                        // connect() *and* latched for getsockopt(SO_ERROR).
                         meta[slot].connecting = false;
+                        meta[slot].so_error = ECONNREFUSED;
                         Ok(Conn::Failed)
                     }
                     _ => Ok(Conn::Progress),
@@ -1012,11 +1034,16 @@ pub fn sock_recv(
                 Ok(0) => Err(EAGAIN_L),
                 Ok(n) => Ok(n),
                 Err(tcp::RecvError::Finished) => Ok(0),
-                Err(tcp::RecvError::InvalidState) => Err(if meta[slot].connected {
-                    ECONNRESET
-                } else {
-                    ENOTCONN
-                }),
+                Err(tcp::RecvError::InvalidState) => {
+                    let err = if meta[slot].connected {
+                        ECONNRESET
+                    } else {
+                        ENOTCONN
+                    };
+                    // Latch so a subsequent getsockopt(SO_ERROR) sees it.
+                    meta[slot].so_error = err;
+                    Err(err)
+                }
             }
         }),
         SockKind::Udp => with_set(|set| {
@@ -1074,6 +1101,149 @@ pub fn sock_recv(
             }
         }
     }
+}
+
+/// Sockopt option values, already normalised out of each ABI's numbering.
+/// The per-ABI arms translate their own constants into these.
+pub const OPT_SO_TYPE: i32 = 1;
+pub const OPT_SO_ERROR: i32 = 2;
+pub const OPT_SO_SNDBUF: i32 = 3;
+pub const OPT_SO_RCVBUF: i32 = 4;
+pub const OPT_SO_REUSEADDR: i32 = 5;
+pub const OPT_SO_BROADCAST: i32 = 6;
+pub const OPT_SO_KEEPALIVE: i32 = 7;
+
+/// Kernel-reported buffer sizes (the smoltcp ring sizes actually in use).
+const DEF_SNDBUF: u32 = TCP_BUF as u32;
+const DEF_RCVBUF: u32 = TCP_BUF as u32;
+
+/// setsockopt(2). `optval`/`optlen` are raw user pointers; the ABI arm has
+/// already mapped its option number onto one of the `OPT_*` constants.
+pub fn sock_setopt(
+    slot: usize,
+    opt: i32,
+    optval: u64,
+    optlen: usize,
+) -> Result<(), u8> {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used {
+        return Err(EBADF);
+    }
+    if optlen < 4 {
+        return Err(EINVAL);
+    }
+    if !crate::proc::user_range_ok(optval, 4) {
+        return Err(14); // EFAULT
+    }
+    let v = unsafe { core::ptr::read_volatile(optval as *const u32) };
+    match opt {
+        OPT_SO_SNDBUF => {
+            // Linux/NetBSD both clamp to the doubled-kernel-size model;
+            // we keep the request and report it back verbatim.
+            meta[slot].so_sndbuf = v;
+            Ok(())
+        }
+        OPT_SO_RCVBUF => {
+            meta[slot].so_rcvbuf = v;
+            Ok(())
+        }
+        OPT_SO_REUSEADDR | OPT_SO_BROADCAST | OPT_SO_KEEPALIVE => {
+            let bit = match opt {
+                OPT_SO_REUSEADDR => SO_REUSEADDR,
+                OPT_SO_BROADCAST => SO_BROADCAST,
+                _ => SO_KEEPALIVE,
+            };
+            if v != 0 {
+                meta[slot].so_flags |= bit;
+            } else {
+                meta[slot].so_flags &= !bit;
+            }
+            Ok(())
+        }
+        // SO_TYPE and SO_ERROR are get-only.
+        OPT_SO_TYPE | OPT_SO_ERROR => Err(22), // EINVAL
+        _ => Ok(()), // unknown: accepted and ignored (lenient policy)
+    }
+}
+
+/// getsockopt(2): write the option value into `optval` and the realised
+/// length into `optlen`. `optlen` may be null (length-only probe).
+pub fn sock_getopt(
+    slot: usize,
+    opt: i32,
+    optval: u64,
+    optlen: u64,
+) -> Result<(), u8> {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used {
+        return Err(EBADF);
+    }
+    if optlen != 0 && !crate::proc::user_range_ok(optlen, 4) {
+        return Err(14); // EFAULT
+    }
+    let (val, is_so_type) = match opt {
+        OPT_SO_TYPE => (
+            match meta[slot].kind {
+                SockKind::Tcp => 1,   // SOCK_STREAM
+                SockKind::Udp => 2,   // SOCK_DGRAM
+                SockKind::Icmp => 3,  // SOCK_RAW
+            },
+            true,
+        ),
+        // Report-and-clear, per POSIX.
+        OPT_SO_ERROR => {
+            let e = meta[slot].so_error;
+            meta[slot].so_error = 0;
+            (e as u32, false)
+        }
+        OPT_SO_SNDBUF => (
+            if meta[slot].so_sndbuf != 0 {
+                meta[slot].so_sndbuf
+            } else {
+                DEF_SNDBUF
+            },
+            false,
+        ),
+        OPT_SO_RCVBUF => (
+            if meta[slot].so_rcvbuf != 0 {
+                meta[slot].so_rcvbuf
+            } else {
+                DEF_RCVBUF
+            },
+            false,
+        ),
+        OPT_SO_REUSEADDR => (
+            ((meta[slot].so_flags & SO_REUSEADDR) != 0) as u32,
+            false,
+        ),
+        OPT_SO_BROADCAST => (
+            ((meta[slot].so_flags & SO_BROADCAST) != 0) as u32,
+            false,
+        ),
+        OPT_SO_KEEPALIVE => (
+            ((meta[slot].so_flags & SO_KEEPALIVE) != 0) as u32,
+            false,
+        ),
+        // Unknown option: a zero length result, as the previous v1 arm did.
+        _ => {
+            if optlen != 0 {
+                unsafe { (optlen as *mut u32).write_volatile(0) };
+            }
+            return Ok(());
+        }
+    };
+    if optval != 0 {
+        if !crate::proc::user_range_ok(optval, 4) {
+            return Err(14); // EFAULT
+        }
+        unsafe { (optval as *mut u32).write_volatile(val) };
+    }
+    // SO_TYPE reports sizeof(int); the rest are plain ints.
+    let _ = is_so_type;
+    if optlen != 0 {
+        unsafe { (optlen as *mut u32).write_volatile(4) };
+    }
+    Ok(())
 }
 
 /// SHUT_WR (how==1): shut down the send half of a TCP connection (FIN).
