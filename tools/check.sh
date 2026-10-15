@@ -410,13 +410,17 @@ echo "== session 18: setsockopt/getsockopt SO_* options probe (N5c)"
 S18="$T/s18.log"
 ( sleep 3
   printf '/bin/sockopt\n'; sleep 6
+  printf 'sockopt\n'; sleep 6
   printf '/bin/nosuchfile\n'; sleep 2
+  printf 'nosuchcmd\n'; sleep 2
   printf 'exit\n'; sleep 3
-) | timeout 45 ./tools/run.sh >"$S18" 2>&1
+) | timeout 60 ./tools/run.sh >"$S18" 2>&1
 # An absolute path must exec directly; it must not be re-prefixed to
-# /bin//bin/<cmd> (which missed and exited 127).
-gate_has   "s18: abs path exec"   "$S18" 'exec /bin/sockopt'
+# /bin//bin/<cmd> (which missed and exited 127). The bare name must
+# resolve through $PATH to the same binary: two execs, not one.
+gate_count "s18: exec twice"     "$S18" 'exec /bin/sockopt' 2
 gate_has   "s18: missing abs 127" "$S18" 'sh: /bin/nosuchfile: not found'
+gate_count "s18: missing bare 127" "$S18" 'sh: nosuchcmd: not found' 1
 gate_has   "s18: SO_TYPE"        "$S18" 'so_type=1'
 gate_has   "s18: SO_REUSEADDR"   "$S18" 'so_reuseaddr=1'
 gate_has   "s18: SO_KEEPALIVE"   "$S18" 'so_keepalive=1'

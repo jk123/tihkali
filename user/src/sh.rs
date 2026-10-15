@@ -206,6 +206,47 @@ unsafe fn close(fd: i64) -> i64 {
     if err != 0 { -ret } else { ret }
 }
 
+/// Search `$PATH` for a bare command name, writing the first hit into
+/// `out`. Falls back to `/bin/<name>` so a bare name keeps working even
+/// when `$PATH` is unset or empty — this shell has no environment to
+/// inherit from, so `PATH` is a compile-time default rather than a
+/// settable variable.
+///
+/// An absolute `cmd` is returned unchanged (no directory search), which
+/// keeps `/bin/foo` from being re-prefixed.
+fn resolve_cmd(cmd: &str, out: &mut [u8; 64]) -> bool {
+    if cmd.is_empty() || cmd.len() > 60 {
+        return false;
+    }
+    let cb = cmd.as_bytes();
+    if cb[0] == b'/' {
+        if cmd.len() > 63 {
+            return false;
+        }
+        out[..cmd.len()].copy_from_slice(cb);
+        return true;
+    }
+    // Default PATH: /bin first (this is where every binary lives), then
+    // /usr/bin for host-provided tools.
+    for dir in ["/bin".as_bytes(), "/usr/bin".as_bytes()] {
+        let n = dir.len() + 1 + cmd.len();
+        if n > 63 {
+            continue;
+        }
+        out[..dir.len()].copy_from_slice(dir);
+        out[dir.len()] = b'/';
+        out[dir.len() + 1..n].copy_from_slice(cb);
+        // Confirm the file exists so a miss falls through to the next
+        // entry instead of failing exec outright.
+        let fd = unsafe { open(core::str::from_utf8(&out[..n]).unwrap_or(""), 0) };
+        if fd >= 0 {
+            unsafe { close(fd) };
+            return true;
+        }
+    }
+    false
+}
+
 unsafe fn read(fd: i64, buf: &mut [u8]) -> i64 {
     let ret: i64;
     let err: u64;
@@ -730,20 +771,22 @@ pub extern "C" fn _start() -> ! {
                 // would look up /bin//bin/<cmd> and miss).
                 let cl = other.len();
                 let mut path = [0u8; 64];
-                let abs = other.as_bytes().first() == Some(&b'/');
-                let plen = if abs {
-                    cl
-                } else {
-                    cl + 5
-                };
-                if plen == 0 || plen > 63 {
-                    unsafe { write(1, "sh: bad command\n") };
-                    continue;
-                }
-                if !abs {
+                // Search $PATH for a bare name; an absolute path is used
+                // verbatim (prefixing it again would look up /bin//bin/<cmd>).
+                if !resolve_cmd(other, &mut path) {
+                    if cl == 0 || cl > 58 {
+                        unsafe { write(1, "sh: bad command\n") };
+                        continue;
+                    }
+                    // Unresolvable: keep the conventional /bin/<cmd> so the
+                    // exec reports "not found" against the path the user
+                    // would expect, rather than the bare word.
                     path[..5].copy_from_slice(b"/bin/");
+                    path[5..5 + cl].copy_from_slice(other.as_bytes());
                 }
-                path[plen - cl..plen].copy_from_slice(other.as_bytes());
+                let plen = (0..64)
+                    .find(|&i| path[i] == 0)
+                    .unwrap_or(63);
                 let path_s = core::str::from_utf8(&path[..plen]).unwrap_or("?");
 
                 // Full argv: cmd + remaining words (busybox needs `busybox
