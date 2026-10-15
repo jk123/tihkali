@@ -13,14 +13,38 @@ space lives at VA 4 GiB, kernel identity-maps all RAM in every address space).
 warning is a failure. Sessions use scripted stdin:
 
 ```sh
-(sleep 3; printf 'ls\n'; sleep 0.5; printf 'exit\n') | timeout 12 ./tools/run.sh
+(sleep 5; printf 'ls\n'; sleep 0.5; printf 'exit\n') | timeout 15 ./tools/run.sh
 ```
 
-First input must start after **3 s**: run.sh runs `cargo build` first, and a
+First input must start after **5 s**: run.sh runs `cargo build` first, and a
 rebuild (triggered by `sync` rewriting target/initramfs.img in a previous
 session) takes ~1.5 s on top of boot — anything earlier races the UART init
 and drops the first byte (symptom: `trap` → `rap`). Mid-session sleeps can
 stay short.
+
+The margin was **3 s → 5 s** because 3 s proved flaky on a loaded host: with
+4 QEMU sessions contending, s3 lost its first byte and reported `rap 15`, and
+s17's hostfwd exchange timed out (`s17host: echo=b''`). Each session's
+`timeout` is now **3 s larger** than before so the extra margin is paid for,
+not stolen from the script's own runtime. Verify the headroom still holds
+after editing a session's sleeps:
+
+```sh
+# sum each session's host sleeps vs its timeout; s9's `printf 'sleep 100'`
+# is a guest command and must not be counted
+python3 - <<'PY'
+import re
+src = open('tools/check.sh').read()
+for b in re.split(r'\necho "== session ', src)[1:]:
+    to = re.search(r'timeout (\d+) \./tools/run\.sh', b)
+    tot = sum(float(x) for x in re.findall(r"sleep ([0-9.]+)", b[:to.start()]))
+    print(b.split('"')[0].split(':')[0], tot, to.group(1))
+PY
+```
+
+Sessions run **sequentially**; running several `run.sh` at once fails with
+`Failed to get "write" lock` on `target/initramfs.img` and is not a valid
+stress test of the margin.
 
 ## Commands
 

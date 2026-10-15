@@ -59,12 +59,12 @@ fi
 
 echo "== session 1: fs ops + write-back"
 S1="$T/s1.log"
-( sleep 3
+( sleep 5
   printf 'mkdir /w\n';      sleep 0.3
   printf 'save /w/a alpha data\n'; sleep 0.3
   printf 'sync\n';          sleep 2.0
   printf 'exit\n'
-) | timeout 15 ./tools/run.sh >"$S1" 2>&1
+) | timeout 18 ./tools/run.sh >"$S1" 2>&1
 gate_has "s1: file saved"     "$S1" 'saved /w/a'
 gate_has "s1: sync wrote"     "$S1" 'sync: wrote [0-9]+ sectors'
 gate_has "s1: clean exit"     "$S1" 'proc: pid 0 exited \(0\)'
@@ -72,21 +72,21 @@ gate_bad  "s1" "$S1"
 
 echo "== session 2: persistence across reboot"
 S2="$T/s2.log"
-( sleep 3
+( sleep 5
   printf 'ls /w\n';          sleep 0.3
   printf 'cat /w/a\n';       sleep 0.3
   printf 'rm /w/a\n';        sleep 0.3
   printf 'rmdir /w\n';       sleep 0.3
   printf 'sync\n';           sleep 2.0
   printf 'exit\n'
-) | timeout 15 ./tools/run.sh >"$S2" 2>&1
+) | timeout 18 ./tools/run.sh >"$S2" 2>&1
 gate_has "s2: file survived reboot" "$S2" 'alpha data'
 gate_has "s2: removal synced"       "$S2" 'sync: wrote [0-9]+ sectors'
 gate_bad  "s2" "$S2"
 
 echo "== session 3: signals + mask + jobs"
 S3="$T/s3.log"
-( sleep 3
+( sleep 5
   printf 'trap 15\n';        sleep 0.3
   printf 'kill 15\n';        sleep 0.5
   printf 'sigblock 15\n';    sleep 0.3
@@ -96,7 +96,7 @@ S3="$T/s3.log"
   printf 'jobs\n';           sleep 1.0
   printf 'killchild 9\n';    sleep 2.0
   printf 'kill 2\n';         sleep 1.5
-) | timeout 18 ./tools/run.sh >"$S3" 2>&1
+) | timeout 21 ./tools/run.sh >"$S3" 2>&1
 gate_count "s3: caught exactly twice (15 suppressed while blocked)" \
     "$S3" 'caught signal 15' 2
 gate_has "s3: unblock delivered"   "$S3" 'sigunblock 15'
@@ -108,11 +108,11 @@ gate_bad  "s3" "$S3"
 
 echo "== session 4: embedded fallback (--no-drive)"
 S4="$T/s4.log"
-( sleep 3
+( sleep 5
   printf 'ls /bin\n';        sleep 0.3
   printf 'cat /etc/motd\n';  sleep 0.3
   printf 'exit\n'
-) | timeout 12 ./tools/run.sh --no-drive >"$S4" 2>&1
+) | timeout 15 ./tools/run.sh --no-drive >"$S4" 2>&1
 gate_has "s4: fallback engaged"  "$S4" 'no device in 32 MMIO slots'
 gate_has "s4: fs served"         "$S4" 'Welcome to tihkali'
 gate_has "s4: sh listed"         "$S4" '^sh'
@@ -121,11 +121,11 @@ gate_bad  "s4" "$S4"
 
 echo "== session 5: Linux ABI personality"
 S5="$T/s5.log"
-( sleep 3
+( sleep 5
   printf 'linux-hello\n'
   sleep 2.0
   printf 'exit\n'
-) | timeout 12 ./tools/run.sh >"$S5" 2>&1
+) | timeout 15 ./tools/run.sh >"$S5" 2>&1
 gate_has "s5: linux binary ran"  "$S5" 'hello from linux/musl \(EL0 via Linux ABI\)'
 gate_has "s5: exit code via wait4" "$S5" 'sh: linux-hello exited 42'
 gate_has "s5: clean exit"         "$S5" 'proc: pid 0 exited \(0\)'
@@ -133,12 +133,12 @@ gate_bad  "s5" "$S5"
 
 echo "== session 6: Raspberry Pi 3 (raspi3b, embedded initramfs)"
 S6="$T/s6.log"
-( sleep 3
+( sleep 5
   printf 'ls /bin\n';    sleep 0.6
   printf 'busybox sleep 0.5\n'; sleep 1.4
   printf 'greet\n';      sleep 1.5
   printf 'exit\n'
-) | timeout 15 ./tools/run.sh --rpi >"$S6" 2>&1
+) | timeout 18 ./tools/run.sh --rpi >"$S6" 2>&1
 gate_has "s6: booted on raspi3b"     "$S6" 'entered at EL'
 gate_has "s6: no-GIC dispatcher"     "$S6" 'BCM283x poll dispatcher'
 gate_has "s6: fallback initramfs"    "$S6" 'no device in 32 MMIO slots'
@@ -151,7 +151,7 @@ gate_bad  "s6" "$S6"
 
 echo "== session 7: Linux ABI depth + Alpine busybox"
 S7="$T/s7.log"
-( sleep 3
+( sleep 5
   printf 'linux-probe\n'
   sleep 3
   printf 'busybox echo hello-from-alpine\n'
@@ -161,7 +161,7 @@ S7="$T/s7.log"
   printf 'busybox cat /etc/motd\n'
   sleep 2
   printf 'exit\n'
-) | timeout 20 ./tools/run.sh >"$S7" 2>&1
+) | timeout 23 ./tools/run.sh >"$S7" 2>&1
 gate_has "s7: probe all ok"          "$S7" 'linux-probe: all ok'
 gate_has "s7: probe exited 0"        "$S7" 'sh: linux-probe exited 0'
 gate_count "s7: busybox echo ran"    "$S7" 'hello-from-alpine' 2
@@ -172,7 +172,7 @@ gate_bad  "s7" "$S7"
 
 echo "== session 8: busybox ash (POSIX shell: script + pipeline + applets)"
 S8="$T/s8.log"
-( sleep 3
+( sleep 5
   printf 'busybox ash /etc/demo.sh\n'
   sleep 3
   printf 'busybox cat /etc/motd\n'
@@ -180,7 +180,7 @@ S8="$T/s8.log"
   printf 'busybox ls /bin\n'
   sleep 2
   printf 'exit\n'
-) | timeout 18 ./tools/run.sh >"$S8" 2>&1
+) | timeout 21 ./tools/run.sh >"$S8" 2>&1
 gate_has "s8: ash ran demo script"      "$S8" 'hello-from-pipeline'
 gate_has "s8: pipeline second line"     "$S8" '^done'
 gate_has "s8: ash exited 0"             "$S8" 'sh: busybox exited 0'
@@ -191,7 +191,7 @@ gate_bad  "s8" "$S8"
 
 echo "== session 9: job control — interactive ash, ppoll line editing, Ctrl-C"
 S9="$T/s9.log"
-( sleep 3
+( sleep 5
   printf 'busybox ash\n'
   sleep 3
   printf 'echo interactive-ok\n'
@@ -205,7 +205,7 @@ S9="$T/s9.log"
   printf 'exit\n'
   sleep 1.5
   printf 'exit\n'
-) | timeout 20 ./tools/run.sh >"$S9" 2>&1
+) | timeout 23 ./tools/run.sh >"$S9" 2>&1
 gate_has "s9: interactive line editing (ppoll)" "$S9" 'interactive-ok'
 gate_has "s9: ^C killed fg sleep"               "$S9" 'proc: pid [0-9]+ killed by signal 2'
 gate_has "s9: ash survived ^C"                  "$S9" 'alive-after-ctrlc'
@@ -217,7 +217,7 @@ gate_bad  "s9" "$S9"
 
 echo "== session 10: writable FS depth — stage mode/mtime/rename/symlink + sync"
 S10="$T/s10.log"
-( sleep 3
+( sleep 5
   printf 'busybox rm -rf /w\n';                 sleep 0.4
   printf 'busybox mkdir -m 700 /w\n';           sleep 0.4
   printf 'save /w/f m19-fs-depth\n';            sleep 0.4
@@ -228,7 +228,7 @@ S10="$T/s10.log"
   printf 'busybox sync\n';                      sleep 1.5
   printf 'sync\n';                              sleep 2.0
   printf 'exit\n'
-) | timeout 18 ./tools/run.sh >"$S10" 2>&1
+) | timeout 21 ./tools/run.sh >"$S10" 2>&1
 gate_has "s10: sync wrote"     "$S10" 'sync: wrote [0-9]+ sectors'
 gate_count "s10: no ENOSYS"    "$S10" 'ENOSYS' 0
 gate_count "s10: no bad syscalls from *at arms" "$S10" 'sh: busybox exited 1' 0
@@ -237,7 +237,7 @@ gate_bad  "s10" "$S10"
 
 echo "== session 11: FS depth persistence across reboot (modes/mtime/rename/symlink)"
 S11="$T/s11.log"
-( sleep 3
+( sleep 5
   printf 'busybox ls -ld /w\n';                 sleep 0.5
   printf 'busybox ls -l /w\n';                  sleep 0.5
   printf 'busybox cat /w/g\n';                  sleep 0.4
@@ -249,7 +249,7 @@ S11="$T/s11.log"
   printf 'busybox rmdir /w\n';                  sleep 0.4
   printf 'sync\n';                              sleep 2.0
   printf 'exit\n'
-) | timeout 18 ./tools/run.sh >"$S11" 2>&1
+) | timeout 21 ./tools/run.sh >"$S11" 2>&1
 gate_has "s11: dir mode 700 persisted"   "$S11" 'drwx------'
 gate_has "s11: file mode 600 persisted"  "$S11" '-rw-------'
 gate_has "s11: symlink lstat persisted"  "$S11" 'lrwxrwxrwx'
@@ -265,7 +265,7 @@ gate_bad  "s11" "$S11"
 
 echo "== session 12: net smoke (virtio-net + slirp ARP/ICMP)"
 S12="$T/s12.log"
-( sleep 3; printf 'exit\n' ) | timeout 12 ./tools/run.sh >"$S12" 2>&1
+( sleep 5; printf 'exit\n' ) | timeout 15 ./tools/run.sh >"$S12" 2>&1
 gate_has   "s12: link up"        "$S12" 'net: link up, 10\.0\.2\.15/24 gw 10\.0\.2\.2 \(dhcp\)'
 gate_has   "s12: arp resolved"   "$S12" 'net: arp 10\.0\.2\.2 -> ([0-9a-f]{2}:){5}[0-9a-f]{2}'
 gate_has   "s12: icmp reply"     "$S12" 'net: icmp reply from 10\.0\.2\.2, .* rtt'
@@ -292,7 +292,7 @@ sleep 1
 ( sleep 4
   printf 'linux-tcp\n'; sleep 3
   printf 'exit\n'; sleep 1
-) | timeout 20 ./tools/run.sh >"$S13" 2>&1
+) | timeout 23 ./tools/run.sh >"$S13" 2>&1
 kill "$SRV" 2>/dev/null
 wait "$SRV" 2>/dev/null
 gate_has   "s13: tcp all ok"   "$S13" 'tcp: all ok'
@@ -313,7 +313,7 @@ sleep 1
   printf 'busybox wget -O - http://10.0.2.2:18081/n3.txt\n'; sleep 4
   printf 'nettest\n'; sleep 4
   printf 'exit\n'; sleep 1
-) | timeout 30 ./tools/run.sh >"$S14" 2>&1
+) | timeout 33 ./tools/run.sh >"$S14" 2>&1
 kill "$HTTP" 2>/dev/null
 wait "$HTTP" 2>/dev/null
 rm -rf "$N3DIR"
@@ -351,7 +351,7 @@ HOSTP=$!
   printf 'netserver\n'; sleep 14
   printf '\n'; sleep 1
   printf 'exit\n'; sleep 4
-) | timeout 45 ./tools/run.sh --hostfwd "tcp:127.0.0.1:18082-10.0.2.15:18082" >"$S15" 2>&1
+) | timeout 48 ./tools/run.sh --hostfwd "tcp:127.0.0.1:18082-10.0.2.15:18082" >"$S15" 2>&1
 wait "$HOSTP" 2>/dev/null
 gate_has   "s15: accepted peer" "$S15" 'netserver: peer port'
 gate_has   "s15: host echo"     "$S15H" "s15host: echo=b'X'"
@@ -369,7 +369,7 @@ sleep 1
 ( sleep 4
   printf 'wget -O - http://10.0.2.2:18083/n5.txt\n'; sleep 4
   printf 'exit\n'; sleep 1
-) | timeout 40 ./tools/run.sh >"$S16" 2>&1
+) | timeout 43 ./tools/run.sh >"$S16" 2>&1
 kill "$HTTP" 2>/dev/null
 wait "$HTTP" 2>/dev/null
 rm -rf "$N5DIR"
@@ -401,7 +401,7 @@ HOSTP=$!
   printf 'netsend\n'; sleep 10
   printf '\n'; sleep 1
   printf 'exit\n'; sleep 3
-) | timeout 45 ./tools/run.sh --hostfwd "tcp:127.0.0.1:18086-10.0.2.15:18086" >"$S17" 2>&1
+) | timeout 48 ./tools/run.sh --hostfwd "tcp:127.0.0.1:18086-10.0.2.15:18086" >"$S17" 2>&1
 wait "$HOSTP" 2>/dev/null
 gate_has   "s17: recvmsg echo" "$S17" 'netsend: recv=[0-9]+'
 gate_has   "s17: probe exit 0" "$S17" 'sh: netsend exited 0'
@@ -412,13 +412,13 @@ gate_bad   "s17" "$S17"
 
 echo "== session 18: setsockopt/getsockopt SO_* options probe (N5c)"
 S18="$T/s18.log"
-( sleep 3
+( sleep 5
   printf '/bin/sockopt\n'; sleep 6
   printf 'sockopt\n'; sleep 6
   printf '/bin/nosuchfile\n'; sleep 2
   printf 'nosuchcmd\n'; sleep 2
   printf 'exit\n'; sleep 3
-) | timeout 60 ./tools/run.sh >"$S18" 2>&1
+) | timeout 63 ./tools/run.sh >"$S18" 2>&1
 # An absolute path must exec directly; it must not be re-prefixed to
 # /bin//bin/<cmd> (which missed and exited 127). The bare name must
 # resolve through $PATH to the same binary: two execs, not one.
