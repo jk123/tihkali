@@ -45,6 +45,14 @@ pub fn now() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Hint to the CPU that we are in a bounded busy-wait: keeps the timer
+/// IRQ path short without dropping to a WFI the boot path can't wake from
+/// reliably (no scheduler is running yet).
+#[cfg(feature = "net")]
+pub fn spin() {
+    core::hint::spin_loop();
+}
+
 /// Seconds since the fake epoch (matches clock_gettime's REALTIME base),
 /// used for file mtimes.
 pub fn unix_secs() -> i64 {

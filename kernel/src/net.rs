@@ -13,10 +13,11 @@
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use smoltcp::iface::{Config, Interface, PollResult, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::dhcpv4;
 use smoltcp::socket::icmp::{
     Endpoint as IcmpEndpoint, PacketBuffer as IcmpBuffer, PacketMetadata as IcmpMeta,
     RecvError as IcmpRecvError, SendError as IcmpSendError, Socket as IcmpSocket,
@@ -38,6 +39,9 @@ const GW: [u8; 4] = [10, 0, 2, 2];
 const IDENT: u16 = 0x1234;
 const DEADLINE_MS: i64 = 1500; // boot smoke; must fit before the sessions'
                                // first scripted input at 3 s
+/// DHCP acquisition window. Kept short so a silent/absent DHCP server
+/// costs boot time only once; SLIRP answers instantly.
+const DHCP_DEADLINE_MS: i64 = 1200;
 
 /// Socket pool (Linux fd → pool slot via FdTarget::Socket).
 const NSOCK: usize = 8;
@@ -73,6 +77,20 @@ const SO_BROADCAST: u16 = 0x0020;
 
 /// Gateway MAC sniffed off the wire: bit 63 = seen, bits 0..47 = address.
 static ARP_GW: AtomicU64 = AtomicU64::new(0);
+
+/// Negotiated gateway (DHCP when available, else the static SLIRP one),
+/// packed big-endian. Read by the ARP sniffer and the boot ICMP probe so
+/// neither has to assume the static address.
+static GW_ADDR: AtomicU32 = AtomicU32::new(0);
+
+fn gw_octets() -> [u8; 4] {
+    let v = GW_ADDR.load(Ordering::Acquire);
+    if v == 0 {
+        GW
+    } else {
+        v.to_le_bytes()
+    }
+}
 
 /// `UnsafeCell` wrapper (the file.rs/fs.rs pattern) — single-core, so no
 /// locking; edition 2024 forbids direct `&mut STATIC` references.
@@ -232,15 +250,16 @@ impl<'a> RxToken for NetRx<'a> {
         let bytes = virtio_net::rx_bytes(self.id, self.len);
         // Sniff an ARP reply from the gateway for the resolution print
         // (smoltcp 0.12 exposes no public neighbor-cache accessor).
+        let gw = gw_octets();
         if bytes.len() >= 42
             && bytes[12] == 0x08
             && bytes[13] == 0x06 // ethertype ARP
             && bytes[20] == 0x00
             && bytes[21] == 0x02 // opcode reply
-            && bytes[28] == GW[0]
-            && bytes[29] == GW[1]
-            && bytes[30] == GW[2]
-            && bytes[31] == GW[3]
+            && bytes[28] == gw[0]
+            && bytes[29] == gw[1]
+            && bytes[30] == gw[2]
+            && bytes[31] == gw[3]
             && ARP_GW.load(Ordering::Acquire) >> 63 == 0
         {
             let mac = u64::from_be_bytes([
@@ -254,8 +273,13 @@ impl<'a> RxToken for NetRx<'a> {
                 0,
             ]);
             ARP_GW.store(mac | (1 << 63), Ordering::Release);
+            let g = gw_octets();
             kprintln!(
-                "net: arp 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                "net: arp {}.{}.{}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                g[0],
+                g[1],
+                g[2],
+                g[3],
                 bytes[22],
                 bytes[23],
                 bytes[24],
@@ -306,6 +330,45 @@ impl Device for NetDev {
 
 // ---------- boot smoke (N1) ----------
 
+/// Acquire an IPv4 configuration over DHCP, bounded by `deadline_ms`.
+///
+/// Returns `(address, gateway)` on success. The smoltcp DHCP socket borrows
+/// its receive buffer, so it is scoped to this call rather than living in
+/// the persistent pool; acquisition is a boot-time one-shot.
+fn dhcp_acquire(
+    iface: &mut Interface,
+    dev: &mut NetDev,
+    deadline_ms: i64,
+) -> Option<([u8; 4], Option<[u8; 4]>)> {
+    let sock = dhcpv4::Socket::new();
+    let mut store = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut store[..]);
+    let handle = sockets.add(sock);
+
+    let start = now_ms();
+    while now_ms() - start < deadline_ms {
+        let ts = Instant::from_millis(now_ms());
+        iface.poll(ts, dev, &mut sockets);
+        let event = sockets.get_mut::<dhcpv4::Socket>(handle).poll();
+        if let Some(dhcpv4::Event::Configured(cfg)) = event {
+            let a = cfg.address.address().octets();
+            let gw = cfg.router.map(|r| r.octets());
+            // Drop the socket before handing the address back.
+            sockets.remove(handle);
+            return Some((a, gw));
+        }
+        // No sleep primitive on the boot path — poll in a tight loop and
+        // let the deadline (advanced by the timer IRQ) bound it. The
+        // `poll_delay` hint tells us whether another pass is worth it.
+        let wait = iface.poll_delay(ts, &sockets);
+        if wait.is_none() {
+            crate::arch::timer::spin();
+        }
+    }
+    sockets.remove(handle);
+    None
+}
+
 /// Bring up driver + interface (static). Called by `smoke()` at boot;
 /// later users only need `poll_tick`/socket ops, which no-op until this
 /// has succeeded once.
@@ -319,26 +382,38 @@ fn init_iface() -> Result<(), &'static str> {
     let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress::from_bytes(&mac)));
     cfg.random_seed = 0x7469_6b61;
     let mut iface = Interface::new(cfg, &mut dev, Instant::from_millis(now_ms()));
+
+    // DHCP first; fall back to the static SLIRP address on timeout.
+    let leased = dhcp_acquire(&mut iface, &mut dev, DHCP_DEADLINE_MS);
+    let (ip, gw, note) = match leased {
+        Some((a, g)) => {
+            let gw = g.unwrap_or(GW);
+            (a, gw, "dhcp")
+        }
+        None => (IP, GW, "static"),
+    };
     iface.update_ip_addrs(|v| {
-        let _ = v.push(IpCidr::new(
-            IpAddress::Ipv4(Ipv4Address::new(IP[0], IP[1], IP[2], IP[3])),
-            24,
-        ));
+        let _ = v.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])), 24));
     });
     if iface
         .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(GW[0], GW[1], GW[2], GW[3]))
+        .add_default_ipv4_route(Ipv4Address::new(gw[0], gw[1], gw[2], gw[3]))
         .is_err()
     {
         return Err("route table full");
     }
     unsafe { *IFACE.0.get() = Some(iface) };
+    GW_ADDR.store(u32::from_le_bytes(gw), Ordering::Release);
     kprintln!(
-        "net: link up, {}.{}.{}.{}/24, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        IP[0],
-        IP[1],
-        IP[2],
-        IP[3],
+        "net: link up, {}.{}.{}.{}/24 gw {}.{}.{}.{} ({note}), mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+        gw[0],
+        gw[1],
+        gw[2],
+        gw[3],
         mac[0],
         mac[1],
         mac[2],
@@ -399,10 +474,8 @@ pub fn smoke() {
             kprintln!("net: icmp bind failed ({e:?})");
             return;
         }
-        if let Err(e) = sock.send_slice(
-            &req,
-            IpAddress::Ipv4(Ipv4Address::new(GW[0], GW[1], GW[2], GW[3])),
-        ) {
+        let g = gw_octets();
+        if let Err(e) = sock.send_slice(&req, IpAddress::Ipv4(Ipv4Address::new(g[0], g[1], g[2], g[3]))) {
             kprintln!("net: icmp queue failed ({e:?})");
             return;
         }
@@ -430,8 +503,13 @@ pub fn smoke() {
         if let Some(n) = got {
             if n >= 8 && rbuf[0] == 0 {
                 let rtt = (now_ms() - start_ms).max(0);
+                let g = gw_octets();
                 kprintln!(
-                    "net: icmp reply from 10.0.2.2, {} bytes, rtt ~{} ms",
+                    "net: icmp reply from {}.{}.{}.{}, {} bytes, rtt ~{} ms",
+                    g[0],
+                    g[1],
+                    g[2],
+                    g[3],
                     n - 8,
                     rtt
                 );
@@ -440,7 +518,14 @@ pub fn smoke() {
         }
 
         if now_ms() >= deadline {
-            kprintln!("net: icmp timeout (no reply from 10.0.2.2)");
+            let g = gw_octets();
+            kprintln!(
+                "net: icmp timeout (no reply from {}.{}.{}.{})",
+                g[0],
+                g[1],
+                g[2],
+                g[3]
+            );
             return;
         }
         core::hint::spin_loop();
