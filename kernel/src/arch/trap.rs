@@ -224,10 +224,10 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         }
         83 => {
             // SYS_compat_50_setitimer(which, new, old): ITIMER_REAL only.
-            // NetBSD aarch64 itimerval = {it_value.tv_sec u64, it_value.tv_usec u64,
-            // it_interval.tv_sec u64, it_interval.tv_usec u64} — same layout as
-            // the Linux arm reads; arm a per-process deadline, tick fires
-            // SIGALRM (canonical 14) via wake_itimers().
+            // NetBSD aarch64 struct itimerval = { it_interval, it_value },
+            // each a { time_t tv_sec; suseconds_t tv_usec } of 8 bytes
+            // (sys/sys/time.h) — identical to the Linux/musl layout:
+            // it_interval at +0, it_value at +16, 32 bytes total.
             let which = frame.x[0] as i32;
             let new = frame.x[1];
             let old = frame.x[2];
@@ -242,24 +242,30 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 (0, 0)
             } else if new == 0 {
                 // Null new = disarm.
-                crate::proc::proc_set_itimer(crate::proc::current_slot(), None);
+                crate::proc::proc_set_itimer(crate::proc::current_slot(), None, None);
                 (0, 0)
-            } else if !crate::proc::user_range_ok(new, 16) {
+            } else if !crate::proc::user_range_ok(new, 32) {
                 (-1, 14) // EFAULT
             } else {
-                // NetBSD aarch64 itimerval = {tv_sec u64, tv_usec u64, …}.
-                let sec = unsafe { (new as *const u64).read_unaligned() };
-                let usec =
-                    unsafe { (new as *const u64).add(1).read_unaligned() } as u64;
+                let rd = |off: usize| unsafe {
+                    (new as *const u64).add(off / 8).read_unaligned() as u64
+                };
+                let sec = rd(16);
+                let usec = rd(24);
+                let isec = rd(0);
+                let iusec = rd(8);
                 if sec == 0 && usec == 0 {
-                    crate::proc::proc_set_itimer(crate::proc::current_slot(), None);
+                    crate::proc::proc_set_itimer(crate::proc::current_slot(), None, None);
                 } else {
                     let ticks = crate::proc::arch_timer_hz();
+                    let to_ticks = |s: u64, us: u64| s * ticks + us * ticks / 1_000_000;
                     let deadline =
-                        crate::proc::arch_timer_now() + sec * ticks + usec * ticks / 1_000_000;
+                        crate::proc::arch_timer_now() + to_ticks(sec, usec);
+                    let iv = to_ticks(isec, iusec);
                     crate::proc::proc_set_itimer(
                         crate::proc::current_slot(),
                         Some(deadline),
+                        Some(iv),
                     );
                 }
                 (0, 0)

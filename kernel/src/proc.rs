@@ -95,6 +95,9 @@ pub struct Process {
     /// setitimer(ITIMER_REAL): absolute tick deadline, armed when the
     /// process's own timer fires SIGALRM. None = no timer set.
     pub itimer_at: Option<u64>,
+    /// setitimer(ITIMER_REAL) repeat period in ticks, from it_interval.
+    /// Some(0) = one-shot (interval zero); None = no timer set.
+    pub itimer_iv: Option<u64>,
 }
 
 struct ProcTable(UnsafeCell<Vec<Option<Process>>>);
@@ -192,6 +195,7 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         wake_at: None,
         tpidr: crate::user::TPIDR_VAL,
         itimer_at: None,
+        itimer_iv: None,
     }));
     CURRENT.store(0, Ordering::Relaxed);
     NEXT_PID.store(1, Ordering::Relaxed);
@@ -294,12 +298,15 @@ pub fn self_raise(sig: u8) {
 }
 
 /// Arm or clear the current process's ITIMER_REAL deadline. `None`
-/// disarms. Returns the previous deadline (for the setitimer out-param).
-pub fn proc_set_itimer(pid: usize, at: Option<u64>) -> Option<u64> {
+/// disarms. `iv` is the repeat period in ticks: `Some(0)` one-shots,
+/// `Some(n)` re-arms n ticks after each SIGALRM. Returns the previous
+/// deadline (for the setitimer out-param).
+pub fn proc_set_itimer(pid: usize, at: Option<u64>, iv: Option<u64>) -> Option<u64> {
     let t = table();
     let p = t.get_mut(pid).and_then(|slot| slot.as_mut()).expect("process exists");
     let prev = p.itimer_at;
     p.itimer_at = at;
+    p.itimer_iv = if at.is_some() { iv } else { None };
     prev
 }
 
@@ -391,8 +398,21 @@ pub fn wake_itimers() {
         if let Some(p) = o {
             if let Some(at) = p.itimer_at {
                 if now >= at {
-                    p.itimer_at = None;
+                    // Re-arm by the interval so periodic alarms keep
+                    // firing; a zero interval is a true one-shot.
+                    p.itimer_at = match p.itimer_iv {
+                        Some(iv) if iv > 0 => Some(at + iv),
+                        _ => None,
+                    };
                     p.pending |= 1u64 << 14; // SIGALRM (canonical 14)
+                    // A deliverable signal must resume a process blocked in
+                    // a syscall, or the handler never runs: a timer alarm
+                    // that lands on a sleeping process would otherwise sit in
+                    // `pending` until unrelated I/O happened to wake it.
+                    if p.state == State::Sleeping {
+                        p.state = State::Runnable;
+                        p.frame.elr = p.frame.elr.wrapping_sub(4);
+                    }
                 }
             }
         }
@@ -488,6 +508,7 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         // Child shares the parent's live TLS (COW pages keep it valid).
         tpidr: read_tpidr(),
         itimer_at: None, // ITIMER_REAL does not survive fork()
+        itimer_iv: None,
     });
     kprintln!("proc: fork pid {} (parent {})", pid, t[cur].as_ref().unwrap().pid);
     Ok(pid)

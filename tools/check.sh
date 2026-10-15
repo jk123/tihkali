@@ -309,7 +309,7 @@ python3 -m http.server 18081 --bind 127.0.0.1 --directory "$N3DIR" >/dev/null 2>
 HTTP=$!
 sleep 1
 ( sleep 4
-  printf 'busybox ping -c 1 10.0.2.2\n'; sleep 4
+  printf 'busybox ping -c 3 10.0.2.2\n'; sleep 6
   printf 'busybox wget -O - http://10.0.2.2:18081/n3.txt\n'; sleep 4
   printf 'nettest\n'; sleep 4
   printf 'exit\n'; sleep 1
@@ -318,6 +318,10 @@ kill "$HTTP" 2>/dev/null
 wait "$HTTP" 2>/dev/null
 rm -rf "$N3DIR"
 gate_has   "s14: ping reply"  "$S14" '64 bytes from 10.0.2.2'
+# A multi-packet ping only finishes if repeating SIGALRM reaches the
+# process; -c 1 passed even when every alarm after the first was lost.
+gate_count "s14: ping 3 replies" "$S14" '64 bytes from 10\.0\.2\.2' 3
+gate_has   "s14: ping summary" "$S14" '3 packets transmitted, 3 packets received'
 gate_has   "s14: wget body"   "$S14" 'tihkali-n3-ok'
 gate_has   "s14: nettest ok"  "$S14" 'nettest: ok'
 gate_count "s14: no ENOSYS"   "$S14" 'ENOSYS' 0

@@ -164,23 +164,38 @@ pub fn svc(frame: &mut TrapFrame) {
                 // not ITIMER_REAL: accept and ignore
                 (0, 0)
             } else {
-                // new = itimerval; it_value.tv_sec/u64 is at +0, .tv_usec
-                // at +8 (musl aarch64 itimerval layout).
+                // musl aarch64: struct itimerval = { it_interval, it_value },
+                // each a { time_t tv_sec; suseconds_t tv_usec } with
+                // time_t = long = 8 bytes. it_interval is at +0 and
+                // it_value at +16, so the pair spans 32 bytes.
                 let new = frame.x[1];
-                if new == 0 || !proc::user_range_ok(new, 16) {
+                if new == 0 || !proc::user_range_ok(new, 32) {
                     (0, 0)
                 } else {
-                    let sec = unsafe { (new as *const u32).read_unaligned() as u64 };
-                    let usec = unsafe { (new as *const u32).add(2).read_unaligned() as u64 };
+                    let rd = |off: usize| unsafe {
+                        (new as *const u64).add(off / 8).read_unaligned() as u64
+                    };
+                    let sec = rd(16);
+                    let usec = rd(24);
+                    let isec = rd(0);
+                    let iusec = rd(8);
+                    let ticks = proc::arch_timer_hz();
+                    let to_ticks = |s: u64, us: u64| s * ticks + us * ticks / 1_000_000;
                     if sec == 0 && usec == 0 {
                         // Disarm: clear the deadline, keep returning 0.
-                        proc::proc_set_itimer(proc::current_slot(), None);
+                        proc::proc_set_itimer(proc::current_slot(), None, None);
                     } else {
-                        let ticks = proc::arch_timer_hz();
-                        let deadline = proc::arch_timer_now()
-                            + sec * ticks
-                            + usec * ticks / 1_000_000;
-                        proc::proc_set_itimer(proc::current_slot(), Some(deadline));
+                        let deadline =
+                            proc::arch_timer_now() + to_ticks(sec, usec);
+                        // A zero interval is a one-shot alarm; anything else
+                        // repeats, which is what periodic tools like
+                        // busybox ping rely on to drive their send loop.
+                        let iv = to_ticks(isec, iusec);
+                        proc::proc_set_itimer(
+                            proc::current_slot(),
+                            Some(deadline),
+                            Some(iv),
+                        );
                     }
                     (0, 0)
                 }
