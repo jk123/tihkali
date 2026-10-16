@@ -1,0 +1,135 @@
+name: check
+
+on:
+  push:
+    branches: [master, side-b]
+  pull_request:
+  workflow_dispatch:
+
+# Two suites at once would fight over target/initramfs.img's QEMU write
+# lock and produce phantom failures, so never run two check.sh at once.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: acceptance suite (20 sessions)
+    runs-on: ubuntu-latest
+    # The suite is ~15 min: 20 sequential QEMU boots, each scripted over
+    # stdin with a multi-second first-input margin so the UART does not
+    # eat the opening byte.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl dpkg-dev python3 llvm-19
+          # run.sh calls llvm-objcopy-19 by that exact name to turn the
+          # Pi kernel ELF into kernel8.img.
+          command -v llvm-objcopy-19
+
+      - name: Cache toolchain
+        # .toolchain is ~1.5 GB (musl cross + vendored QEMU + Alpine
+        # busybox). Key on the fetch scripts so a change to any of them
+        # invalidates the cache instead of silently reusing stale bits.
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: .toolchain
+          key: toolchain-${{ hashFiles('tools/fetch-linux-toolchain.sh', 'tools/fetch-qemu.sh', 'tools/fetch-vgabios.sh', 'tools/fetch-alpine-busybox.sh') }}
+          restore-keys: toolchain-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-none
+
+      - name: Fetch musl cross toolchain
+        run: ./tools/fetch-linux-toolchain.sh
+
+      - name: Fetch QEMU
+        run: ./tools/fetch-qemu.sh
+
+      - name: Fetch vgabios option ROMs
+        # `ramfb` calls rom_add_vga("vgabios-ramfb.bin") at realize time,
+        # so QEMU aborts at startup without this ROM present.
+        run: ./tools/fetch-vgabios.sh
+
+      - name: Fetch Alpine busybox
+        run: ./tools/fetch-alpine-busybox.sh
+
+      - name: Build both boards (warning-free)
+        run: |
+          # A warm cache suppresses warnings entirely, so a cached
+          # "compiled clean" proves nothing. Build into a throwaway
+          # target dir to get real diagnostics, then check both boards.
+          cargo build --release --target-dir /tmp/warncheck 2>&1 | tee /tmp/warn-default.log
+          cargo build --release --no-default-features --features rpi3 \
+            --target-dir /tmp/warncheck-rpi 2>&1 | tee /tmp/warn-rpi.log
+          # A warning is a build failure in this project.
+          if grep -qE "^warning" /tmp/warn-default.log /tmp/warn-rpi.log; then
+            echo "::error::build emitted warnings"
+            grep -hE "^warning" /tmp/warn-default.log /tmp/warn-rpi.log | head -20
+            exit 1
+          fi
+
+      - name: Run acceptance suite
+        run: ./tools/check.sh
+
+      - name: Upload session logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-logs
+          path: /tmp/tihkali-check/
+          if-no-files-found: warn
+
+  build-rpi3:
+    name: rpi3 kernel (guest boot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl dpkg-dev python3 llvm-19
+
+      - uses: actions/cache@v4
+        with:
+          path: .toolchain
+          key: toolchain-${{ hashFiles('tools/fetch-linux-toolchain.sh', 'tools/fetch-qemu.sh', 'tools/fetch-alpine-busybox.sh') }}
+          restore-keys: toolchain-
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-none
+
+      - name: Fetch toolchains
+        run: |
+          ./tools/fetch-linux-toolchain.sh
+          ./tools/fetch-qemu.sh
+          ./tools/fetch-alpine-busybox.sh
+
+      - name: Boot the Pi 3 guest once
+        # --script takes printf escapes; piped stdin is ignored (the
+        # default script is just `exit`). run.sh --rpi rebuilds for the
+        # rpi3 board and llvm-objcopy-19's kernel8.img.
+        run: ./tools/boot-test.sh --script 'ls /bin\nexit\n' --rpi
