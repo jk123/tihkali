@@ -1,3 +1,4 @@
 /target
 /.toolchain
 /.mimocode
+/package-lock.json
