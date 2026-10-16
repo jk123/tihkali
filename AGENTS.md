@@ -114,10 +114,10 @@ cargo build --release --no-default-features --features rpi3   # Pi kernel only
   0x100000000; `kernel/assets/c/` = musl C tests linked there too (`-static
   -no-pie -Wl,-Ttext-segment=0x100000000`; PIE or 0x400000 links are
   rejected).
-- **`kernel/src/gui.rs` = the display stack (qemu-virt only).** The framebuffer
+- **`kernel/src/fb.rs` = the display stack (qemu-virt only).** The framebuffer
   is QEMU's `ramfb`: no MMIO, virtqueue, IRQ or PCI — the guest hands QEMU a
   pointer to its own contiguous RAM (`pmm::alloc_contiguous`) through **fw_cfg
-  DMA**, and QEMU maps it as the display surface.
+  DMA**, and QEMU maps it as the display surface. Kernel log lines are `fb:`.
   - **`-device ramfb` is mandatory** (run.sh adds it; `NO_GUI=1` omits it) and
     **needs `vgabios-ramfb.bin` in the `-L` datadir** — install it with
     `tools/fetch-vgabios.sh`, or QEMU aborts at startup. `-machine virt` has
@@ -134,7 +134,8 @@ cargo build --release --no-default-features --features rpi3   # Pi kernel only
     (Linux **480/481/482**). User space blits *through the kernel* because the
     user window is only 4 MiB (`user::USER_LIMIT`) and the framebuffer is
     contiguous physical memory the MMU already identity-maps.
-  - Client is `user/src/gui.rs` → `/bin/gui`; all drawing is user space.
+  - Client is `user/src/gui.rs` → `/bin/gui` (unchanged by the module
+    rename; only the kernel side is `fb`), all drawing is user space.
   - Verify pixels, not just logs: QMP `screendump` writes a **binary PPM
     (P6)** even if you name the file `.png`.
 - Top level is deliberately flat: 2 workspace crates (`kernel`, `user`) plus

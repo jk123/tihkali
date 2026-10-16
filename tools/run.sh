@@ -63,7 +63,7 @@ fi
 QEMU="$ROOT/.toolchain/qemu/usr/bin/qemu-system-aarch64"
 export LD_LIBRARY_PATH="$ROOT/.toolchain/qemu/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-# `ramfb` gives the guest a framebuffer in its own RAM (see kernel/src/gui.rs).
+# `ramfb` gives the guest a framebuffer in its own RAM (see kernel/src/fb.rs).
 # It needs vgabios-ramfb.bin in the -L datadir: tools/fetch-vgabios.sh.
 # --no-gui omits it; a guest with ramfb but no display can still run headless.
 GUI_ARGS=(-device ramfb)

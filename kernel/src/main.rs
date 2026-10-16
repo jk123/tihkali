@@ -17,7 +17,7 @@ mod cpio;
 mod file;
 mod fs;
 #[cfg(feature = "qemu-virt")]
-mod gui;
+mod fb;
 mod kmem;
 mod linux_abi;
 #[cfg(feature = "net")]
@@ -98,9 +98,9 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
     // back to the UART console rather than failing the boot. qemu-virt
     // only, like the module itself (the Pi has no framebuffer path).
     #[cfg(feature = "qemu-virt")]
-    match gui::init() {
-        Ok(()) => kprintln!("gui: display ready"),
-        Err(e) => kprintln!("gui: {e} (console only)"),
+    match fb::init() {
+        Ok(()) => kprintln!("fb: display ready"),
+        Err(e) => kprintln!("fb: {e} (console only)"),
     }
 
     let Some(sh) = fs::lookup("/bin/sh") else {

@@ -832,16 +832,16 @@ pub fn svc(frame: &mut TrapFrame) {
         }
         #[cfg(feature = "qemu-virt")]
         480 => {
-            // tihkali: gui_fb_info(out) -> {width, height, stride, pa}
-            match crate::gui::sys_fb_info(frame.x[0]) {
+            // tihkali: fb_fb_info(out) -> {width, height, stride, pa}
+            match crate::fb::sys_fb_info(frame.x[0]) {
                 Ok(()) => (0, 0),
                 Err(e) => (0, linux_errno(e)),
             }
         }
         #[cfg(feature = "qemu-virt")]
         481 => {
-            // tihkali: gui_fill_rect(x, y, w, h, rgb)
-            match crate::gui::sys_fill_rect(
+            // tihkali: fb_fill_rect(x, y, w, h, rgb)
+            match crate::fb::sys_fill_rect(
                 frame.x[0] as u32,
                 frame.x[1] as u32,
                 frame.x[2] as u32,
@@ -854,8 +854,8 @@ pub fn svc(frame: &mut TrapFrame) {
         }
         #[cfg(feature = "qemu-virt")]
         482 => {
-            // tihkali: gui_blit(src, x, y, w, h, src_stride)
-            match crate::gui::sys_blit(
+            // tihkali: fb_blit(src, x, y, w, h, src_stride)
+            match crate::fb::sys_blit(
                 frame.x[0],
                 frame.x[1] as u32,
                 frame.x[2] as u32,

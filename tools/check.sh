@@ -483,10 +483,10 @@ S20="$T/s20.log"
   printf 'gui\n'; sleep 14
   printf 'exit\n'; sleep 3
 ) | timeout 52 ./tools/run.sh >"$S20" 2>&1
-gate_has   "s20: ramfb entry found"  "$S20" 'gui: fw_cfg etc/ramfb at selector 0x[0-9a-f]+'
-gate_has   "s20: framebuffer mapped" "$S20" 'gui: framebuffer 640x480 xrgb8888 at 0x[0-9a-f]+'
-gate_has   "s20: pixels written"     "$S20" 'gui: paint \+ readback ok'
-gate_has   "s20: display ready"      "$S20" 'gui: display ready'
+gate_has   "s20: ramfb entry found"  "$S20" 'fb: fw_cfg etc/ramfb at selector 0x[0-9a-f]+'
+gate_has   "s20: framebuffer mapped" "$S20" 'fb: framebuffer 640x480 xrgb8888 at 0x[0-9a-f]+'
+gate_has   "s20: pixels written"     "$S20" 'fb: paint \+ readback ok'
+gate_has   "s20: display ready"      "$S20" 'fb: display ready'
 gate_has   "s20: wm geometry"        "$S20" 'gui: wm up fb=640x480'
 gate_has   "s20: wm demo ok"         "$S20" 'gui: demo ok frames=120'
 gate_has   "s20: wm exit 0"          "$S20" 'sh: gui exited 0'

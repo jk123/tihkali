@@ -241,14 +241,14 @@ pub fn init() -> Result<(), &'static str> {
     }
 
     let sel = find_ramfb_selector().ok_or("fw_cfg has no etc/ramfb entry")?;
-    kprintln!("gui: fw_cfg etc/ramfb at selector {sel:#x}");
+    kprintln!("fb: fw_cfg etc/ramfb at selector {sel:#x}");
 
     let pa = pmm::alloc_contiguous(FB_BYTES / 4096).ok_or("out of frames for framebuffer")?;
     unsafe {
         core::ptr::write_bytes(pa as *mut u8, 0, FB_BYTES);
         FB_PA = pa;
     }
-    kprintln!("gui: {FB_BYTES} bytes at {pa:#x} for {FB_WIDTH}x{FB_HEIGHT}x{FB_BPP}");
+    kprintln!("fb: {FB_BYTES} bytes at {pa:#x} for {FB_WIDTH}x{FB_HEIGHT}x{FB_BPP}");
 
     // Describe the buffer to QEMU. `addr` is a *physical* address; the
     // mapping is coherent, so no flush is required before handing it over.
@@ -263,7 +263,7 @@ pub fn init() -> Result<(), &'static str> {
     if !dma_xfer(sel, &cfg as *const RamfbCfg as *mut u8, RAMFB_CFG_LEN, true) {
         return Err("fw_cfg rejected the ramfb configuration");
     }
-    kprintln!("gui: framebuffer {FB_WIDTH}x{FB_HEIGHT} xrgb8888 at {pa:#x}");
+    kprintln!("fb: framebuffer {FB_WIDTH}x{FB_HEIGHT} xrgb8888 at {pa:#x}");
     test();
     Ok(())
 }
@@ -282,9 +282,9 @@ pub fn test() {
 
     let got = unsafe { read_volatile(px_at(7 * FB_STRIDE as usize + 7 * 4)) };
     let corner = unsafe { read_volatile(px_at(0)) };
-    assert_eq!(got, 0x00ff00ff, "gui: framebuffer pixel readback mismatch");
-    assert_eq!(corner, 0x00c0ff00, "gui: framebuffer corner mismatch");
-    kprintln!("gui: paint + readback ok ({FB_WIDTH}x{FB_HEIGHT} xrgb8888)");
+    assert_eq!(got, 0x00ff00ff, "fb: framebuffer pixel readback mismatch");
+    assert_eq!(corner, 0x00c0ff00, "fb: framebuffer corner mismatch");
+    kprintln!("fb: paint + readback ok ({FB_WIDTH}x{FB_HEIGHT} xrgb8888)");
 }
 
 /// Physical address of the framebuffer, 0 when `init` has not run.
