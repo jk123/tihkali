@@ -864,6 +864,13 @@ const POLLNVAL: u16 = 0x020;
 
 /// Readiness of one fd for the events requested in `events`.
 fn poll_revents(fd: i32, events: u16) -> u16 {
+    // Service the NIC before reading socket state: a datagram that landed
+    // since the last poll_tick is only in the rx queue, not yet in the
+    // socket buffer, so sock_poll would report "not ready" and the caller
+    // would sleep through the arrival. Without this, poll(2) on a UDP
+    // socket (musl's DNS resolver) never observes the reply.
+    #[cfg(feature = "net")]
+    crate::net::poll_tick();
     if fd < 0 {
         return 0; // negative fds are ignored per POSIX
     }

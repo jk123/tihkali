@@ -961,6 +961,12 @@ fn icmp_sock<'a>(
     set.get_mut::<IcmpSocket>(h)
 }
 
+/// Ephemeral local port for a socket that bound to 0. Per-slot so a
+/// socket keeps the same source port across bind and sendto.
+fn ephemeral_port(slot: usize) -> u16 {
+    EPHEMERAL_PORT + slot as u16
+}
+
 /// bind(2): UDP binds for real; TCP records the local port for connect.
 pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
     let meta = meta();
@@ -977,11 +983,32 @@ pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
             if s.is_open() {
                 return Err(EINVAL);
             }
-            s.bind((
+            // bind(0.0.0.0:0) means "pick an ephemeral port"; smoltcp
+            // rejects port 0 outright, so choose one here. musl's resolver
+            // (busybox ping/wget) always binds this way before sending a
+            // query, and abandoning the bind makes it report a lookup
+            // failure instead of querying.
+            let port: u16 = match port {
+                0 => {
+                    let p = ephemeral_port(slot);
+                    if s.bind((IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), p)).is_err() {
+                        return Err(EINVAL);
+                    }
+                    meta[slot].lport = p;
+                    return Ok(());
+                }
+                p => p,
+            };
+            if s.bind((
                 IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
                 port,
             ))
-            .map_err(|_| EINVAL)
+            .is_err()
+            {
+                return Err(EINVAL);
+            }
+            meta[slot].lport = port;
+            Ok(())
         }),
         SockKind::Icmp => {
             // `port` carries the echo identifier; 0 = stay unbound (the
@@ -1265,7 +1292,7 @@ pub fn sock_send_to(slot: usize, data: &[u8], ip: [u8; 4], port: u16) -> Result<
                 let p = if meta[slot].lport != 0 {
                     meta[slot].lport
                 } else {
-                    40_000 + slot as u16
+                    ephemeral_port(slot)
                 };
                 if s.bind((
                     IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
@@ -1280,11 +1307,20 @@ pub fn sock_send_to(slot: usize, data: &[u8], ip: [u8; 4], port: u16) -> Result<
                 IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
                 port,
             );
-            match s.send_slice(data, ep) {
+            let res = match s.send_slice(data, ep) {
                 Ok(()) => Ok(data.len()),
                 Err(udp::SendError::BufferFull) => Err(EAGAIN_L),
                 Err(udp::SendError::Unaddressable) => Err(EINVAL),
+            };
+            // Transmit the queued datagram now. Without this the query sits
+            // in the smoltcp tx ring until some later svc-tail/idle
+            // poll_tick, so a process that sends and then blocks in
+            // poll(2) waits for a reply to a packet never put on the wire
+            // (musl's DNS resolver does exactly this).
+            if res.is_ok() {
+                service_iface();
             }
+            res
         }),
     }
 }
