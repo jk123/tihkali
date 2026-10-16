@@ -60,6 +60,14 @@ jobs:
           targets: aarch64-unknown-none
 
       - name: Fetch musl cross toolchain
+        # KNOWN BLOCKER on stock runners: musl.cc is unreachable from
+        # GitHub's network, and Ubuntu ships no aarch64 musl to replace
+        # it (musl-tools is amd64/i386/arm64 only; musl-dev is
+        # host-arch). kernel/assets/c needs a static musl libc, so the
+        # suite cannot build here until .toolchain is seeded into the
+        # Actions cache from a machine that can reach musl.cc. This step
+        # fails fast with that explanation rather than after ~9 minutes
+        # of connect timeouts.
         run: ./tools/fetch-linux-toolchain.sh
 
       - name: Fetch QEMU

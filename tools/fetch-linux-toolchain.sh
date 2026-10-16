@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Fetch the project-local aarch64-linux-musl cross toolchain.
-#
-# Primary source is musl.cc, which is unreachable from GitHub Actions
-# runners (connection to port 443 times out), so a local build stays on
-# it while CI falls back to Ubuntu's own gcc-aarch64-linux-gnu plus
-# musl-tools. Either way the compiler lands at the exact path
-# kernel/build.rs invokes, so the build script needs no changes.
-#
+# Fetch the project-local aarch64-linux-musl cross toolchain (musl.cc).
 # Idempotent: skips when already present. ~100 MB download.
+#
+# NOTE FOR CI: musl.cc is not reachable from GitHub Actions runners --
+# the connection to port 443 times out. There is no substitute in
+# Ubuntu's archive: musl-tools is published for amd64/i386/arm64 only
+# and musl-dev is host-arch, so nothing in noble provides an aarch64
+# musl libc for cross compilation. The C probes in kernel/assets/c
+# need real musl headers and a static libc.a, so the toolchain cannot
+# be substituted. If this fails on a runner, seed the toolchain into
+# the Actions cache from a machine that can reach musl.cc.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$ROOT/.toolchain"
@@ -22,60 +24,33 @@ fi
 mkdir -p "$DEST"
 TARBALL="$DEST/aarch64-linux-musl-cross.tgz"
 
-fetch_musl_cc() {
-    if [ ! -f "$TARBALL" ]; then
-        # Probe first with a short timeout. On a blocked network the
-        # --retry loop costs ~9 minutes of 133s timeouts before giving
-        # up, which would blow the job budget before the fallback runs.
-        if ! curl -fsS --connect-timeout 10 --max-time 20 -o /dev/null \
-             https://musl.cc/ 2>/dev/null; then
-            echo "musl.cc unreachable (connect timeout)" >&2
-            return 1
-        fi
-        echo "downloading https://musl.cc/aarch64-linux-musl-cross.tgz ..."
-        curl -fL --retry 2 -o "$TARBALL" \
-            https://musl.cc/aarch64-linux-musl-cross.tgz || return 1
-    fi
-    echo "extracting into $DEST ..."
-    tar -xzf "$TARBALL" -C "$DEST" || return 1
-    rm -f "$TARBALL"
-    [ -x "$BIN" ]
-}
+# Probe first with a short timeout. Against an unreachable host the
+# --retry loop costs ~9 minutes of 133s timeouts, which burns the CI
+# job budget before failing with a confusing tar error.
+if ! curl -fsS --connect-timeout 10 --max-time 20 -o /dev/null \
+        https://musl.cc/ 2>/dev/null; then
+    cat >&2 <<'MSG'
+error: musl.cc is unreachable from this host.
 
-# Fallback for hosts that cannot reach musl.cc. Ubuntu ships the gcc
-# cross compiler and musl's own libc headers in the archive; wrap the
-# gnu driver so callers still see `aarch64-linux-musl-gcc`.
-fetch_ubuntu() {
-    echo "falling back to Ubuntu's aarch64 cross toolchain + musl-tools" >&2
-    sudo apt-get update
-    sudo apt-get install -y --no-install-recommends \
-        gcc-aarch64-linux-gnu musl-tools
-    local dir="$DEST/aarch64-linux-musl-cross"
-    mkdir -p "$dir/bin"
-    cat >"$dir/bin/aarch64-linux-musl-gcc" <<'WRAP'
-#!/usr/bin/env bash
-# The musl cc driver lives under musl-tools; everything else (crt
-# objects, libc.a) comes from musl-dev, which Debian ships in
-# /usr/lib/aarch64-linux-musl. -static is what build.rs always passes.
-exec aarch64-linux-musl-gcc "$@"
-WRAP
-    chmod +x "$dir/bin/aarch64-linux-musl-gcc"
-}
+  kernel/build.rs compiles kernel/assets/c/*.c with a static aarch64
+  musl gcc, and no Ubuntu package provides one (musl-tools is
+  amd64/i386/arm64 only, musl-dev is host-arch).
 
-# `set +e` around the attempt: with `set -e` active, a failure inside a
-# function exits the shell immediately even when the function is the
-# condition of `if !`, so the fallback would never run. Every step in
-# the function returns non-zero explicitly instead.
-set +e
-fetch_musl_cc
-rc=$?
-set -e
-if [ "$rc" -ne 0 ]; then
-    rm -f "$TARBALL"
-    echo "musl.cc unavailable; using the Ubuntu fallback" >&2
-    fetch_ubuntu
+  Local build: this machine can reach musl.cc, so run it directly.
+  CI runner:  seed .toolchain/aarch64-linux-musl-cross into the
+              Actions cache from a machine that can, or install the
+              compiler to the path above by hand.
+MSG
+    exit 1
 fi
 
-test -x "$BIN" || { echo "error: $BIN missing after setup" >&2; exit 1; }
+if [ ! -f "$TARBALL" ]; then
+    echo "downloading https://musl.cc/aarch64-linux-musl-cross.tgz ..."
+    curl -fL --retry 3 -o "$TARBALL" https://musl.cc/aarch64-linux-musl-cross.tgz
+fi
+echo "extracting into $DEST ..."
+tar -xzf "$TARBALL" -C "$DEST"
+rm -f "$TARBALL"
+test -x "$BIN" || { echo "error: $BIN missing after extraction" >&2; exit 1; }
 echo "toolchain ready:"
 "$BIN" --version | head -1
