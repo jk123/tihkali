@@ -1125,13 +1125,11 @@ fn linux_errno(e: u8) -> u8 {
 // ---------- socket helpers ----------
 
 /// Current process's fd → net pool slot (None if not a socket fd).
+///
+/// Lives in `net` so the NetBSD personality can use it without depending on
+/// this module; see `net::sock_slot`.
 #[cfg(feature = "net")]
-pub fn sock_slot(fd: usize) -> Option<usize> {
-    match proc::current_target(fd) {
-        Some(FdTarget::Socket(s)) => Some(s),
-        _ => None,
-    }
-}
+pub use crate::net::sock_slot;
 
 /// Linux `SOL_SOCKET` (asm-generic/socket.h).
 #[cfg(feature = "net")]
@@ -1157,29 +1155,8 @@ fn linux_opt(name: i32) -> Option<i32> {
     })
 }
 
-/// NetBSD `SOL_SOCKET` is 0xffff — NOT the Linux 1. (sys/socket.h)
-#[cfg(feature = "net")]
-pub const SOL_SOCKET_N: i32 = 0xffff;
-
-/// Map a NetBSD `SO_*` name onto the ABI-neutral `net::OPT_*` value.
-/// NetBSD numbers the boolean flags as low `so_options` bits (SO_REUSEADDR
-/// 0x0004, SO_BROADCAST 0x0020, SO_KEEPALIVE 0x0008) and the extra options
-/// high (SO_SNDBUF 0x1001, SO_RCVBUF 0x1002, SO_ERROR 0x1007, SO_TYPE 0x1008).
-#[cfg(feature = "net")]
-pub fn netbsd_opt(name: i32) -> Option<i32> {
-    use crate::net::{OPT_SO_BROADCAST, OPT_SO_ERROR, OPT_SO_KEEPALIVE, OPT_SO_RCVBUF,
-                     OPT_SO_REUSEADDR, OPT_SO_SNDBUF, OPT_SO_TYPE};
-    Some(match name {
-        0x1008 => OPT_SO_TYPE,      // SO_TYPE
-        0x1007 => OPT_SO_ERROR,     // SO_ERROR
-        0x0004 => OPT_SO_REUSEADDR, // SO_REUSEADDR
-        0x0020 => OPT_SO_BROADCAST, // SO_BROADCAST
-        0x1001 => OPT_SO_SNDBUF,    // SO_SNDBUF
-        0x1002 => OPT_SO_RCVBUF,    // SO_RCVBUF
-        0x0008 => OPT_SO_KEEPALIVE, // SO_KEEPALIVE
-        _ => return None,
-    })
-}
+// NetBSD's SOL_SOCKET and its SO_* optname map live in `net`, not here:
+// the NetBSD dispatch uses them and must not depend on this module.
 
 /// Linux `struct sockaddr_in` (16 bytes): family u16 LE, port u16 BE,
 /// IPv4 u32 BE, 8 bytes padding. Returns ([u8; 4], port).

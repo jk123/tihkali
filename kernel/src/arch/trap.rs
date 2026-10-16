@@ -1,6 +1,7 @@
 //! Trap frame, exception dispatch, syscall handling, and register dumps.
 
 use crate::hal::gic;
+use crate::netbsd_abi::nr as nbsys;
 use crate::{kprint, kprintln};
 
 use crate::arch::timer;
@@ -134,18 +135,18 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         return;
     }
     let nr = imm;
-    let (result, err): (i64, u8) = match nr {
-        1 => {
+    let (result, err): (i64, u8) = match imm as u16 {
+        nbsys::EXIT => {
             // SYS_exit(code)
             crate::proc::sys_exit(frame, frame.x[0]);
             return;
         }
-        2 => match crate::proc::sys_fork(frame) {
+        nbsys::FORK => match crate::proc::sys_fork(frame) {
             // SYS_fork: parent gets the child pid, child (later) gets 0
             Ok(pid) => (pid as i64, 0),
             Err(crate::proc::ForkError::NoMem) => (-1, crate::proc::ENOMEM),
         },
-        3 => {
+        nbsys::READ => {
             // SYS_read(fd, buf, len): tty-in sleeps, files read through.
             match crate::proc::sys_read(frame, frame.x[0] as usize, frame.x[1], frame.x[2] as usize)
             {
@@ -154,11 +155,11 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 crate::proc::Io::Slept => return,
             }
         }
-        4 => match crate::proc::sys_write(frame.x[0] as usize, frame.x[1], frame.x[2] as usize) {
+        nbsys::WRITE => match crate::proc::sys_write(frame.x[0] as usize, frame.x[1], frame.x[2] as usize) {
             Ok(n) => (n, 0),
             Err(e) => (-1, e),
         },
-        5 => {
+        nbsys::OPEN => {
             // SYS_open(path, flags): O_RDONLY only (read-only initramfs).
             match crate::proc::read_user_cstr(frame.x[0], 128) {
                 None => (-1, 14), // EFAULT
@@ -168,19 +169,19 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 },
             }
         }
-        6 => match crate::proc::sys_close(frame.x[0] as usize) {
+        nbsys::CLOSE => match crate::proc::sys_close(frame.x[0] as usize) {
             Ok(()) => (0, 0),
             Err(e) => (-1, e),
         },
-        20 => (crate::proc::current_pid() as i64, 0), // SYS_getpid
-        59 => {
+        nbsys::GETPID_WITH_PPID => (crate::proc::current_pid() as i64, 0), // SYS_getpid
+        nbsys::EXECVE => {
             // SYS_execve(path, argv)
             match crate::proc::sys_execve(frame, frame.x[0], frame.x[1]) {
                 Ok(()) => return, // frame rebuilt: enter the new image
                 Err(e) => (-1, e),
             }
         }
-        10 => {
+        nbsys::UNLINK => {
             // SYS_unlink(path)
             match crate::proc::read_user_cstr(frame.x[0], 128) {
                 None => (-1, 14), // EFAULT
@@ -190,12 +191,12 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 },
             }
         }
-        36 => match crate::proc::sys_sync() {
+        nbsys::SYNC => match crate::proc::sys_sync() {
             // SYS_sync: write-back dirty nodes
             Ok(()) => (0, 0),
             Err(e) => (-1, e),
         },
-        136 => {
+        nbsys::MKDIR => {
             // SYS_mkdir(path, mode)
             match crate::proc::read_user_cstr(frame.x[0], 128) {
                 None => (-1, 14), // EFAULT
@@ -205,7 +206,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 },
             }
         }
-        137 => {
+        nbsys::RMDIR => {
             // SYS_rmdir(path)
             match crate::proc::read_user_cstr(frame.x[0], 128) {
                 None => (-1, 14), // EFAULT
@@ -215,14 +216,14 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 },
             }
         }
-        37 => {
+        nbsys::KILL => {
             // SYS_kill(pid, sig)
             match crate::proc::sys_kill(frame.x[0] as i64, frame.x[1]) {
                 Ok(()) => (0, 0),
                 Err(e) => (-1, e),
             }
         }
-        83 => {
+        nbsys::SETITIMER => {
             // SYS_compat_50_setitimer(which, new, old): ITIMER_REAL only.
             // NetBSD aarch64 struct itimerval = { it_interval, it_value },
             // each a { time_t tv_sec; suseconds_t tv_usec } of 8 bytes
@@ -271,19 +272,19 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 (0, 0)
             }
         }
-        103 | 295 => {
+        nbsys::SIGRETURN | nbsys::SIGRETURN__2 => {
             // SYS_sigreturn / __sigreturn14: frame fully rebuilt.
             crate::proc::sys_sigreturn(frame);
             return;
         }
-        340 => {
+        nbsys::__SIGACTION_SIGTRAMP => {
             // SYS___sigaction_sigtramp(sig, act, oact, sigtramp, sz)
             match crate::proc::sys_sigaction(frame.x[0], frame.x[1], frame.x[2]) {
                 Ok(old) => (old as i64, 0),
                 Err(e) => (-1, e),
             }
         }
-        390 => {
+        nbsys::GETDENTS__2 => {
             // SYS___getdents30(fd, buf, len)
             match crate::proc::sys_getdents(frame.x[0] as usize, frame.x[1], frame.x[2] as usize)
             {
@@ -291,14 +292,14 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 Err(e) => (-1, e),
             }
         }
-        293 => {
+        nbsys::SIGPROCMASK__2 => {
             // SYS___sigprocmask14(how, set, oset)
             match crate::proc::sys_sigprocmask(frame.x[0] as i64, frame.x[1], frame.x[2]) {
                 Ok(()) => (0, 0),
                 Err(e) => (-1, e),
             }
         }
-        449 => {
+        nbsys::WAIT4__2 => {
             // SYS___wait450(pid, status, options, rusage)
             match crate::proc::sys_wait4(frame, frame.x[0] as i64, frame.x[1], frame.x[2]) {
                 crate::proc::Wait4::Done(pid) => (pid, 0),
@@ -307,7 +308,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "qemu-virt")]
-        481 => {
+        crate::netbsd_abi::fb::INFO => {
             // tihkali: fb_fb_info(out) -> {width, height, stride, pa}
             match crate::fb::sys_fb_info(frame.x[0]) {
                 Ok(()) => (0, 0),
@@ -315,7 +316,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "qemu-virt")]
-        482 => {
+        crate::netbsd_abi::fb::FILL_RECT => {
             // tihkali: fb_fill_rect(x, y, w, h, rgb)
             match crate::fb::sys_fill_rect(
                 frame.x[0] as u32,
@@ -329,7 +330,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "qemu-virt")]
-        483 => {
+        crate::netbsd_abi::fb::BLIT => {
             // tihkali: fb_blit(src, x, y, w, h, src_stride)
             match crate::fb::sys_blit(
                 frame.x[0],
@@ -366,10 +367,10 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        98 => {
+        nbsys::CONNECT => {
             // SYS_connect(fd, sockaddr, addrlen): blocking on TCP — each
             // wake re-enters the state machine (same contract as Linux 203).
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (-1, crate::file::EBADF),
                 Some(slot) => {
                     match crate::net::parse_netbsd_sockaddr_in(frame.x[1], frame.x[2]) {
@@ -397,9 +398,9 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        106 => {
+        nbsys::LISTEN => {
             // SYS_listen(fd, backlog)
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (-1, crate::file::EBADF),
                 Some(slot) => match crate::net::sock_listen(slot, frame.x[1] as i32) {
                     Ok(()) => (0, 0),
@@ -408,9 +409,9 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        30 => {
+        nbsys::ACCEPT => {
             // SYS_accept(fd, laddr, laddrp): blocking, mirrors Linux 202.
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (-1, crate::file::EBADF),
                 Some(slot) => {
                     crate::net::poll_tick();
@@ -455,9 +456,9 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        134 => {
+        nbsys::SHUTDOWN => {
             // SYS_shutdown(fd, how)
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (-1, crate::file::EBADF),
                 Some(slot) => match crate::net::sock_shutdown(slot, frame.x[1] as i32) {
                     Ok(()) => (0, 0),
@@ -466,12 +467,12 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        28 => {
+        nbsys::SENDMSG => {
             // SYS_sendmsg(fd, msg, flags): scatter into one send.
             // `frame.x[1]` is the msghdr: msg_iov at byte 16,
             // msg_iovlen (u32) at byte 28 on NetBSD aarch64 — the pad after
             // msg_iov makes it differ from Linux's byte 24. Do NOT share.
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (-1, crate::file::EBADF),
                 Some(slot) => {
                     let msg = frame.x[1];
@@ -490,10 +491,10 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        27 => {
+        nbsys::RECVMSG => {
             // SYS_recvmsg(fd, msg, flags): one coalesced recv.
             // Same msghdr offsets as arm 28 (msg_iov @16, msg_iovlen @28).
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (-1, crate::file::EBADF),
                 Some(slot) => {
                     let msg = frame.x[1];
@@ -527,9 +528,9 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        104 => {
+        nbsys::BIND => {
             // SYS_bind(fd, sockaddr, addrlen)
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (-1, crate::file::EBADF),
                 Some(slot) => match crate::net::parse_netbsd_sockaddr_in(frame.x[1], frame.x[2]) {
                     Err(e) => (-1, e),
@@ -541,15 +542,15 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        105 => {
+        nbsys::SETSOCKOPT => {
             // SYS_setsockopt(fd, level, name, value, len)
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (0, crate::file::EBADF),
                 Some(slot) => {
-                    if frame.x[1] as i32 != crate::linux_abi::SOL_SOCKET_N {
+                    if frame.x[1] as i32 != crate::net::SOL_SOCKET_N {
                         (0, 0) // unknown level: lenient
                     } else {
-                        match crate::linux_abi::netbsd_opt(frame.x[2] as i32) {
+                        match crate::net::netbsd_opt(frame.x[2] as i32) {
                             None => (0, 0),
                             Some(opt) => {
                                 match crate::net::sock_setopt(
@@ -568,15 +569,15 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        118 => {
+        nbsys::GETSOCKOPT => {
             // SYS_getsockopt(fd, level, name, value, len*)
-            match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+            match crate::net::sock_slot(frame.x[0] as usize) {
                 None => (0, crate::file::EBADF),
                 Some(slot) => {
-                    if frame.x[1] as i32 != crate::linux_abi::SOL_SOCKET_N {
+                    if frame.x[1] as i32 != crate::net::SOL_SOCKET_N {
                         (0, 0)
                     } else {
-                        match crate::linux_abi::netbsd_opt(frame.x[2] as i32) {
+                        match crate::net::netbsd_opt(frame.x[2] as i32) {
                             None => {
                                 let optlen_ptr = frame.x[4];
                                 if optlen_ptr != 0 && crate::proc::user_range_ok(optlen_ptr, 4) {
@@ -603,7 +604,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        133 => {
+        nbsys::SENDTO => {
             // SYS_sendto(fd, buf, len, flags, to, tolen)
             let len = frame.x[2] as usize;
             if len == 0 {
@@ -611,7 +612,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             } else if !crate::proc::user_range_ok(frame.x[1], len) {
                 (-1, 14) // EFAULT
             } else {
-                match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                match crate::net::sock_slot(frame.x[0] as usize) {
                     None => (-1, crate::file::EBADF),
                     Some(slot) => {
                         let bytes = unsafe {
@@ -647,7 +648,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        29 => {
+        nbsys::RECVFROM => {
             // SYS_recvfrom(fd, buf, len, flags, from, fromlen): blocking.
             let len = frame.x[2] as usize;
             if len == 0 {
@@ -655,7 +656,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             } else if !crate::proc::user_range_ok(frame.x[1], len) {
                 (-1, 14) // EFAULT
             } else {
-                match crate::linux_abi::sock_slot(frame.x[0] as usize) {
+                match crate::net::sock_slot(frame.x[0] as usize) {
                     None => (-1, crate::file::EBADF),
                     Some(slot) => {
                         if crate::proc::has_deliverable() {

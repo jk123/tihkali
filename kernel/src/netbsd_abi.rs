@@ -11,3 +11,14 @@
 #![allow(dead_code)]
 
 include!(concat!(env!("OUT_DIR"), "/netbsd_syscall_table.rs"));
+
+/// tihkali's private display door, in the NetBSD ABI's number space.
+///
+/// These are NOT NetBSD syscalls — they collide with nothing NetBSD
+/// defines on aarch64 and are unreachable from a real NetBSD libc, so
+/// userland sees them as unknown.
+pub mod fb {
+    pub const INFO: u16 = 481;
+    pub const FILL_RECT: u16 = 482;
+    pub const BLIT: u16 = 483;
+}

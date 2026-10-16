@@ -987,6 +987,38 @@ fn icmp_sock<'a>(
     set.get_mut::<IcmpSocket>(h)
 }
 
+pub fn sock_slot(fd: usize) -> Option<usize> {
+    match crate::proc::current_target(fd) {
+        Some(crate::file::FdTarget::Socket(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Map a NetBSD `SO_*` optname onto the ABI-neutral `OPT_SO_*` value.
+/// Lives here, not in `linux_abi`, because both personalities use it: the
+/// NetBSD dispatch must not reach into the Linux module for its own ABI.
+///
+/// NetBSD numbers the boolean flags as low `so_options` bits (SO_REUSEADDR
+/// 0x0004, SO_BROADCAST 0x0020, SO_KEEPALIVE 0x0008) and the extra options
+/// high (SO_SNDBUF 0x1001, SO_RCVBUF 0x1002, SO_ERROR 0x1007, SO_TYPE
+/// 0x1008). These differ from the Linux numbers, so the two mappings must
+/// stay separate — see `linux_abi::linux_opt`.
+pub fn netbsd_opt(name: i32) -> Option<i32> {
+    Some(match name {
+        0x1008 => OPT_SO_TYPE,      // SO_TYPE
+        0x1007 => OPT_SO_ERROR,     // SO_ERROR
+        0x0004 => OPT_SO_REUSEADDR, // SO_REUSEADDR
+        0x0020 => OPT_SO_BROADCAST, // SO_BROADCAST
+        0x1001 => OPT_SO_SNDBUF,    // SO_SNDBUF
+        0x1002 => OPT_SO_RCVBUF,    // SO_RCVBUF
+        0x0008 => OPT_SO_KEEPALIVE, // SO_KEEPALIVE
+        _ => return None,
+    })
+}
+
+/// NetBSD `SOL_SOCKET` is 0xffff — NOT the Linux 1. (sys/socket.h)
+pub const SOL_SOCKET_N: i32 = 0xffff;
+
 /// Ephemeral local port for a socket that bound to 0. Per-slot so a
 /// socket keeps the same source port across bind and sendto.
 fn ephemeral_port(slot: usize) -> u16 {
