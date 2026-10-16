@@ -170,9 +170,50 @@ cargo build --release --no-default-features --features rpi3   # Pi kernel only
   the timeout path (hence the `settled` flag).
 - `ManagedSlice` comes from the `managed` crate directly; smoltcp does not
   re-export it.
-- The guest's libc resolver is NOT wired to this: busybox is statically
-  linked and its musl resolver is unreachable from here. `wget http://name`
-  will still fail until userland calls door 240 instead.
+- **busybox/musl's resolver works** (`ping example.com`, `wget
+  http://example.com` — full name -> A record -> TCP -> body). It is a
+  completely separate path from `net::resolve` and needed six kernel fixes
+  to function; all are listed below.
+  - musl **binds `0.0.0.0:0`** before querying. smoltcp rejects port 0, so
+    `sock_bind` must treat 0 as "pick an ephemeral port"
+    (`EPHEMERAL_PORT + slot`), or bind fails EINVAL and musl reports a
+    lookup failure without ever querying.
+  - The ephemeral bind must use **`local_ip()`**, not `UNSPECIFIED`.
+    smoltcp takes the packet's source IP from the bound address, so
+    `UNSPECIFIED` puts `0.0.0.0` on the wire, SLIRP replies to `0.0.0.0`,
+    and the reply is silently dropped.
+  - UDP `sendto` must call **`service_iface()`** after queueing, like
+    `sock_send` does for TCP. Without it the query sits in the smoltcp tx
+    ring until an unrelated idle `poll_tick`, so a process that sends then
+    blocks in `poll(2)` waits on a packet that never left.
+  - `poll(2)` must **`poll_tick()` once before sampling fds** — a datagram
+    that landed since the last tick is in the rx queue, not the socket
+    buffer, so `sock_poll` reports "not ready" and the caller sleeps
+    through the arrival. Do it once per ppoll, not per fd: `poll_tick`
+    wakes sleepers, and per-fd would wake the caller mid-iteration.
+  - musl opens its socket **`SOCK_NONBLOCK`** and expects `EAGAIN` from
+    `recvmsg`/`recvfrom`, not a sleep. `socket(2)` must honour the flag
+    (masked off by `& 0xf` for type detection) and `fcntl(F_SETFL)` must
+    stop ignoring it, or the resolver blocks forever on an empty socket.
+  - `recvmsg` must **not zero `msg_iovlen`**. musl walks the iovec array
+    advancing that field; clearing it makes it discard a perfectly good
+    reply and report `bad address`. Do write back `msg_name`/`msg_namelen`
+    (the reply source) and zero `msg_controllen`/`msg_flags`.
+- **No IPv6 stack, so `strip_ipv6_records` removes AAAA RRs** from every
+  port-53 reply on the way to user space. musl hands userland *every*
+  address it resolved and busybox commits to the first: without this,
+  `ping example.com` and `wget http://example.com` resolve fine and then
+  die on `socket(AF_INET6)`. Dropping the AAAA *query* is not enough — the
+  address comes back in the A reply too. The rewrite is in place: records
+  are compacted, ANCOUNT is fixed, and name-compression pointers stay
+  valid because the copy never moves the message start.
+  - The DNS header is `id[0..2] flags[2..4] qdcount[4..6] ancount[6..8]`.
+    **QR is bit 15 of the 16-bit flags at bytes 2-3**, not byte 1 — testing
+    `buf[1] & 0x80` reads the transaction ID and silently skips every
+    reply. This cost an hour; check the offset against a hexdump, not the
+    header shape.
+- The two resolvers coexist: `dnsprobe` exercises the in-kernel socket,
+  busybox exercises musl. check.sh session 19 gates both.
 
 ## Memory-map facts (easy to get wrong)
 

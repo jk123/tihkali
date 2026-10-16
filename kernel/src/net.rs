@@ -57,6 +57,15 @@ const CONNECT_TIMEOUT_MS: u64 = 8_000;
 /// Ephemeral local port base for connect() (smoltcp rejects local port 0).
 const EPHEMERAL_PORT: u16 = 49_500;
 
+/// Linux `O_NONBLOCK` (asm-generic/fcntl.h). Not the NetBSD 0x4 value —
+/// the fcntl(F_SETFL) path is the Linux personality's, and musl sends
+/// this value.
+pub const O_NONBLOCK: i64 = 0o4000;
+
+/// Linux `SOCK_NONBLOCK` (asm-generic/socket.h) — passed in the type word
+/// of socket(2). Masked off by `socket_kind`, so it never reaches smoltcp.
+pub const SOCK_NONBLOCK: u64 = 0x800;
+
 /// Kernel errnos (NetBSD numbering; the Linux epilogue translates).
 pub const EAGAIN_L: u8 = 35;
 pub const EINVAL: u8 = 22;
@@ -95,6 +104,19 @@ fn gw_octets() -> [u8; 4] {
     }
 }
 
+/// Our IPv4 address, or UNSPECIFIED if the link never came up.
+fn local_ip() -> [u8; 4] {
+    match iface_mut() {
+        Some(iface) => match iface.ip_addrs().first() {
+            Some(cidr) => match cidr.address() {
+                IpAddress::Ipv4(a) => a.octets(),
+            },
+            None => Ipv4Address::UNSPECIFIED.octets(),
+        },
+        None => Ipv4Address::UNSPECIFIED.octets(),
+    }
+}
+
 /// `UnsafeCell` wrapper (the file.rs/fs.rs pattern) — single-core, so no
 /// locking; edition 2024 forbids direct `&mut STATIC` references.
 struct NetCell<T>(UnsafeCell<T>);
@@ -123,6 +145,9 @@ struct SockMeta {
     connected: bool,
     /// UDP/TCP: local port chosen by bind() (0 = ephemeral at connect).
     lport: u16,
+    /// O_NONBLOCK via fcntl(F_SETFL). Non-blocking sockets return EAGAIN
+    /// instead of sleeping — musl's resolver depends on this.
+    nonblock: bool,
     /// ICMP: peer set by connect() — used by NULL-dest send/sendto.
     peer_ip: [u8; 4],
     /// TCP: listen(2) has been called on this slot.
@@ -147,6 +172,7 @@ const SOCK_META_EMPTY: SockMeta = SockMeta {
     connecting: false,
     connected: false,
     lport: 0,
+    nonblock: false,
     peer_ip: [0; 4],
     listening: false,
     refs: 0,
@@ -967,6 +993,92 @@ fn ephemeral_port(slot: usize) -> u16 {
     EPHEMERAL_PORT + slot as u16
 }
 
+/// Drop AAAA RRs from a DNS reply in place, fixing the answer count and
+/// shortening the message. We have no IPv6 stack, and musl hands userland
+/// every address it resolved: busybox ping takes the first one, so an AAAA
+/// record that SLIRP happily returns makes it fail on
+/// socket(AF_INET6) for a host that is perfectly reachable over IPv4.
+/// Allocation-free; runs on every port-53 datagram.
+fn strip_ipv6_records(buf: &mut [u8], len: usize) -> usize {
+    let len = len.min(buf.len());
+    if len < 12 {
+        return len;
+    }
+    let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let mut i = 12usize;
+    // Walk the question section to find where records start.
+    for _ in 0..qd {
+        while i < len && buf[i] != 0 {
+            if buf[i] & 0xc0 == 0xc0 {
+                i += 2;
+                break;
+            }
+            i += 1 + buf[i] as usize;
+        }
+        i += 1; // root label
+        if i + 4 > len {
+            return len; // malformed: leave the message alone
+        }
+        i += 4; // qtype + qclass
+    }
+    let mut w = i; // read cursor over the original message
+    let mut out = i; // write cursor for the compacted message
+    let mut removed = 0u16;
+    while w < len {
+        let mut p = w;
+        loop {
+            if p >= len {
+                return out;
+            }
+            let l = buf[p];
+            if l & 0xc0 == 0xc0 {
+                p += 2;
+                break;
+            }
+            if l == 0 {
+                p += 1;
+                break;
+            }
+            p += 1 + l as usize;
+        }
+        if p + 10 > len {
+            break;
+        }
+        let rr_type = u16::from_be_bytes([buf[p], buf[p + 1]]);
+        let rdlen = u16::from_be_bytes([buf[p + 8], buf[p + 9]]) as usize;
+        let end = p + 10 + rdlen;
+        if end > len {
+            break;
+        }
+        if rr_type == 28 {
+            removed += 1;
+        } else {
+            // Compression pointers in NAME are offsets from the message
+            // start, which the copy leaves unchanged, so they stay valid.
+            buf.copy_within(w..end, out);
+            out += end - w;
+        }
+        w = end;
+    }
+    if removed > 0 {
+        let an = u16::from_be_bytes([buf[6], buf[7]]).saturating_sub(removed);
+        buf[6..8].copy_from_slice(&an.to_be_bytes());
+    }
+    out
+}
+
+pub fn sock_is_nonblock(slot: usize) -> bool {
+    let meta = meta();
+    slot < NSOCK && meta[slot].used && meta[slot].nonblock
+}
+
+pub fn sock_set_nonblock(slot: usize, on: bool) {
+    let meta = meta();
+    if slot < NSOCK && meta[slot].used {
+        meta[slot].nonblock = on;
+    }
+}
+
 /// bind(2): UDP binds for real; TCP records the local port for connect.
 pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
     let meta = meta();
@@ -991,7 +1103,13 @@ pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
             let port: u16 = match port {
                 0 => {
                     let p = ephemeral_port(slot);
-                    if s.bind((IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), p)).is_err() {
+                    let lip = local_ip();
+                    if s.bind((
+                        IpAddress::Ipv4(Ipv4Address::new(lip[0], lip[1], lip[2], lip[3])),
+                        p,
+                    ))
+                    .is_err()
+                    {
                         return Err(EINVAL);
                     }
                     meta[slot].lport = p;
@@ -1294,8 +1412,13 @@ pub fn sock_send_to(slot: usize, data: &[u8], ip: [u8; 4], port: u16) -> Result<
                 } else {
                     ephemeral_port(slot)
                 };
+                // Bind to the real local address, not UNSPECIFIED: smoltcp
+                // takes the packet's source IP from the bound address, and
+                // 0.0.0.0 makes the peer reply to 0.0.0.0, which this
+                // interface never accepts.
+                let lip = local_ip();
                 if s.bind((
-                    IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                    IpAddress::Ipv4(Ipv4Address::new(lip[0], lip[1], lip[2], lip[3])),
                     p,
                 ))
                 .is_err()
@@ -1334,6 +1457,10 @@ pub fn sock_recv(
     from: Option<&mut ([u8; 4], u16)>,
 ) -> Result<usize, u8> {
     let meta = meta();
+    // A datagram may have landed in the rx queue since the last poll_tick;
+    // dispatch it before deciding the socket is empty, or a non-blocking
+    // recv reports EAGAIN with the reply sitting unread.
+    poll_tick();
     if slot >= NSOCK || !meta[slot].used {
         return Err(EBADF);
     }
@@ -1361,7 +1488,17 @@ pub fn sock_recv(
         SockKind::Udp => with_set(|set| {
             let s = udp_sock(set, slot);
             match s.recv_slice(buf) {
-                Ok((n, meta_ep)) => {
+                Ok((mut n, meta_ep)) => {
+                    // No IPv6 stack: strip AAAA (type 28) records out of
+                    // DNS replies so musl's resolver never hands userland
+                    // an IPv6 address it cannot use. busybox ping takes the
+                    // first address getaddrinfo returns and would die on
+                    // socket(AF_INET6) for a host we can reach over IPv4.
+                    if meta_ep.endpoint.port == 53 && n >= 12 && buf[2] & 0x80 != 0 {
+                        // QR is bit 15 of the 16-bit flags at bytes 2-3;
+                        // bytes 0-1 are the transaction ID.
+                        n = strip_ipv6_records(buf, n);
+                    }
                     if let Some(from) = from {
                         let IpAddress::Ipv4(a) = meta_ep.endpoint.addr;
                         from.0.copy_from_slice(&a.octets());

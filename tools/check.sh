@@ -450,8 +450,14 @@ echo "== session 19: in-kernel DNS resolver (smoltcp dns::Socket)"
 S19="$T/s19.log"
 ( sleep 5
   printf 'dnsprobe\n'; sleep 8
+  # musl's resolver (busybox ping/wget) is a separate path from
+  # dnsprobe's in-kernel socket: it binds 0.0.0.0:0, opens the socket
+  # SOCK_NONBLOCK, and reads replies with recvmsg. No -4: the kernel
+  # strips AAAA records from replies, so busybox sees only the A record.
+  printf 'ping -c 1 example.com\n'; sleep 9
+  printf 'wget -q -O - http://example.com\n'; sleep 12
   printf 'exit\n'; sleep 6
-) | timeout 32 ./tools/run.sh >"$S19" 2>&1
+) | timeout 52 ./tools/run.sh >"$S19" 2>&1
 # The A record for example.com is a live CDN address, so gate the shape
 # (four dotted octets in 1-255), not the exact value.
 gate_has   "s19: A record"      "$S19" 'dns: example\.com = [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
@@ -459,6 +465,11 @@ gate_has   "s19: hosts file"    "$S19" 'dns: gateway = 10\.0\.2\.2'
 gate_has   "s19: bogus rejected" "$S19" 'dns: bogus name rejected'
 gate_has   "s19: probe ok"      "$S19" 'dnsprobe: ok'
 gate_has   "s19: exit 0"        "$S19" 'sh: dnsprobe exited 0'
+# musl resolved the name itself: ping prints the A record it looked up.
+gate_has   "s19: musl resolved" "$S19" 'PING example\.com \([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)'
+gate_has   "s19: musl ping ok"  "$S19" '1 packets transmitted, 1 packets received'
+# wget over the same musl resolver: name -> A record -> TCP -> body.
+gate_has   "s19: wget body"      "$S19" 'Example Domain'
 gate_count "s19: no ENOSYS"     "$S19" 'ENOSYS' 0
 gate_has   "s19: clean exit"    "$S19" 'proc: pid 0 exited \(0\)'
 gate_bad   "s19" "$S19"

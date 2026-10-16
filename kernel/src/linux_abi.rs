@@ -428,13 +428,20 @@ pub fn svc(frame: &mut TrapFrame) {
                 ) {
                     None => (0, crate::net::EAFNOSUPPORT),
                     Some(kind) => match crate::net::sock_open(kind) {
-                        Ok(slot) => match proc::install_fd(FdTarget::Socket(slot)) {
-                            Ok(fd) => (fd as i64, 0),
-                            Err(e) => {
-                                crate::net::sock_ref_dec(slot);
-                                (0, e)
+                        Ok(slot) => {
+                            // SOCK_NONBLOCK (0x800) rides in the type word;
+                            // musl's resolver opens its UDP socket this way.
+                            if frame.x[1] & crate::net::SOCK_NONBLOCK != 0 {
+                                crate::net::sock_set_nonblock(slot, true);
                             }
-                        },
+                            match proc::install_fd(FdTarget::Socket(slot)) {
+                                Ok(fd) => (fd as i64, 0),
+                                Err(e) => {
+                                    crate::net::sock_ref_dec(slot);
+                                    (0, e)
+                                }
+                            }
+                        }
                         Err(e) => (0, e),
                     },
                 }
@@ -603,8 +610,18 @@ pub fn svc(frame: &mut TrapFrame) {
                                     (n as i64, 0)
                                 }
                                 Err(crate::net::EAGAIN_L) => {
-                                    proc::sleep_current(frame);
-                                    return;
+                                    #[cfg(feature = "net")]
+                                    if crate::net::sock_is_nonblock(slot) {
+                                        (0, 11) // EAGAIN
+                                    } else {
+                                        proc::sleep_current(frame);
+                                        return;
+                                    }
+                                    #[cfg(not(feature = "net"))]
+                                    {
+                                        proc::sleep_current(frame);
+                                        return;
+                                    }
                                 }
                                 Err(e) => (0, e),
                             }
@@ -733,7 +750,21 @@ pub fn svc(frame: &mut TrapFrame) {
                         };
                         match res {
                             Ok(n) => {
-                                // msg_name is msghdr byte 0 (absent here).
+                                // Linux msghdr output fields musl inspects:
+                                // msg_namelen @8, msg_controllen @40,
+                                // msg_flags @48. Leaving them as the
+                                // caller left them makes musl treat a
+                                // perfectly good reply as truncated/unknown
+                                // and report a lookup failure.
+                                unsafe {
+                                    let m = msg as *mut u8;
+                                    if n > 0 {
+                                        let nameptr = *(m as *const u64);
+                                        write_sockaddr_out(nameptr, m as u64 + 8, &src.0, src.1);
+                                        *(m.add(40) as *mut u64) = 0; // msg_controllen
+                                        *(m.add(48) as *mut u32) = 0; // msg_flags
+                                    }
+                                }
                                 // Inline-flush so an echo right after the
                                 // recvmsg reaches the peer (N4 fix).
                                 if n > 0 {
@@ -742,8 +773,18 @@ pub fn svc(frame: &mut TrapFrame) {
                                 (n as i64, 0)
                             }
                             Err(crate::net::EAGAIN_L) => {
-                                proc::sleep_current(frame);
-                                return;
+                                #[cfg(feature = "net")]
+                                if crate::net::sock_is_nonblock(slot) {
+                                    (0, 11) // EAGAIN
+                                } else {
+                                    proc::sleep_current(frame);
+                                    return;
+                                }
+                                #[cfg(not(feature = "net"))]
+                                {
+                                    proc::sleep_current(frame);
+                                    return;
+                                }
                             }
                             Err(e) => (0, e),
                         }
@@ -864,13 +905,6 @@ const POLLNVAL: u16 = 0x020;
 
 /// Readiness of one fd for the events requested in `events`.
 fn poll_revents(fd: i32, events: u16) -> u16 {
-    // Service the NIC before reading socket state: a datagram that landed
-    // since the last poll_tick is only in the rx queue, not yet in the
-    // socket buffer, so sock_poll would report "not ready" and the caller
-    // would sleep through the arrival. Without this, poll(2) on a UDP
-    // socket (musl's DNS resolver) never observes the reply.
-    #[cfg(feature = "net")]
-    crate::net::poll_tick();
     if fd < 0 {
         return 0; // negative fds are ignored per POSIX
     }
@@ -939,6 +973,14 @@ fn ppoll(frame: &mut TrapFrame, fds: u64, nfds: u64, timeout: u64) -> Io {
         return Io::Err(file::EFAULT);
     }
     let mut nready = 0usize;
+    // Service the NIC once, before sampling any fd: a datagram that landed
+    // since the last poll_tick is still in the rx queue, not yet in the
+    // socket buffer, so sock_poll would report "not ready" and the caller
+    // would sleep through its arrival. Done here rather than inside
+    // poll_revents because poll_tick wakes sleepers — doing that per-fd
+    // would wake this process while it is still walking its fd list.
+    #[cfg(feature = "net")]
+    crate::net::poll_tick();
     for i in 0..nfds as usize {
         let base = fds + (i as u64) * 8;
         let (fd, events) = unsafe {
@@ -1510,10 +1552,38 @@ fn fcntl(fd: usize, cmd: i64, arg: i64) -> (i64, u8) {
                 Ok(false) => (0, 0),
                 Err(e) => (0, e),
             },
-            Some(_) => (0, file::EBADF),
+            Some(FdTarget::Socket(s)) => {
+                #[cfg(feature = "net")]
+                {
+                    if crate::net::sock_is_nonblock(s) {
+                        (crate::net::O_NONBLOCK as i64, 0)
+                    } else {
+                        (0, 0)
+                    }
+                }
+                #[cfg(not(feature = "net"))]
+                {
+                    let _ = s;
+                    (0, 0)
+                }
+            }
             None => (0, file::EBADF),
+            _ => (0, 0), // TtyIn/TtyOut/Pipe: no flags tracked
         },
-        4 => (0, 0), // F_SETFL: ignore
+        // F_SETFL: O_NONBLOCK is load-bearing — musl's resolver polls a
+        // non-blocking UDP socket and expects EAGAIN rather than a sleep.
+        4 => match proc::current_target(fd) {
+            Some(FdTarget::Socket(s)) => {
+                #[cfg(feature = "net")]
+                crate::net::sock_set_nonblock(s, arg & crate::net::O_NONBLOCK as i64 != 0);
+                #[cfg(not(feature = "net"))]
+                {
+                    let _ = (s, arg);
+                }
+                (0, 0)
+            }
+            _ => (0, 0),
+        },
         1030 => match proc::sys_dupfd(fd as i64, arg) {
             // F_DUPFD_CLOEXEC (no cloexec tracking v1 — same as F_DUPFD)
             Ok(n) => (n as i64, 0),
