@@ -1,0 +1,5 @@
+# tihkali static host table (BSD-style hosts file).
+# Format: <ip-address> <name> [name...]
+# Consulted before DNS, so these names never cost a round trip.
+127.0.0.1	localhost
+10.0.2.2	gateway

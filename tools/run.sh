@@ -63,6 +63,14 @@ fi
 QEMU="$ROOT/.toolchain/qemu/usr/bin/qemu-system-aarch64"
 export LD_LIBRARY_PATH="$ROOT/.toolchain/qemu/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# `ramfb` gives the guest a framebuffer in its own RAM (see kernel/src/gui.rs).
+# It needs vgabios-ramfb.bin in the -L datadir: tools/fetch-vgabios.sh.
+# --no-gui omits it; a guest with ramfb but no display can still run headless.
+GUI_ARGS=(-device ramfb)
+if [ "${NO_GUI:-0}" = "1" ]; then
+    GUI_ARGS=()
+fi
+
 exec "$QEMU" \
     -L "$ROOT/.toolchain/qemu/usr/share/qemu" \
     -machine virt,gic-version=3 \
@@ -70,6 +78,7 @@ exec "$QEMU" \
     -m 256M \
     -display none -serial stdio -monitor none \
     -global virtio-mmio.force-legacy=false \
+    "${GUI_ARGS[@]}" \
     "${DRIVE_ARGS[@]}" \
     -device virtio-net-device,netdev=n0 \
     $( [ -n "$HOSTFWD" ] && echo "-netdev user,id=n0,hostfwd=$HOSTFWD" || echo "-netdev user,id=n0" ) \

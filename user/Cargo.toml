@@ -31,3 +31,11 @@ path = "src/netsend.rs"
 [[bin]]
 name = "tihkali-sockopt"
 path = "src/sockopt.rs"
+
+[[bin]]
+name = "tihkali-gui"
+path = "src/gui.rs"
+
+[[bin]]
+name = "tihkali-dnsprobe"
+path = "src/dnsprobe.rs"

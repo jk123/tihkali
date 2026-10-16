@@ -4,7 +4,7 @@
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::platform::{GICD_BASE, GICR_BASE};
+use super::platform::{GICD_BASE, GICR_BASE};
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ICENABLER0: usize = 0x180;

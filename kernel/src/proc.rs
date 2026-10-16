@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use tihkali_hal::kprintln;
+use crate::kprintln;
 
 use crate::arch::trap::TrapFrame;
 use crate::file::{self, FdTarget, EACCES, EBADF, EFAULT, EINTR, ESRCH};
@@ -940,7 +940,7 @@ pub fn sys_write(fd: usize, buf: u64, len: usize) -> Result<i64, u8> {
                 return Err(EFAULT);
             }
             let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-            tihkali_hal::console::write_bytes(bytes);
+            crate::hal::console::write_bytes(bytes);
             Ok(len as i64)
         }
         FdTarget::Pipe { slot, write_end: true } => {
@@ -1511,7 +1511,7 @@ pub fn sys_brk(addr: u64) -> u64 {
         return p.brk;
     }
     let ok = addr >= p.brk_start && addr <= user::MMAP_FLOOR as u64;
-    tihkali_hal::kprintln!("sys_brk: req={addr:#x} start={:#x} floor={:#x} ok={ok}", p.brk_start, user::MMAP_FLOOR);
+    crate::kprintln!("sys_brk: req={addr:#x} start={:#x} floor={:#x} ok={ok}", p.brk_start, user::MMAP_FLOOR);
     if ok {
         p.brk = addr;
     }

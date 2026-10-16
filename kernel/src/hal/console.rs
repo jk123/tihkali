@@ -2,8 +2,8 @@
 
 use core::fmt::{self, Write};
 
-use crate::platform::UART0_BASE;
-use crate::uart::Pl011;
+use super::platform::UART0_BASE;
+use super::uart::Pl011;
 
 static UART: Pl011 = Pl011::new(UART0_BASE);
 
@@ -57,7 +57,7 @@ pub fn getc() -> u8 {
 #[macro_export]
 macro_rules! kprint {
     ($($arg:tt)*) => {
-        $crate::console::_print(core::format_args!($($arg)*))
+        $crate::hal::console::_print(core::format_args!($($arg)*))
     };
 }
 

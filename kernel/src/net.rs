@@ -18,6 +18,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use smoltcp::iface::{Config, Interface, PollResult, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::dhcpv4;
+use managed::ManagedSlice;
+use smoltcp::socket::dns::{self, QueryHandle};
 use smoltcp::socket::icmp::{
     Endpoint as IcmpEndpoint, PacketBuffer as IcmpBuffer, PacketMetadata as IcmpMeta,
     RecvError as IcmpRecvError, SendError as IcmpSendError, Socket as IcmpSocket,
@@ -27,10 +29,11 @@ use smoltcp::socket::udp;
 use smoltcp::storage::RingBuffer;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+    DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint,
+    IpListenEndpoint, Ipv4Address,
 };
 
-use tihkali_hal::kprintln;
+use crate::kprintln;
 
 use crate::virtio_net;
 
@@ -569,6 +572,194 @@ fn with_set<R>(f: impl FnOnce(&mut SocketSet<'static>) -> R) -> R {
     let store = sock_store();
     let mut set = SocketSet::new(&mut store[..]);
     f(&mut set)
+}
+
+// ---------- DNS resolver ----------
+
+/// Fallback nameserver when `/etc/resolv.conf` is missing or has no usable
+/// `nameserver` line: SLIRP's built-in resolver (`-netdev user` default —
+/// 10.0.2.2 is the gateway, 10.0.2.3 the nameserver).
+const DNS_FALLBACK: [u8; 4] = [10, 0, 2, 3];
+
+/// Wall-clock budget for one resolution. A local answer is instant; this
+/// only bounds the failure path (no resolver listening, or the name does
+/// not exist) so a bad name returns instead of hanging.
+pub const DNS_TIMEOUT: i64 = 2_000;
+
+/// Parse one dotted-quad into 4 octets.
+fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut i = 0;
+    for part in s.split(|&c| c == b'.') {
+        if i >= 4 || part.is_empty() {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for &d in part {
+            if !d.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + u32::from(d - b'0');
+            if n > 255 {
+                return None;
+            }
+        }
+        out[i] = n as u8;
+        i += 1;
+    }
+    if i == 4 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Strip `#` comments and surrounding blanks from one config line.
+fn config_line(bytes: &[u8]) -> Option<&[u8]> {
+    let line = bytes.split(|&c| c == b'\n').next()?;
+    let line = match line.iter().position(|&c| c == b'#') {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    let start = line
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    Some(&line[start..end])
+}
+
+/// First `nameserver` address in `/etc/resolv.conf`, else the fallback.
+///
+/// BSD-style: whitespace-separated tokens, `nameserver <ip>`, `#` comments.
+/// Only the first entry is used — a single-core kernel resolving one query
+/// at a time has no use for a retry chain.
+fn nameserver() -> [u8; 4] {
+    let Some(idx) = crate::fs::lookup("/etc/resolv.conf") else {
+        return DNS_FALLBACK;
+    };
+    let mut found = DNS_FALLBACK;
+    crate::fs::with_bytes(idx, |data| {
+        for raw in data.split(|&c| c == b'\n') {
+            let Some(line) = config_line(raw) else { continue };
+            let mut tok = line.split(|c| c.is_ascii_whitespace()).filter(|t| !t.is_empty());
+            if tok.next() != Some(&b"nameserver"[..]) {
+                continue;
+            }
+            if let Some(ip) = tok.next().and_then(parse_ipv4) {
+                found = ip;
+                return;
+            }
+        }
+    });
+    found
+}
+
+/// Static `/etc/hosts` lookup, BSD-style: `<ip> <name> [name...]`, `#`
+/// comments. Exact match only — no search domains. Consulted before DNS so
+/// a local name never costs a round trip.
+fn hosts_lookup(name: &str) -> Option<[u8; 4]> {
+    let idx = crate::fs::lookup("/etc/hosts")?;
+    let hit = crate::fs::with_bytes(idx, |data| {
+        for raw in data.split(|&c| c == b'\n') {
+            let Some(line) = config_line(raw) else { continue };
+            let mut tok = line.split(|c| c.is_ascii_whitespace()).filter(|t| !t.is_empty());
+            let Some(ip) = tok.next().and_then(parse_ipv4) else { continue };
+            for field in tok {
+                if field == name.as_bytes() {
+                    return Some(ip);
+                }
+            }
+        }
+        None
+    });
+    if hit.is_none() {
+        kprintln!("dns: {name} not in /etc/hosts");
+    }
+    hit
+}
+
+/// Resolve `name` to an IPv4 address, blocking until answered or timed out.
+///
+/// Scoped-socket design like `dhcp_acquire`: the dns::Socket owns its own
+/// SocketSet for the duration of the call and is dropped before returning,
+/// so it never consumes one of the 8 persistent pool slots a user socket
+/// needs. smoltcp handles retransmission and the pending/completed state
+/// machine internally; we only drive `poll` until the query resolves.
+///
+/// Returns the first A record, or `None` on timeout/NXDOMAIN/no-A-record.
+///
+/// `/etc/hosts` is consulted first (static answers skip the network), then
+/// the `nameserver` from `/etc/resolv.conf`.
+pub fn resolve(name: &str, timeout_ms: i64) -> Option<[u8; 4]> {
+    if let Some(ip) = hosts_lookup(name) {
+        return Some(ip);
+    }
+    let iface = iface_mut()?;
+    let mut dev = NetDev;
+
+    let srv = nameserver();
+    let server = IpAddress::Ipv4(Ipv4Address::new(srv[0], srv[1], srv[2], srv[3]));
+    // Borrowed slice keeps the socket allocation-free. Must hold at least
+    // one slot or `start_query` returns NoFreeSlot — one concurrent query
+    // is all a blocking resolve needs.
+    let mut queries = [None; 1];
+    let sock = dns::Socket::new(&[server], ManagedSlice::Borrowed(&mut queries));
+    let mut store = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut store[..]);
+    let sock_handle = sockets.add(sock);
+
+    let q: QueryHandle = {
+        let s = sockets.get_mut::<dns::Socket>(sock_handle);
+        match s.start_query(iface.context(), name, DnsQueryType::A) {
+            Ok(h) => h,
+            Err(_) => {
+                sockets.remove(sock_handle);
+                return None;
+            }
+        }
+    };
+
+    let start = now_ms();
+    let mut out = None;
+    // Set once the query reaches a terminal state, because
+    // `get_query_result` frees the slot on completion/failure — calling
+    // `cancel_query` on that freed slot would panic.
+    let mut settled = false;
+    while now_ms() - start < timeout_ms {
+        let ts = Instant::from_millis(now_ms());
+        iface.poll(ts, &mut dev, &mut sockets);
+        let s = sockets.get_mut::<dns::Socket>(sock_handle);
+        match s.get_query_result(q) {
+            Ok(addrs) => {
+                // proto-ipv6 is off, so IpAddress is IPv4-only here.
+                out = addrs.first().map(|a| match a {
+                    IpAddress::Ipv4(v) => v.octets(),
+                });
+                settled = true;
+                break;
+            }
+            Err(dns::GetQueryResultError::Pending) => {
+                if iface.poll_delay(ts, &sockets).is_none() {
+                    crate::arch::timer::spin();
+                }
+            }
+            // Terminal failure (NXDOMAIN, no A record, server unreachable).
+            Err(_) => {
+                settled = true;
+                break;
+            }
+        }
+    }
+    if !settled {
+        // Timed out with the query still pending — reclaim the slot.
+        sockets.get_mut::<dns::Socket>(sock_handle).cancel_query(q);
+    }
+    sockets.remove(sock_handle);
+    out
 }
 
 // ---------- socket pool ops (called from syscall arms) ----------

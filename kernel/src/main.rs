@@ -5,10 +5,19 @@
 
 extern crate alloc;
 
+#[cfg(all(feature = "qemu-virt", feature = "rpi3"))]
+compile_error!("board features are mutually exclusive: qemu-virt xor rpi3");
+#[cfg(not(any(feature = "qemu-virt", feature = "rpi3")))]
+compile_error!("enable exactly one board feature: qemu-virt or rpi3");
+
+#[macro_use]
+mod hal;
 mod arch;
 mod cpio;
 mod file;
 mod fs;
+#[cfg(feature = "qemu-virt")]
+mod gui;
 mod kmem;
 mod linux_abi;
 #[cfg(feature = "net")]
@@ -24,7 +33,7 @@ mod vm;
 
 use core::panic::PanicInfo;
 
-use tihkali_hal::{console, gic, kprintln};
+use hal::{console, gic};
 
 /// Embedded initramfs: used when no virtio-blk disk is attached.
 static INITRAMFS: &[u8] = include_bytes!(env!("TIHKALI_INITRAMFS"));
@@ -84,6 +93,15 @@ pub extern "C" fn kernel_main(entry_el: u64) -> ! {
 
     #[cfg(feature = "net")]
     net::smoke(); // boot-time ARP/ICMP smoke; prints `net:` lines, never panics
+
+    // Framebuffer: needs `-device ramfb` on the QEMU line. Absent it, fall
+    // back to the UART console rather than failing the boot. qemu-virt
+    // only, like the module itself (the Pi has no framebuffer path).
+    #[cfg(feature = "qemu-virt")]
+    match gui::init() {
+        Ok(()) => kprintln!("gui: display ready"),
+        Err(e) => kprintln!("gui: {e} (console only)"),
+    }
 
     let Some(sh) = fs::lookup("/bin/sh") else {
         panic!("initramfs: no /bin/sh");

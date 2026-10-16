@@ -7,8 +7,8 @@
 
 use alloc::vec::Vec;
 
-use tihkali_hal::kprintln;
-use tihkali_hal::platform::{self, RAM_BASE, RAM_SIZE};
+use crate::kprintln;
+use crate::hal::platform::{self, RAM_BASE, RAM_SIZE};
 
 use crate::mm::pmm;
 
@@ -82,8 +82,14 @@ pub fn init() {
             for &d in platform::LOW_DEVICES.iter().chain(platform::MID_DEVICES.iter()) {
                 if (d as u64) >> 30 == slot as u64 {
                     used = true;
-                    let idx = (((d as u64) - base) >> 21) as usize;
-                    (*slot_l2)[slot].0[idx] = block_desc(d as u64, ATTR_DEVICE);
+                    let off = (d as u64) - base;
+                    let idx = (off >> 21) as usize;
+                    // The descriptor's address must be the *aligned* block
+                    // base, not `d`: several devices can share one 2 MiB
+                    // block (UART0 0x09000000 and fw_cfg 0x09020000 on QEMU
+                    // virt both land in idx 72), and a block maps its whole
+                    // aligned range or nothing.
+                    (*slot_l2)[slot].0[idx] = block_desc(base + (idx as u64) << 21, ATTR_DEVICE);
                 }
             }
 

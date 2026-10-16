@@ -1,6 +1,6 @@
 //! Load the embedded test ELF into user mappings and enter EL0.
 
-use tihkali_hal::kprintln;
+use crate::kprintln;
 
 /// User VA window (see user.ld): text in the first 2 MiB, stack in the
 /// second; physical frames come from the PMM on demand (COW/lazy).

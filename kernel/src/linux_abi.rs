@@ -7,7 +7,7 @@
 
 use alloc::string::String;
 
-use tihkali_hal::kprintln;
+use crate::kprintln;
 
 use crate::arch::trap::TrapFrame;
 use crate::file::{self, FdTarget};
@@ -764,6 +764,68 @@ pub fn svc(frame: &mut TrapFrame) {
             Ok(()) => (0, 0),
             Err(e) => (0, e),
         },
+        #[cfg(feature = "net")]
+        240 => {
+            // tihkali_resolve(const char *name, u32 *out_ipv4) — in-kernel
+            // DNS. 240 is unused on Linux aarch64, chosen so the musl
+            // getaddrinfo path can be redirected here without colliding
+            // with a real syscall. Returns 0 + the A record on success,
+            // or -EHOSTUNREACH / -EFAULT.
+            let out = frame.x[1];
+            if out == 0 || !proc::user_range_ok(out, 4) {
+                (0, file::EFAULT)
+            } else {
+                match proc::read_user_cstr(frame.x[0], 256) {
+                    None => (0, file::EFAULT),
+                    Some(name) => match crate::net::resolve(&name, crate::net::DNS_TIMEOUT) {
+                        Some(ip) => {
+                            // Bounds validated above; write the 4-byte A
+                            // record as one volatile store.
+                            unsafe { (out as *mut u32).write_volatile(u32::from_le_bytes(ip)) };
+                            (0, 0)
+                        }
+                        None => (0, 2), // ENOENT: no such name / timed out
+                    },
+                }
+            }
+        }
+        #[cfg(feature = "qemu-virt")]
+        480 => {
+            // tihkali: gui_fb_info(out) -> {width, height, stride, pa}
+            match crate::gui::sys_fb_info(frame.x[0]) {
+                Ok(()) => (0, 0),
+                Err(e) => (0, linux_errno(e)),
+            }
+        }
+        #[cfg(feature = "qemu-virt")]
+        481 => {
+            // tihkali: gui_fill_rect(x, y, w, h, rgb)
+            match crate::gui::sys_fill_rect(
+                frame.x[0] as u32,
+                frame.x[1] as u32,
+                frame.x[2] as u32,
+                frame.x[3] as u32,
+                frame.x[4] as u32,
+            ) {
+                Ok(()) => (0, 0),
+                Err(e) => (0, linux_errno(e)),
+            }
+        }
+        #[cfg(feature = "qemu-virt")]
+        482 => {
+            // tihkali: gui_blit(src, x, y, w, h, src_stride)
+            match crate::gui::sys_blit(
+                frame.x[0],
+                frame.x[1] as u32,
+                frame.x[2] as u32,
+                frame.x[3] as u32,
+                frame.x[4] as u32,
+                frame.x[5] as u32,
+            ) {
+                Ok(()) => (0, 0),
+                Err(e) => (0, linux_errno(e)),
+            }
+        }
         _ => {
             kprintln!(
                 "[linux] ENOSYS nr={nr} x0={:#x} x1={:#x} x2={:#x} elr={:#x}",
@@ -1622,7 +1684,7 @@ fn sendfile(out_fd: usize, in_fd: usize, off: u64, count: usize) -> (i64, u8) {
         let wrote = match dst {
             FdTarget::TtyOut => {
                 let bytes = unsafe { core::slice::from_raw_parts(kaddr as *const u8, n) };
-                tihkali_hal::console::write_bytes(bytes);
+                crate::hal::console::write_bytes(bytes);
                 n
             }
             FdTarget::File(dst_idx) => {

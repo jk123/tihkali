@@ -5,4 +5,4 @@ target = "aarch64-unknown-none"
 replace-with = "vendored-sources"
 
 [source.vendored-sources]
-directory = "deps/vendor"
+directory = "vendor"

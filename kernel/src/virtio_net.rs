@@ -11,7 +11,7 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
-use tihkali_hal::kprintln;
+use crate::kprintln;
 
 use crate::mm::pmm;
 

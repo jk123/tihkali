@@ -24,5 +24,3 @@ pub const UART0_SPI: u32 = 57;
 
 pub const LOW_DEVICES: &[usize] = &[VCIC_BASE, UART0_BASE];
 pub const MID_DEVICES: &[usize] = &[CTRL_BASE];
-
-pub const RAM_SLOT: usize = 0;

@@ -6,8 +6,8 @@
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::console;
-use crate::platform::{CTRL_BASE, UART0_SPI, VCIC_BASE};
+use super::console;
+use super::platform::{CTRL_BASE, UART0_SPI, VCIC_BASE};
 
 pub const SPURIOUS: u32 = 1023;
 pub const PPI_PHYS_TIMER: u32 = 30;

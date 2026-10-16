@@ -9,18 +9,18 @@ static mut IN: usize = 0; // monotonic write cursor
 static mut OUT: usize = 0; // monotonic read cursor
 
 /// Board UART interrupt number (GIC SPI on virt, VC IRQ on the Pi).
-pub const UART0_SPI: u32 = tihkali_hal::platform::UART0_SPI;
+pub const UART0_SPI: u32 = crate::hal::platform::UART0_SPI;
 
 /// Wire up RX: unmask PL011 + enable the GIC SPI.
 pub fn init() {
-    tihkali_hal::console::enable_rx_irq();
-    tihkali_hal::gic::enable_spi(UART0_SPI);
+    crate::hal::console::enable_rx_irq();
+    crate::hal::gic::enable_spi(UART0_SPI);
 }
 
 /// RX interrupt: drain the UART FIFO into the ring, wake readers.
 pub fn on_rx() {
-    while tihkali_hal::console::rx_pending() {
-        let c = tihkali_hal::console::getc();
+    while crate::hal::console::rx_pending() {
+        let c = crate::hal::console::getc();
         if c == 0x03 {
             // Ctrl-C: line-discipline ISIG — SIGINT the foreground group
             // instead of queueing the byte (v1: ISIG always on).

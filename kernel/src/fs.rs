@@ -10,7 +10,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use tihkali_hal::kprintln;
+use crate::kprintln;
 
 use crate::cpio;
 use crate::file::{EIO, ENOENT, ENOSPC, ENOTDIR, EEXIST, EISDIR, EBUSY, ENOTEMPTY};

@@ -1,8 +1,8 @@
 //! Physical frame allocator: first-fit bitmap over QEMU virt RAM,
 //! with per-frame reference counts for copy-on-write sharing.
 
-use tihkali_hal::kprintln;
-use tihkali_hal::platform::{RAM_BASE, RAM_SIZE};
+use crate::kprintln;
+use crate::hal::platform::{RAM_BASE, RAM_SIZE};
 
 const FRAME: usize = 4096;
 const NUM_FRAMES: usize = RAM_SIZE / FRAME;

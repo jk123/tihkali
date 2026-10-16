@@ -19,9 +19,13 @@ fn main() {
     println!("cargo:rerun-if-changed=../user/src/netserver.rs");
     println!("cargo:rerun-if-changed=../user/src/netsend.rs");
     println!("cargo:rerun-if-changed=../user/src/sockopt.rs");
+    println!("cargo:rerun-if-changed=../user/src/dnsprobe.rs");
+    println!("cargo:rerun-if-changed=../user/src/gui.rs");
     println!("cargo:rerun-if-changed=../user/user.ld");
     println!("cargo:rerun-if-changed=assets/motd");
     println!("cargo:rerun-if-changed=assets/demo.sh");
+    println!("cargo:rerun-if-changed=assets/resolv.conf");
+    println!("cargo:rerun-if-changed=assets/hosts");
 
     // Build the user programs into a private target dir (nested cargo
     // would deadlock on the parent's target-dir lock, hence OUT_DIR/user).
@@ -51,7 +55,9 @@ fn main() {
     let netserver = bindir.join("tihkali-netserver");
     let netsend = bindir.join("tihkali-netsend");
     let sockopt = bindir.join("tihkali-sockopt");
-    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt] {
+    let dnsprobe = bindir.join("tihkali-dnsprobe");
+    let gui = bindir.join("tihkali-gui");
+    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt, &dnsprobe, &gui] {
         assert!(p.exists(), "user binary not produced at {}", p.display());
     }
     // Still used by main.rs until M4 switches pid0/exec to the VFS.
@@ -64,7 +70,7 @@ fn main() {
     let gcc = Path::new(&dir)
         .join("../.toolchain/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc");
     let linux_out = Path::new(&out).join("linux-hello");
-    let src = Path::new(&dir).join("../linux/hello.c");
+    let src = Path::new(&dir).join("assets/c/hello.c");
     let status = Command::new(&gcc)
         .args([
             "-static",
@@ -81,11 +87,11 @@ fn main() {
         Ok(_) => panic!("linux hello compile failed (run tools/fetch-linux-toolchain.sh)"),
         Err(e) => panic!("musl gcc not runnable ({e}); run tools/fetch-linux-toolchain.sh"),
     }
-    println!("cargo:rerun-if-changed=../linux/hello.c");
+    println!("cargo:rerun-if-changed=assets/c/hello.c");
 
     // Linux syscall depth probe (packed as /bin/linux-probe).
     let probe_out = Path::new(&out).join("linux-probe");
-    let probe_src = Path::new(&dir).join("../linux/probe.c");
+    let probe_src = Path::new(&dir).join("assets/c/probe.c");
     let status = Command::new(&gcc)
         .args(["-static", "-no-pie", "-O2", "-Wl,-Ttext-segment=0x100000000", "-o"])
         .arg(&probe_out)
@@ -96,11 +102,11 @@ fn main() {
         Ok(_) => panic!("linux probe compile failed"),
         Err(e) => panic!("musl gcc not runnable ({e})"),
     }
-    println!("cargo:rerun-if-changed=../linux/probe.c");
+    println!("cargo:rerun-if-changed=assets/c/probe.c");
 
     // N2 TCP probe (packed as /bin/linux-tcp).
     let tcp_out = Path::new(&out).join("linux-tcp");
-    let tcp_src = Path::new(&dir).join("../linux/tcp.c");
+    let tcp_src = Path::new(&dir).join("assets/c/tcp.c");
     let status = Command::new(&gcc)
         .args(["-static", "-no-pie", "-O2", "-Wl,-Ttext-segment=0x100000000", "-o"])
         .arg(&tcp_out)
@@ -111,7 +117,7 @@ fn main() {
         Ok(_) => panic!("linux tcp probe compile failed"),
         Err(e) => panic!("musl gcc not runnable ({e})"),
     }
-    println!("cargo:rerun-if-changed=../linux/tcp.c");
+    println!("cargo:rerun-if-changed=assets/c/tcp.c");
 
     // Alpine busybox (static ET_EXEC at 0x400000): shift all VAs into the
     // user window. Static aarch64 code addresses everything PC-relatively
@@ -201,6 +207,8 @@ fn main() {
     let netserver_bytes = std::fs::read(&netserver).expect("read tihkali-netserver");
     let netsend_bytes = std::fs::read(&netsend).expect("read tihkali-netsend");
     let sockopt_bytes = std::fs::read(&sockopt).expect("read tihkali-sockopt");
+    let dnsprobe_bytes = std::fs::read(&dnsprobe).expect("read tihkali-dnsprobe");
+    let gui_bytes = std::fs::read(&gui).expect("read tihkali-gui");
     let linux_bytes = std::fs::read(&linux_out).expect("read linux-hello");
     let probe_bytes = std::fs::read(&probe_out).expect("read linux-probe");
     let tcp_bytes = std::fs::read(&tcp_out).expect("read linux-tcp");
@@ -208,6 +216,9 @@ fn main() {
 
     let motd = std::fs::read(Path::new(&dir).join("assets/motd")).expect("read motd");
     let demo_sh = std::fs::read(Path::new(&dir).join("assets/demo.sh")).expect("read demo.sh");
+    let resolv_conf =
+        std::fs::read(Path::new(&dir).join("assets/resolv.conf")).expect("read resolv.conf");
+    let hosts = std::fs::read(Path::new(&dir).join("assets/hosts")).expect("read hosts");
 
     let mut entries: Vec<CpioEntry> = vec![
         CpioEntry::dir("."),
@@ -220,12 +231,16 @@ fn main() {
         CpioEntry::file("bin/netserver", &netserver_bytes),
         CpioEntry::file("bin/netsend", &netsend_bytes),
         CpioEntry::file("bin/sockopt", &sockopt_bytes),
+        CpioEntry::file("bin/dnsprobe", &dnsprobe_bytes),
+        CpioEntry::file("bin/gui", &gui_bytes),
         CpioEntry::file("bin/linux-hello", &linux_bytes),
         CpioEntry::file("bin/linux-probe", &probe_bytes),
         CpioEntry::file("bin/linux-tcp", &tcp_bytes),
         CpioEntry::exe("bin/busybox", &busybox_bytes),
         CpioEntry::file("etc/motd", &motd),
         CpioEntry::file("etc/demo.sh", &demo_sh),
+        CpioEntry::file("etc/resolv.conf", &resolv_conf),
+        CpioEntry::file("etc/hosts", &hosts),
     ];
     // busybox applet links (Alpine convention: /bin/<applet> -> busybox).
     // ash execs these by name; busybox dispatches on argv[0]'s basename.

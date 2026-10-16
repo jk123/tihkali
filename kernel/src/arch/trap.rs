@@ -1,7 +1,7 @@
 //! Trap frame, exception dispatch, syscall handling, and register dumps.
 
-use tihkali_hal::gic;
-use tihkali_hal::{kprint, kprintln};
+use crate::hal::gic;
+use crate::{kprint, kprintln};
 
 use crate::arch::timer;
 
@@ -304,6 +304,43 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 crate::proc::Wait4::Done(pid) => (pid, 0),
                 crate::proc::Wait4::Slept => return,
                 crate::proc::Wait4::Err(e) => (-1, e),
+            }
+        }
+        #[cfg(feature = "qemu-virt")]
+        481 => {
+            // tihkali: gui_fb_info(out) -> {width, height, stride, pa}
+            match crate::gui::sys_fb_info(frame.x[0]) {
+                Ok(()) => (0, 0),
+                Err(e) => (-1, e),
+            }
+        }
+        #[cfg(feature = "qemu-virt")]
+        482 => {
+            // tihkali: gui_fill_rect(x, y, w, h, rgb)
+            match crate::gui::sys_fill_rect(
+                frame.x[0] as u32,
+                frame.x[1] as u32,
+                frame.x[2] as u32,
+                frame.x[3] as u32,
+                frame.x[4] as u32,
+            ) {
+                Ok(()) => (0, 0),
+                Err(e) => (-1, e),
+            }
+        }
+        #[cfg(feature = "qemu-virt")]
+        483 => {
+            // tihkali: gui_blit(src, x, y, w, h, src_stride)
+            match crate::gui::sys_blit(
+                frame.x[0],
+                frame.x[1] as u32,
+                frame.x[2] as u32,
+                frame.x[3] as u32,
+                frame.x[4] as u32,
+                frame.x[5] as u32,
+            ) {
+                Ok(()) => (0, 0),
+                Err(e) => (-1, e),
             }
         }
         #[cfg(feature = "net")]

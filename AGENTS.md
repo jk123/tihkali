@@ -8,7 +8,7 @@ space lives at VA 4 GiB, kernel identity-maps all RAM in every address space).
 ## The one rule
 
 `./tools/check.sh` must exit 0 before calling anything done (0-warning build
-+ 18 scripted QEMU sessions / 127 gates; logs land in
++ 20 scripted QEMU sessions / 150 gates; logs land in
 `/tmp/tihkali-check/*.log`). A
 warning is a failure. Sessions use scripted stdin:
 
@@ -46,6 +46,23 @@ Sessions run **sequentially**; running several `run.sh` at once fails with
 `Failed to get "write" lock` on `target/initramfs.img` and is not a valid
 stress test of the margin.
 
+Two ways to poison a suite run, both of which look like real regressions:
+
+- **A QEMU that survives its session** keeps the initramfs lock, so every
+  *later* session dies instantly with `Failed to get "write" lock` and all
+  its gates fail. `timeout` sends SIGTERM, which QEMU can ignore; kill any
+  leftover by **numeric PID** (`ps -C qemu-system-aarch64 -o pid=`), never
+  `pkill -f` — the pattern matches the invoking shell and hangs it.
+- **Orphaned host helpers.** s13–s17 background a `python3 -m http.server` or
+  a TCP listener. If the suite is interrupted those survive holding ports
+  18081/18083/18086, and the next run's s16/s17 fail on `Connection refused`
+  with an empty log. Check `ps -eo pid,args | grep "[h]ttp.server 180"` before
+  trusting a red run.
+- **Never rebuild while the suite is running** — `run.sh` rebuilds per
+  session, so replacing `target/` mid-run leaves later sessions booting a
+  half-written binary. Build once, then start `check.sh` and leave it alone.
+- Long runs need `setsid nohup ... &` or they die with the agent's shell.
+
 ## Commands
 
 ```sh
@@ -53,12 +70,13 @@ cargo build --release                      # QEMU-virt kernel (default board)
 ./tools/run.sh [args]                      # build + boot virt; --no-drive = embedded initramfs
 ./tools/run.sh --rpi                       # build -p rpi + boot -M raspi3b (kernel8.img)
 cargo build --release --no-default-features --features rpi3   # Pi kernel only
-./tools/fetch-linux-toolchain.sh           # REQUIRED once: build.rs compiles linux/*.c with it
+./tools/fetch-linux-toolchain.sh           # REQUIRED once: build.rs compiles kernel/assets/c/*.c
 ./tools/check.sh                           # full acceptance suite
 ```
 
-- Boards are cargo features: `qemu-virt ⊕ raspi3` (hal selects platform
-  constants, IRQ facade, linker script). Never enable both (compile_error).
+- Boards are cargo features: `qemu-virt ⊕ rpi3` (`kernel/src/hal` selects
+  platform constants, IRQ facade, linker script). Never enable both
+  (compile_error).
 - Extra QEMU args pass through run.sh after `-kernel`; `--rpi`/`--no-drive`
   are consumed by the script, not forwarded.
 
@@ -67,14 +85,14 @@ cargo build --release --no-default-features --features rpi3   # Pi kernel only
 - Nested `cargo build -p tihkali-user` with a **private `--target-dir` under
   OUT_DIR** — same target dir would deadlock on the parent's lock. Do NOT
   "fix" this by building user/ from the shell first; build.rs is self-contained.
-- Compiles `linux/hello.c` with the musl cross gcc → build fails with a
-  pointer to fetch-linux-toolchain.sh if missing.
+- Compiles `kernel/assets/c/hello.c` with the musl cross gcc → build fails
+  with a pointer to fetch-linux-toolchain.sh if missing.
 - Packs `target/initramfs.img` (cpio newc, 64 KiB zero headroom after
   TRAILER!!! — QEMU capacity == file size, headroom is what `sync` writes
   into). The same path is embedded as the no-disk fallback.
-- **Editing any file under user/ or linux/ regenerates the image**, wiping
-  files created by an earlier `sync` run. Two-boot persistence tests require
-  stable sources between runs.
+- **Editing any file under user/ or kernel/assets/c/ regenerates the image**,
+  wiping files created by an earlier `sync` run. Two-boot persistence tests
+  require stable sources between runs.
 
 ## Layout / entrypoints
 
@@ -87,11 +105,74 @@ cargo build --release --no-default-features --features rpi3   # Pi kernel only
   + positive errno); immediate 0 → Linux (`x8` = number, error = `-errno` in
   x0). Numbers differ per ABI (e.g. getpid 20 vs 172, O_CREAT 0x200 vs 0x40 —
   translate in `linux_abi.rs`, never assume Linux values on the NetBSD path).
-- `hal/` board selection: `platform_{virt,raspi}.rs`, `gic.rs` facade.
+- `kernel/src/hal/` board selection: `platform_{virt,raspi}.rs`, `gic.rs`
+  facade. `kprint!`/`kprintln!` are `#[macro_export]`ed (crate root) and
+  reach submodules via `use crate::{kprint, kprintln};` — `#[macro_use]` on
+  `mod hal` does NOT descend into child modules like `arch::trap`.
   Pi has **no GIC**: `gic_rpi::iar()` polls timer/UART; acks are source-side.
 - `user/` = userland (sh, hello, greet) — Rust no_std bins linked at
-  0x100000000; `linux/` = musl C tests linked there too (`-static -no-pie
-  -Wl,-Ttext-segment=0x100000000`; PIE or 0x400000 links are rejected).
+  0x100000000; `kernel/assets/c/` = musl C tests linked there too (`-static
+  -no-pie -Wl,-Ttext-segment=0x100000000`; PIE or 0x400000 links are
+  rejected).
+- **`kernel/src/gui.rs` = the display stack (qemu-virt only).** The framebuffer
+  is QEMU's `ramfb`: no MMIO, virtqueue, IRQ or PCI — the guest hands QEMU a
+  pointer to its own contiguous RAM (`pmm::alloc_contiguous`) through **fw_cfg
+  DMA**, and QEMU maps it as the display surface.
+  - **`-device ramfb` is mandatory** (run.sh adds it; `NO_GUI=1` omits it) and
+    **needs `vgabios-ramfb.bin` in the `-L` datadir** — install it with
+    `tools/fetch-vgabios.sh`, or QEMU aborts at startup. `-machine virt` has
+    **no PL110**, and this QEMU build ships **no virtio-gpu device at all**.
+  - fw_cfg windows: **data base+0, selector base+8, DMA base+16**. All three
+    are `DEVICE_BIG_ENDIAN`: the data port accepts an access **only at offset
+    0** (multi-byte reads must be one access, never `+i`), every value needs
+    `swap_bytes()`, and the DMA trigger store must carry the descriptor
+    address **byte-swapped** or the transfer silently does nothing.
+    `struct fw_cfg_dma_access` field order is **control, length, address**.
+    `struct RAMFBCfg` is **QEMU_PACKED and 28 bytes** — a 32-byte `repr(C)`
+    write is rejected with ERROR.
+  - Syscall door: NetBSD **481** fb_info / **482** fill_rect / **483** blit
+    (Linux **480/481/482**). User space blits *through the kernel* because the
+    user window is only 4 MiB (`user::USER_LIMIT`) and the framebuffer is
+    contiguous physical memory the MMU already identity-maps.
+  - Client is `user/src/gui.rs` → `/bin/gui`; all drawing is user space.
+  - Verify pixels, not just logs: QMP `screendump` writes a **binary PPM
+    (P6)** even if you name the file `.png`.
+- Top level is deliberately flat: 2 workspace crates (`kernel`, `user`) plus
+  `tools/`, `vendor/`. `user/` cannot merge — it needs its own `-T` link
+  script at 0x100000000 vs the kernel's 0x40080000, and rustc-link-arg is
+  package-wide. `vendor/` must sit at the workspace root for
+  `.cargo/config.toml` source replacement.
+
+## DNS (in-kernel resolver)
+
+- `net::resolve(name, timeout_ms)` (`kernel/src/net.rs`) resolves in two
+  steps: **`/etc/hosts` first** (static, no network), then the
+  `nameserver` from **`/etc/resolv.conf`**. Both are BSD-style parsers
+  (`<ip> <name>...`, `nameserver <ip>`, `#` comments); only the first
+  nameserver is used. Missing/unparseable `/etc/resolv.conf` falls back to
+  the built-in 10.0.2.3 (SLIRP). Sources are `kernel/assets/hosts` and
+  `kernel/assets/resolv.conf`, packed to `/etc/` by `kernel/build.rs`.
+- DNS queries go to a scoped `smoltcp::socket::dns::Socket`. Same
+  scoped-socket shape as `dhcp_acquire`: own SocketSet for the call, dropped
+  before returning, so it never eats one of the 8 persistent pool slots.
+- Reached from userland by **Linux syscall 240** (`tihkali_resolve(const
+  char *name, u32 *out_ipv4)`), free on aarch64 Linux. 0 + A record on
+  success, `-EFAULT` (14) for a bad pointer, `-ENOENT` (2) for
+  NXDOMAIN/timeout. `/bin/dnsprobe` exercises it (check.sh session 19).
+- Needs smoltcp feature **`socket-dns`**, not `proto-dns` — the latter only
+  compiles the wire codec; the socket type lives behind `socket-dns`.
+  `DnsQueryType` (not `wire::dns::Type`, which is `pub(crate)`) is the
+  public path.
+- `start_query` needs a `ManagedSlice` with **at least one** slot, else
+  `NoFreeSlot`; `[None; 1]` is the minimal allocation-free form.
+- `get_query_result` **frees the query slot** on completion/failure, so
+  `cancel_query` afterwards would panic on a free slot — only call it on
+  the timeout path (hence the `settled` flag).
+- `ManagedSlice` comes from the `managed` crate directly; smoltcp does not
+  re-export it.
+- The guest's libc resolver is NOT wired to this: busybox is statically
+  linked and its musl resolver is unreachable from here. `wget http://name`
+  will still fail until userland calls door 240 instead.
 
 ## Memory-map facts (easy to get wrong)
 
@@ -117,6 +198,15 @@ only L1[4] (user) + L3s are private per process.
 - `mrs cntp_tval_el0` zero-extends — test expiry as `(tval as i32) < 0`.
 - QEMU virtio-mmio needs `-global virtio-mmio.force-legacy=false` (run.sh
   has it); first device lands on the HIGHEST of 32 slots — always probe all.
+- **A 2 MiB block descriptor's address must be the ALIGNED block base**, not
+  the device address. Devices sharing a block collide (UART0 0x09000000 and
+  fw_cfg 0x09020000 both land in L2 index 72) and the misaligned entry maps
+  nothing, so the access faults as "outside user space".
+- `tools/boot-test.sh` runs one headless session and always reaps QEMU by
+  numeric PID — use it for quick iteration instead of hand-rolling a
+  `(sleep …; printf …) | timeout … run.sh` pipeline, which leaves QEMU
+  holding `target/initramfs.img` when it is killed and makes the *next* run
+  die with `Failed to get "write" lock`.
 - GNU `objcopy` cannot read aarch64 ELF here — use `llvm-objcopy-19`.
 - QEMU's `-nographic` stdio mux swallows piped input; run.sh uses
   `-display none -serial stdio -monitor none` instead.

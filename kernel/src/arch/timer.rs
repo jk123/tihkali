@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tihkali_hal::kprintln;
+use crate::kprintln;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static mut INTERVAL_TICKS: u64 = 0;

@@ -6,8 +6,8 @@ license.workspace = true
 
 [features]
 default = ["qemu-virt", "net"]
-qemu-virt = ["tihkali-hal/qemu-virt"]
-rpi3 = ["tihkali-hal/raspi3"]
+qemu-virt = []
+rpi3 = []
 net = ["dep:smoltcp"]
 
 [[bin]]
@@ -15,7 +15,7 @@ name = "tihkali"
 path = "src/main.rs"
 
 [dependencies]
-tihkali-hal = { path = "../hal", default-features = false }
+managed = { version = "0.8", default-features = false }
 smoltcp = { version = "0.12", default-features = false, optional = true, features = [
     "medium-ethernet",
     "proto-ipv4",
@@ -23,4 +23,5 @@ smoltcp = { version = "0.12", default-features = false, optional = true, feature
     "socket-udp",
     "socket-tcp",
     "socket-dhcpv4",
+    "socket-dns",
 ] }
