@@ -24,12 +24,22 @@ TARBALL="$DEST/aarch64-linux-musl-cross.tgz"
 
 fetch_musl_cc() {
     if [ ! -f "$TARBALL" ]; then
+        # Probe first with a short timeout. On a blocked network the
+        # --retry loop costs ~9 minutes of 133s timeouts before giving
+        # up, which would blow the job budget before the fallback runs.
+        if ! curl -fsS --connect-timeout 10 --max-time 20 -o /dev/null \
+             https://musl.cc/ 2>/dev/null; then
+            echo "musl.cc unreachable (connect timeout)" >&2
+            return 1
+        fi
         echo "downloading https://musl.cc/aarch64-linux-musl-cross.tgz ..."
-        curl -fL --retry 3 -o "$TARBALL" https://musl.cc/aarch64-linux-musl-cross.tgz
+        curl -fL --retry 2 -o "$TARBALL" \
+            https://musl.cc/aarch64-linux-musl-cross.tgz || return 1
     fi
     echo "extracting into $DEST ..."
-    tar -xzf "$TARBALL" -C "$DEST"
+    tar -xzf "$TARBALL" -C "$DEST" || return 1
     rm -f "$TARBALL"
+    [ -x "$BIN" ]
 }
 
 # Fallback for hosts that cannot reach musl.cc. Ubuntu ships the gcc
@@ -52,10 +62,17 @@ WRAP
     chmod +x "$dir/bin/aarch64-linux-musl-gcc"
 }
 
-# Short timeout first: on a blocked network every --retry costs minutes.
-if ! fetch_musl_cc; then
+# `set +e` around the attempt: with `set -e` active, a failure inside a
+# function exits the shell immediately even when the function is the
+# condition of `if !`, so the fallback would never run. Every step in
+# the function returns non-zero explicitly instead.
+set +e
+fetch_musl_cc
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
     rm -f "$TARBALL"
-    echo "musl.cc unreachable; using the Ubuntu fallback" >&2
+    echo "musl.cc unavailable; using the Ubuntu fallback" >&2
     fetch_ubuntu
 fi
 
