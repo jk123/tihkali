@@ -20,6 +20,7 @@ mod fs;
 mod fb;
 mod kmem;
 mod linux_abi;
+mod netbsd_abi;
 #[cfg(feature = "net")]
 mod net;
 mod mm;

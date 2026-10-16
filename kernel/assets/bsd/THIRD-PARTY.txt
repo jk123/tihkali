@@ -1,0 +1,65 @@
+Third-party code vendored into tihkali
+======================================
+
+This product includes software developed for the NetBSD Project by
+Christopher G. Demetriou.
+
+
+syscalls.master
+---------------
+
+  Path:    kernel/assets/bsd/syscalls.master
+  Source:  NetBSD/src, sys/kern/syscalls.master, v1.316 (2024/10/09)
+  Upstream: https://github.com/NetBSD/src/blob/trunk/sys/kern/syscalls.master
+  License: BSD 4-clause, Copyright (c) 1994, 1996, 2000
+           Christopher G. Demetriou. All rights reserved.
+
+Full license text, as shipped in NetBSD's sys/kern/makesyscalls.sh:
+
+  Copyright (c) 1994, 1996, 2000 Christopher G. Demetriou
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+  3. All advertising materials mentioning features or use of this software
+     must display the following acknowledgement:
+       This product includes software developed for the NetBSD Project
+       by Christopher G. Demetriou.
+  4. The name of the author may not be used to endorse or promote products
+     derived from this software without specific prior written permission
+
+  THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Note on clause 3: the ad-material clause is why the acknowledgement at the
+top of this file exists. It is also why the resolver was NOT vendored --
+NetBSD's lib/libc/resolv/res_send.c is 3-clause and pulls a userspace
+socket layer we do not have.
+
+Why this file is vendored rather than transcribed by hand: it is the
+authoritative source for NetBSD syscall numbering, including the compat_09
+through compat_110 layers. Re-deriving those numbers by hand is how the
+wrong number silently ends up dispatched.
+
+
+Generated code
+--------------
+
+kernel/build.rs parses syscalls.master at build time and emits
+$SYSNAME constants. The generated Rust carries the NetBSD CVS id
+(syscalls.master,v 1.316) in a doc comment on each constant block so the
+provenance of every number stays traceable to its upstream revision.

@@ -27,9 +27,12 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/resolv.conf");
     println!("cargo:rerun-if-changed=assets/hosts");
 
+    // NetBSD syscall numbers, generated from the upstream master table.
+    let out = std::env::var("OUT_DIR").unwrap();
+    gen_netbsd_syscall_table(&dir, &out);
+
     // Build the user programs into a private target dir (nested cargo
     // would deadlock on the parent's target-dir lock, hence OUT_DIR/user).
-    let out = std::env::var("OUT_DIR").unwrap();
     let target_dir = std::path::Path::new(&out).join("user-target");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(&cargo)
@@ -345,4 +348,125 @@ fn write_newc(out: &mut Vec<u8>, ino: u32, mode: u32, name: &str, data: &[u8], m
     while out.len() % 4 != 0 {
         out.push(0);
     }
+}
+
+/// Generate `$SYSNAME` constants for the NetBSD personality from NetBSD's
+/// own `sys/kern/syscalls.master`, the same file NetBSD's `makesyscalls.sh`
+/// consumes. Hand-transcribing the numbers would silently diverge from the
+/// compat_09..compat_110 layers; generating them keeps every dispatched
+/// number traceable to its upstream revision.
+///
+/// The table is BSD 4-clause (Christoph Demetriou, 1994/1996/2000); its
+/// attribution lives in assets/bsd/THIRD-PARTY.txt.
+fn gen_netbsd_syscall_table(dir: &str, out: &str) {
+    let master = std::path::Path::new(dir).join("assets/bsd/syscalls.master");
+    println!("cargo:rerun-if-changed=assets/bsd/syscalls.master");
+    let text = std::fs::read_to_string(&master)
+        .unwrap_or_else(|e| panic!("read {}: {e}", master.display()));
+
+    // Keep the CVS id so every generated number carries its provenance.
+    let cvs = text
+        .lines()
+        .find(|l| l.contains("NetBSD:") && l.contains("syscalls.master"))
+        .unwrap_or("unknown revision")
+        .trim()
+        .to_string();
+
+    let mut out_rs = String::new();
+    // `#![allow]` must precede every item, so it goes first.
+    out_rs.push_str("// @generated from kernel/assets/bsd/syscalls.master\n");
+    out_rs.push_str(&format!("// upstream: {cvs}\n"));
+    out_rs.push_str(
+        "//\n// NetBSD BSD 4-clause; attribution in kernel/assets/bsd/THIRD-PARTY.txt.\n\
+         // Do not edit -- regenerate via build.rs.\n\n\
+         pub mod nr {\n",
+    );
+
+    let mut count = 0usize;
+    // A name can recur across compat layers (getsockname, setrlimit and
+    // reboot all do). First definition wins the bare name; later ones get a
+    // numeric suffix so nothing is silently dropped.
+    let mut seen: Vec<String> = Vec::new();
+    // Entries wrap with a trailing backslash, so join continuations before
+    // parsing or every wrapped prototype is silently skipped.
+    let mut joined: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for raw in text.lines() {
+        let l = raw.trim_end();
+        if let Some(head) = l.strip_suffix('\\') {
+            pending.push_str(head);
+            pending.push(' ');
+        } else {
+            // Continuation and its terminator form ONE entry: joining must
+            // concatenate, not push two elements (splitting them loses the
+            // prototype that carries the syscall name).
+            let joined_line = std::mem::take(&mut pending);
+            joined.push(format!("{joined_line}{l}"));
+        }
+    }
+    joined.push(pending);
+    for line in joined.iter().map(|s| s.as_str()) {
+        // Entries look like:  <number>\t<TYPE>\t... { <ret>|sys||<name>(...); }
+        // but compat entries carry a revision field too:
+        //   293 STD  { int|sys|14|sigprocmask(...); }
+        // so the name is the token after the LAST "|" that precedes it,
+        // not blindly the second "||" field. Skip comments, blanks, and
+        // the C preamble above the first numbered entry.
+        let mut it = line.splitn(2, '\t');
+        let Some(num) = it.next() else { continue };
+        let Some(rest) = it.next() else { continue };
+        let num: u32 = match num.trim().parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Take the identifier immediately before the first '(' in the
+        // prototype, e.g. "{ int|sys|14|sigprocmask(int how, ...); }"
+        // yields "sigprocmask".
+        let name = rest
+            .split_once('{')
+            .map(|(_, proto)| proto)
+            .unwrap_or(rest)
+            .split_once('(')
+            .map(|(head, _)| head)
+            .unwrap_or("")
+            .rsplit('|')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let base: &str = &name;
+        let name = if seen.iter().any(|s| s == base) {
+            let mut n = 2;
+            loop {
+                let cand = format!("{base}__{n}");
+                if !seen.iter().any(|s| *s == cand) {
+                    break cand;
+                }
+                n += 1;
+            }
+        } else {
+            base.to_string()
+        };
+        seen.push(name.clone());
+        // syscalls.master names are lowercase (NetBSD's own convention);
+        // emit SCREAMING_CASE to match this tree's constants and avoid
+        // non_upper_case_globals, which is a warning here.
+        let ident = name.to_uppercase();
+        // Keep the upstream spelling in the doc comment: the constant is
+        // SCREAMING_CASE, but the number must stay traceable to the row in
+        // syscalls.master that produced it.
+        out_rs.push_str(&format!(
+            "    /// NetBSD `{name}`.\n    pub const {ident}: u16 = {num};\n"
+        ));
+        count += 1;
+    }
+    out_rs.push_str("}\n");
+
+    let dest = std::path::Path::new(out).join("netbsd_syscall_table.rs");
+    std::fs::write(&dest, out_rs)
+        .unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    println!("cargo:rustc-env=NETBSD_SYSCALL_COUNT={count}");
 }
