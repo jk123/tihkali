@@ -196,6 +196,44 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             Ok(()) => (0, 0),
             Err(e) => (-1, e),
         },
+        // --- memory ---
+        //
+        // NetBSD's mmap takes SEVEN register slots, not Linux's six:
+        //   mmap(void *addr, size_t len, int prot, int flags,
+        //        int fd, long PAD, off_t pos)
+        // x5 is a padding word and x6 is the offset, so `pos` is NOT x5
+        // the way Linux has it. Anonymous mappings only (v1), same as the
+        // Linux arm: no fd, no file backing, no MAP_FIXED.
+        //
+        // MAP_ANONYMOUS is 0x1000 on NetBSD (sys/mman.h) -- NOT the Linux
+        // 0x20. Using the Linux value here rejects every mmap outright.
+        nbsys::MMAP__2 => {
+            const MAP_ANON_N: u64 = 0x1000;
+            if frame.x[3] & MAP_ANON_N == 0 {
+                (-1, 78) // ENOSYS: file-backed mmap is not implemented
+            } else if frame.x[0] != 0 {
+                (-1, 22) // EINVAL: MAP_FIXED-style hint requests unsupported
+            } else {
+                match crate::proc::sys_mmap(frame.x[1]) {
+                    Ok(base) => (base as i64, 0),
+                    Err(e) => (-1, e),
+                }
+            }
+        }
+        nbsys::MUNMAP => match crate::proc::sys_munmap(frame.x[0], frame.x[1]) {
+            Ok(()) => (0, 0),
+            Err(e) => (-1, e),
+        },
+        nbsys::MPROTECT => {
+            // prot is a NetBSD PROT_* bitmask; PROT_NONE is 0 and clears
+            // everything, which vm::set_perms already handles.
+            match crate::proc::sys_mprotect(frame.x[0], frame.x[1], frame.x[2]) {
+                Ok(()) => (0, 0),
+                Err(e) => (-1, e),
+            }
+        }
+        nbsys::MADVISE => (0, 0), // advice-only; always succeeds
+        nbsys::MSYNC => (0, 0),  // no swap, nothing to write back
         nbsys::MKDIR => {
             // SYS_mkdir(path, mode)
             match crate::proc::read_user_cstr(frame.x[0], 128) {

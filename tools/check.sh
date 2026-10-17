@@ -495,6 +495,31 @@ gate_count "s20: no ENOSYS"          "$S20" 'ENOSYS' 0
 gate_has   "s20: clean exit"         "$S20" 'proc: pid 0 exited \(0\)'
 gate_bad   "s20" "$S20"
 
+echo "== session 21: NetBSD memory syscalls (mmap/mprotect/munmap)"
+S21="$T/s21.log"
+# NetBSD's mmap takes a PAD word at x5, so a Linux-ABI order would read
+# the offset out of the pad -- /bin/memtest calls it the NetBSD way and
+# fails if the kernel dispatched the Linux register layout.
+( sleep 5
+  printf 'memtest\n'; sleep 3
+  printf 'exit\n'; sleep 3
+) | timeout 24 ./tools/run.sh >"$S21" 2>&1
+gate_has   "s21: mmap anon"        "$S21" 'memtest: ok   mmap anon'
+gate_has   "s21: mmap aligned"     "$S21" 'memtest: ok   mmap page aligned'
+gate_has   "s21: mmap writable"    "$S21" 'memtest: ok   mmap writable'
+gate_has   "s21: mprotect none"    "$S21" 'memtest: ok   mprotect none'
+gate_has   "s21: mprotect restore" "$S21" 'memtest: ok   mprotect restore'
+gate_has   "s21: madvise"          "$S21" 'memtest: ok   madvise'
+gate_has   "s21: msync"            "$S21" 'memtest: ok   msync'
+gate_has   "s21: munmap"           "$S21" 'memtest: ok   munmap$'
+gate_has   "s21: munmap unaligned" "$S21" 'memtest: ok   munmap rejects unaligned'
+gate_has   "s21: all ok"           "$S21" 'memtest: all ok'
+gate_has   "s21: exit 0"           "$S21" 'sh: memtest exited 0'
+gate_count "s21: no ENOSYS"        "$S21" 'ENOSYS' 0
+gate_count "s21: no panic"         "$S21" 'panic' 0
+gate_has   "s21: clean exit"       "$S21" 'proc: pid 0 exited \(0\)'
+gate_bad   "s21" "$S21"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"
