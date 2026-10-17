@@ -247,10 +247,13 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             match crate::proc::read_user_cstr(frame.x[0], 128) {
                 None => (-1, 14), // EFAULT
                 Some(path) => {
+                    // A relative path resolves against the cwd; before
+                    // chdir existed this was passed through raw.
+                    let abs = crate::proc::abspath(&path);
                     let idx = if follow {
-                        crate::fs::lookup(&path)
+                        crate::fs::lookup(&abs)
                     } else {
-                        crate::fs::lookup_nofollow(&path)
+                        crate::fs::lookup_nofollow(&abs)
                     };
                     match idx {
                         None => (-1, crate::file::ENOENT),
@@ -288,7 +291,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             // short buffer truncates rather than failing.
             match crate::proc::read_user_cstr(frame.x[0], 128) {
                 None => (-1, 14),
-                Some(path) => match crate::fs::lookup_nofollow(&path) {
+                Some(path) => match crate::fs::lookup_nofollow(&crate::proc::abspath(&path)) {
                     None => (-1, crate::file::ENOENT),
                     Some(idx) => {
                         if !crate::fs::is_symlink(idx) {
@@ -479,12 +482,91 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 _ => (-1, 22), // EINVAL: unknown command
             }
         }
+        // --- working directory and path operations ---
+        //
+        // NetBSD has no plain `getcwd`: the call was folded into the
+        // compat-only __getcwd (296). Both numbers dispatch the same
+        // body, so either spelling works.
+        nbsys::__GETCWD => {
+            // SYS___getcwd(bufp, length). POSIX truncation semantics: if
+            // the buffer is too small return ERANGE, and do NOT write a
+            // partial path -- a caller that ignores the error would
+            // otherwise act on half a path.
+            let len = frame.x[1] as usize;
+            let cwd = crate::proc::cwd();
+            // +1 for the NUL, which getcwd must include in the length.
+            if len <= cwd.len() {
+                (-1, 34) // ERANGE
+            } else if !crate::proc::user_range_ok(frame.x[0], cwd.len() + 1) {
+                (-1, 14)
+            } else {
+                unsafe {
+                    let p = frame.x[0] as *mut u8;
+                    core::ptr::copy_nonoverlapping(cwd.as_ptr(), p, cwd.len());
+                    p.add(cwd.len()).write(0);
+                }
+                (cwd.len() as i64 + 1, 0)
+            }
+        }
+        nbsys::CHDIR => {
+            // SYS_chdir(path): must name a directory.
+            match crate::proc::read_user_cstr(frame.x[0], 128) {
+                None => (-1, 14),
+                Some(path) => {
+                    let abs = crate::proc::abspath(&path);
+                    match crate::fs::lookup(&abs) {
+                        None => (-1, crate::file::ENOENT),
+                        Some(idx) => {
+                            if !crate::fs::is_dir(idx) {
+                                (-1, crate::file::ENOTDIR)
+                            } else {
+                                crate::proc::set_cwd(&abs);
+                                (0, 0)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        nbsys::RENAME => {
+            // SYS_rename(from, to). Both resolve against the cwd; the
+            // NetBSD signature carries no dirfd.
+            match crate::proc::read_user_cstr(frame.x[0], 128) {
+                None => (-1, 14),
+                Some(from) => match crate::proc::read_user_cstr(frame.x[1], 128) {
+                    None => (-1, 14),
+                    Some(to) => {
+                        match crate::fs::rename(
+                            &crate::proc::abspath(&from),
+                            &crate::proc::abspath(&to),
+                        ) {
+                            Ok(()) => (0, 0),
+                            Err(e) => (-1, e),
+                        }
+                    }
+                },
+            }
+        }
+        nbsys::CHMOD => {
+            // SYS_chmod(path, mode). Only permission bits are stored; the
+            // S_IF* type bits in `mode` are ignored, as POSIX requires.
+            match crate::proc::read_user_cstr(frame.x[0], 128) {
+                None => (-1, 14),
+                Some(path) => match crate::fs::lookup(&crate::proc::abspath(&path)) {
+                    None => (-1, crate::file::ENOENT),
+                    Some(idx) => match crate::fs::set_mode(idx, frame.x[1] as u16) {
+                        Ok(()) => (0, 0),
+                        Err(e) => (-1, e),
+                    },
+                },
+            }
+        }
         nbsys::ACCESS => {
             // SYS_access(path, mode): the fs is a readable initramfs, so
             // mode is advisory -- existence is the only real question.
             match crate::proc::read_user_cstr(frame.x[0], 128) {
                 None => (-1, 14),
-                Some(path) => match crate::fs::lookup(&path) {
+                Some(path) => match crate::fs::lookup(&crate::proc::abspath(&path)) {
                     None => (-1, crate::file::ENOENT),
                     Some(_) => (0, 0),
                 },

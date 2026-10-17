@@ -24,6 +24,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../user/src/statprobe.rs");
     println!("cargo:rerun-if-changed=../user/src/iovtest.rs");
     println!("cargo:rerun-if-changed=../user/src/fdtest.rs");
+    println!("cargo:rerun-if-changed=../user/src/pathtest.rs");
     println!("cargo:rerun-if-changed=../user/src/gui.rs");
     println!("cargo:rerun-if-changed=../user/user.ld");
     println!("cargo:rerun-if-changed=assets/motd");
@@ -67,8 +68,9 @@ fn main() {
     let statprobe = bindir.join("tihkali-statprobe");
     let iovtest = bindir.join("tihkali-iovtest");
     let fdtest = bindir.join("tihkali-fdtest");
+    let pathtest = bindir.join("tihkali-pathtest");
     let gui = bindir.join("tihkali-gui");
-    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt, &dnsprobe, &memtest, &statprobe, &iovtest, &fdtest, &gui] {
+    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt, &dnsprobe, &memtest, &statprobe, &iovtest, &fdtest, &pathtest, &gui] {
         assert!(p.exists(), "user binary not produced at {}", p.display());
     }
     // Still used by main.rs until M4 switches pid0/exec to the VFS.
@@ -223,6 +225,7 @@ fn main() {
     let statprobe_bytes = std::fs::read(&statprobe).expect("read tihkali-statprobe");
     let iovtest_bytes = std::fs::read(&iovtest).expect("read tihkali-iovtest");
     let fdtest_bytes = std::fs::read(&fdtest).expect("read tihkali-fdtest");
+    let pathtest_bytes = std::fs::read(&pathtest).expect("read tihkali-pathtest");
     let gui_bytes = std::fs::read(&gui).expect("read tihkali-gui");
     let linux_bytes = std::fs::read(&linux_out).expect("read linux-hello");
     let probe_bytes = std::fs::read(&probe_out).expect("read linux-probe");
@@ -251,6 +254,7 @@ fn main() {
         CpioEntry::file("bin/statprobe", &statprobe_bytes),
         CpioEntry::file("bin/iovtest", &iovtest_bytes),
         CpioEntry::file("bin/fdtest", &fdtest_bytes),
+        CpioEntry::file("bin/pathtest", &pathtest_bytes),
         CpioEntry::file("bin/gui", &gui_bytes),
         CpioEntry::file("bin/linux-hello", &linux_bytes),
         CpioEntry::file("bin/linux-probe", &probe_bytes),

@@ -611,6 +611,37 @@ gate_count "s24: no unknown syscall" "$S24" 'unknown syscall' 0
 gate_has   "s24: clean exit"        "$S24" 'proc: pid 0 exited \(0\)'
 gate_bad   "s24" "$S24"
 
+echo "== session 25: NetBSD path calls (getcwd/chdir/rename/chmod)"
+S25="$T/s25.log"
+# These four interact: chdir moves the cwd, and getcwd/stat/rename
+# either report it or resolve relative names against it. A getcwd that
+# ignored chdir, or a rename that resolved against "/", passes in
+# isolation and fails here.
+( sleep 5
+  printf 'pathtest\n'; sleep 5
+  printf 'exit\n'; sleep 3
+) | timeout 28 ./tools/run.sh >"$S25" 2>&1
+gate_has   "s25: getcwd is /"       "$S25" 'pathctl: ok   getcwd is /'
+gate_has   "s25: getcwd NUL len"    "$S25" 'pathctl: ok   getcwd len has NUL'
+gate_has   "s25: getcwd ERANGE"     "$S25" 'pathctl: ok   getcwd ERANGE'
+gate_has   "s25: getcwd follows"    "$S25" 'pathctl: ok   getcwd tracks chdir'
+gate_has   "s25: relative stat"     "$S25" 'pathctl: ok   relative stat uses cwd'
+gate_has   "s25: relative tracks"   "$S25" 'pathctl: ok   relative stat follows cwd'
+gate_has   "s25: .. normalizes"     "$S25" 'pathctl: ok   chdir normalizes ..'
+gate_has   "s25: clamps at root"    "$S25" 'pathctl: ok   chdir clamps at root'
+gate_has   "s25: chdir ENOTDIR"     "$S25" 'pathctl: ok   chdir ENOTDIR'
+gate_has   "s25: chmod in stat"     "$S25" 'pathctl: ok   chmod visible in stat'
+gate_has   "s25: chmod restored"    "$S25" 'pathctl: ok   chmod restored'
+gate_has   "s25: rename relative"   "$S25" 'pathctl: ok   rename relative'
+gate_has   "s25: rename moved it"   "$S25" 'pathctl: ok   old name gone'
+gate_has   "s25: rename ENOENT"     "$S25" 'pathctl: ok   rename ENOENT'
+gate_has   "s25: all ok"            "$S25" 'pathctl: all ok'
+gate_has   "s25: exit 0"            "$S25" 'sh: pathtest exited 0'
+gate_count "s25: no panic"          "$S25" 'panic' 0
+gate_count "s25: no unknown syscall" "$S25" 'unknown syscall' 0
+gate_has   "s25: clean exit"        "$S25" 'proc: pid 0 exited \(0\)'
+gate_bad   "s25" "$S25"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

@@ -66,6 +66,9 @@ pub struct Process {
     pub tables: Vec<usize>,
     /// fd table: 0 = stdin (tty), 1/2 = stdout/stderr (tty), 3+ = files.
     pub fds: Vec<Option<FdTarget>>,
+    /// Working directory, always absolute and normalized. Relative paths
+    /// resolve against it; getcwd reports it.
+    pub cwd: String,
     /// Pending signal bitmask (bit N = signal N).
     pub pending: u64,
     /// Disposition per signal: 0 = SIG_DFL, 1 = SIG_IGN, else handler address.
@@ -183,6 +186,7 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
             Some(FdTarget::TtyOut),
             Some(FdTarget::TtyOut),
         ],
+        cwd: String::from("/"),
         pending: 0,
         handlers: [SIG_DFL; NSIG],
         signaled: false,
@@ -495,6 +499,7 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         sp_el0: child_sp_el0,
         tables: child_tables,
         fds,
+        cwd: t[cur].as_ref().unwrap().cwd.clone(),
         pending: 0,
         handlers,
         signaled: false,
@@ -1692,4 +1697,55 @@ pub fn current_ppid() -> i64 {
         }
         _ => 0,
     }
+}
+
+/// The current process's working directory. Always absolute.
+pub fn cwd() -> String {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    table()[cur].as_ref().map(|p| p.cwd.clone()).unwrap_or_else(|| String::from("/"))
+}
+
+/// Set the working directory. `path` must already be absolute+normalized.
+pub fn set_cwd(path: &str) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if let Some(p) = table()[cur].as_mut() {
+        p.cwd = String::from(path);
+    }
+}
+
+/// Make `path` absolute against the working directory, and normalize it.
+///
+/// A relative path is joined onto `cwd`; `.` components are dropped and
+/// `..` pops one. Going above `/` clamps to `/` rather than escaping, so
+/// `../../..` from anywhere is `/`.
+pub fn abspath(path: &str) -> String {
+    let joined = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        let mut s = cwd();
+        if !s.ends_with('/') {
+            s.push('/');
+        }
+        s.push_str(path);
+        s
+    };
+    let mut out: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            p => out.push(p),
+        }
+    }
+    let mut r = String::from("/");
+    for p in out {
+        r.push_str(p);
+        r.push('/');
+    }
+    if r.len() > 1 && r.ends_with('/') {
+        r.pop();
+    }
+    r
 }
