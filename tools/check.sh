@@ -522,6 +522,37 @@ gate_count "s21: no panic"         "$S21" 'panic' 0
 gate_has   "s21: clean exit"       "$S21" 'proc: pid 0 exited \(0\)'
 gate_bad   "s21" "$S21"
 
+echo "== session 22: NetBSD metadata + time syscalls (stat/lseek/clock)"
+S22="$T/s22.log"
+# /bin/statprobe asserts on struct stat *values* (S_IFREG vs S_IFDIR, a
+# real st_size, S_IFLNK from lstat), not on the calls returning 0. A
+# Linux-shaped stat writer would pass the return-value checks and fail
+# every field check.
+( sleep 5
+  printf 'statprobe\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 25 ./tools/run.sh >"$S22" 2>&1
+gate_has   "s22: stat regular file"  "$S22" 'stat: ok   stat regular file'
+gate_has   "s22: stat size"          "$S22" 'stat: ok   stat size is 4 octets'
+gate_has   "s22: stat dir"           "$S22" 'stat: ok   stat dir is S_IFDIR'
+gate_has   "s22: stat follows link"  "$S22" 'stat: ok   stat follows symlink'
+gate_has   "s22: lstat S_IFLNK"      "$S22" 'stat: ok   lstat sees S_IFLNK'
+gate_has   "s22: readlink target"    "$S22" 'stat: ok   readlink target'
+gate_has   "s22: readlink EINVAL"    "$S22" 'stat: ok   readlink EINVAL on file'
+gate_has   "s22: lseek end"          "$S22" 'stat: ok   lseek end matches size'
+gate_has   "s22: read after seek"    "$S22" 'stat: ok   read after seek'
+gate_has   "s22: access ENOENT"      "$S22" 'stat: ok   access missing ENOENT'
+gate_has   "s22: getuid"             "$S22" 'stat: ok   getuid 0'
+gate_has   "s22: clock realtime"     "$S22" 'stat: ok   realtime after 2023'
+gate_has   "s22: gettimeofday"       "$S22" 'stat: ok   gettimeofday'
+gate_has   "s22: nanosleep"          "$S22" 'stat: ok   nanosleep 0.05s'
+gate_has   "s22: all ok"             "$S22" 'stat: all ok'
+gate_has   "s22: exit 0"             "$S22" 'sh: statprobe exited 0'
+gate_count "s22: no panic"           "$S22" 'panic' 0
+gate_count "s22: no unknown syscall" "$S22" 'unknown syscall' 0
+gate_has   "s22: clean exit"         "$S22" 'proc: pid 0 exited \(0\)'
+gate_bad   "s22" "$S22"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

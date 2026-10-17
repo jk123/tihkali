@@ -234,6 +234,162 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         }
         nbsys::MADVISE => (0, 0), // advice-only; always succeeds
         nbsys::MSYNC => (0, 0),  // no swap, nothing to write back
+        // --- file metadata ---
+        //
+        // NetBSD's struct stat is 152 bytes with st_size at offset 112;
+        // the Linux one is 128 bytes with st_size at 48. The writer in
+        // netbsd_abi::write_stat_node carries the verified offsets --
+        // do not reuse the Linux fill_stat here.
+        nbsys::STAT | nbsys::LSTAT => {
+            // SYS_stat(path, buf) / SYS_lstat(path, buf)
+            // lstat does not follow a final symlink; stat does.
+            let follow = imm == nbsys::STAT as u64;
+            match crate::proc::read_user_cstr(frame.x[0], 128) {
+                None => (-1, 14), // EFAULT
+                Some(path) => {
+                    let idx = if follow {
+                        crate::fs::lookup(&path)
+                    } else {
+                        crate::fs::lookup_nofollow(&path)
+                    };
+                    match idx {
+                        None => (-1, crate::file::ENOENT),
+                        Some(i) => match crate::netbsd_abi::write_stat_node(frame.x[1], i) {
+                            Ok(()) => (0, 0),
+                            Err(e) => (-1, e),
+                        },
+                    }
+                }
+            }
+        }
+        nbsys::FSTAT => {
+            // SYS_fstat(fd, buf)
+            match crate::netbsd_abi::write_stat_fd(frame.x[1], frame.x[0] as usize) {
+                Ok(()) => (0, 0),
+                Err(e) => (-1, e),
+            }
+        }
+        nbsys::LSEEK => {
+            // SYS_lseek(fd, offset, whence). file::lseek indexes the open-
+            // file TABLE, so it wants the table index, not the node index
+            // node_of_fd returns -- passing the node panics.
+            match crate::proc::current_target(frame.x[0] as usize) {
+                Some(crate::file::FdTarget::File(i)) => {
+                    match crate::file::lseek(i, frame.x[1] as i64, frame.x[2] as u32) {
+                        Ok(off) => (off, 0),
+                        Err(e) => (-1, e),
+                    }
+                }
+                _ => (-1, crate::file::EBADF),
+            }
+        }
+        nbsys::READLINK => {
+            // SYS_readlink(path, buf, bufsiz): no NUL appended, and a
+            // short buffer truncates rather than failing.
+            match crate::proc::read_user_cstr(frame.x[0], 128) {
+                None => (-1, 14),
+                Some(path) => match crate::fs::lookup_nofollow(&path) {
+                    None => (-1, crate::file::ENOENT),
+                    Some(idx) => {
+                        if !crate::fs::is_symlink(idx) {
+                            (-1, crate::file::EINVAL) // EINVAL on non-symlink
+                        } else {
+                            let bufsiz = frame.x[2] as usize;
+                            match crate::fs::with_bytes(idx, |b: &[u8]| {
+                                let n = b.len().min(bufsiz);
+                                if n > 0 {
+                                    if !crate::proc::user_range_ok(frame.x[1], n) {
+                                        return None;
+                                    }
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            b.as_ptr(),
+                                            frame.x[1] as *mut u8,
+                                            n,
+                                        );
+                                    }
+                                }
+                                Some(n)
+                            }) {
+                                None => (-1, 14),
+                                Some(n) => (n as i64, 0),
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        nbsys::GETPAGESIZE => (4096, 0),
+        nbsys::ACCESS => {
+            // SYS_access(path, mode): the fs is a readable initramfs, so
+            // mode is advisory -- existence is the only real question.
+            match crate::proc::read_user_cstr(frame.x[0], 128) {
+                None => (-1, 14),
+                Some(path) => match crate::fs::lookup(&path) {
+                    None => (-1, crate::file::ENOENT),
+                    Some(_) => (0, 0),
+                },
+            }
+        }
+        // --- process / credential ---
+        //
+        // NetBSD merges these into single numbered calls: getuid+geteuid
+        // share 24 and getgid+getegid share 47, exactly as getpid+getppid
+        // share 20. Single user, so both return 0.
+        nbsys::GETUID_WITH_EUID => (0, 0),
+        nbsys::GETGID_WITH_EGID => (0, 0),
+        nbsys::UMASK => (0, 0), // never changes
+        // --- time ---
+        //
+        // NetBSD's timeval and timespec are both { long, long } on aarch64,
+        // identical to Linux's, so only the syscall numbers differ.
+        nbsys::GETTIMEOFDAY => {
+            // SYS_gettimeofday(tv, tz): tv is required, tz never written.
+            if frame.x[0] == 0 {
+                (-1, 22) // EINVAL
+            } else if !crate::proc::user_range_ok(frame.x[0], 16) {
+                (-1, 14)
+            } else {
+                let (mut sec, nsec) = crate::linux_abi::now_parts();
+                sec += 1_700_000_000;
+                unsafe {
+                    let p = frame.x[0] as *mut i64;
+                    p.write_unaligned(sec);
+                    p.add(1).write_unaligned(nsec / 1000); // timeval is usec
+                }
+                (0, 0)
+            }
+        }
+        nbsys::CLOCK_GETTIME => {
+            // SYS_clock_gettime(clockid, tp): REALTIME(0) and MONOTONIC(1).
+            let id = frame.x[0] as i64;
+            if id > 1 {
+                (-1, 22) // EINVAL
+            } else if !crate::proc::user_range_ok(frame.x[1], 16) {
+                (-1, 14)
+            } else {
+                let (mut sec, nsec) = crate::linux_abi::now_parts();
+                if id == 0 {
+                    sec += 1_700_000_000;
+                }
+                unsafe {
+                    let p = frame.x[1] as *mut i64;
+                    p.write_unaligned(sec);
+                    p.add(1).write_unaligned(nsec);
+                }
+                (0, 0)
+            }
+        }
+        nbsys::NANOSLEEP => {
+            // SYS_nanosleep(req, rem): relative sleep with EINTR on signal.
+            // Same deadline machinery as the Linux arm -- the process is
+            // parked, not spun, so a signal can still interrupt it.
+            match crate::linux_abi::nanosleep_netbsd(frame, frame.x[0], frame.x[1]) {
+                crate::proc::Io::Val(n) => (n, 0),
+                crate::proc::Io::Err(e) => (-1, e),
+                crate::proc::Io::Slept => return,
+            }
+        }
         nbsys::MKDIR => {
             // SYS_mkdir(path, mode)
             match crate::proc::read_user_cstr(frame.x[0], 128) {

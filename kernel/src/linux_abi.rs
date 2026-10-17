@@ -1089,6 +1089,14 @@ fn nanosleep(frame: &mut TrapFrame, req: u64, rem: u64) -> Io {
     }
 }
 
+/// The NetBSD personality's nanosleep. Identical to the Linux one — the
+/// request/remainder structs match and the deadline machinery is shared.
+/// Present so the NetBSD table does not have to reach into this module's
+/// private helpers.
+pub(crate) fn nanosleep_netbsd(frame: &mut TrapFrame, req: u64, rem: u64) -> Io {
+    nanosleep(frame, req, rem)
+}
+
 /// Report remaining time to the caller on EINTR (best effort).
 fn write_rem(rem: u64, sec: i64, nsec: i64) {
     if rem == 0 || !proc::user_range_ok(rem, 16) {
@@ -1638,7 +1646,7 @@ fn ioctl(fd: usize, cmd: u64, arg: u64) -> (i64, u8) {
     }
 }
 
-fn now_parts() -> (i64, i64) {
+pub(crate) fn now_parts() -> (i64, i64) {
     let (ticks, freq): (u64, u64);
     unsafe {
         core::arch::asm!("mrs {}, cntpct_el0", out(reg) ticks, options(nomem, nostack));

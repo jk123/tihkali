@@ -43,3 +43,7 @@ path = "src/dnsprobe.rs"
 [[bin]]
 name = "tihkali-memtest"
 path = "src/memtest.rs"
+
+[[bin]]
+name = "tihkali-statprobe"
+path = "src/statprobe.rs"
