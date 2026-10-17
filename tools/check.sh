@@ -678,9 +678,9 @@ S27="$T/s27.log"
 # reader. `returned udata` is the one that proves the offsets, because it
 # reads a caller-supplied value back out of kernel-written memory.
 ( sleep 5
-  printf 'kqtest\n'; sleep 6
+  printf 'kqtest\n'; sleep 12
   printf 'exit\n'; sleep 3
-) | timeout 29 ./tools/run.sh >"$S27" 2>&1
+) | timeout 36 ./tools/run.sh >"$S27" 2>&1
 gate_has   "s27: offset ident"    "$S27" 'kq: ok    offset ident'
 gate_has   "s27: offset filter"   "$S27" 'kq: ok    offset filter'
 gate_has   "s27: offset flags"    "$S27" 'kq: ok    offset flags'
@@ -728,6 +728,41 @@ gate_has   "s27: ffor selective"  "$S27" 'kq: ok    ffor delete ignores write'
 gate_has   "s27: fires on delete" "$S27" 'kq: ok    vnode fires on delete'
 gate_has   "s27: NOTE_DELETE"     "$S27" 'kq: ok    delete sets NOTE_DELETE'
 gate_has   "s27: delete ENOENT"   "$S27" 'kq: ok    vnode delete missing ENOENT'
+# EVFILT_PROC gates. The two that matter most are `exec watch child ok`
+# and `proc fires on exec` together: a registration list held in a global
+# instead of per-process passes every filter-local check and loses the
+# parent's watchers the moment ANY child execs. `proc gone is silent` is
+# the other: it proves the registration was not silently dropped after its
+# first event.
+gate_has   "s27: proc pid known"  "$S27" 'kq: ok    proc pid known'
+gate_has   "s27: proc ppid known" "$S27" 'kq: ok    proc ppid known'
+gate_has   "s27: proc ESRCH"      "$S27" 'kq: ok    proc missing ESRCH'
+gate_has   "s27: watch self"      "$S27" 'kq: ok    proc watch self'
+gate_has   "s27: watch self fork" "$S27" 'kq: ok    proc watch self fork'
+gate_has   "s27: fires on fork"   "$S27" 'kq: ok    proc fires on fork'
+gate_has   "s27: fork filter"     "$S27" 'kq: ok    fork filter is PROC'
+gate_has   "s27: fork fflags"     "$S27" 'kq: ok    fork fflags'
+gate_has   "s27: fork udata"      "$S27" 'kq: ok    fork udata'
+gate_has   "s27: fork ident"      "$S27" 'kq: ok    fork ident is me'
+gate_has   "s27: fork data child" "$S27" 'kq: ok    fork data is child'
+gate_has   "s27: not level-trig"  "$S27" 'kq: ok    proc not level-triggered'
+gate_has   "s27: narrow set"      "$S27" 'kq: ok    proc narrow set'
+gate_has   "s27: narrowed silent" "$S27" 'kq: ok    narrowed proc ignores fork'
+gate_has   "s27: proc widen"      "$S27" 'kq: ok    proc widen'
+gate_has   "s27: recovered FORK"  "$S27" 'kq: ok    recovered note is FORK'
+gate_has   "s27: proc disable"    "$S27" 'kq: ok    proc disable'
+gate_has   "s27: disabled silent" "$S27" 'kq: ok    disabled proc silent'
+gate_has   "s27: proc enable"     "$S27" 'kq: ok    proc enable'
+gate_has   "s27: disabled recovers" "$S27" 'kq: ok    disabled proc recovers'
+gate_has   "s27: watch exec"      "$S27" 'kq: ok    proc watch exec'
+gate_has   "s27: exec watch ok"   "$S27" 'kq: ok    exec watch child ok'
+gate_has   "s27: fires on exec"   "$S27" 'kq: ok    proc fires on exec'
+gate_has   "s27: exec fflags"     "$S27" 'kq: ok    exec fflags'
+gate_has   "s27: exec udata"      "$S27" 'kq: ok    exec udata'
+gate_has   "s27: exec ident"      "$S27" 'kq: ok    exec ident is child'
+gate_has   "s27: proc delete"     "$S27" 'kq: ok    proc delete'
+gate_has   "s27: proc del ENOENT" "$S27" 'kq: ok    proc double delete ENOENT'
+gate_has   "s27: proc gone quiet" "$S27" 'kq: ok    proc gone is silent'
 gate_has   "s27: all ok"          "$S27" 'kq: all ok'
 gate_has   "s27: exit 0"          "$S27" 'sh: kqtest exited 0'
 gate_count "s27: no panic"        "$S27" 'panic' 0

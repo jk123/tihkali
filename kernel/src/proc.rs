@@ -101,6 +101,8 @@ pub struct Process {
     /// setitimer(ITIMER_REAL) repeat period in ticks, from it_interval.
     /// Some(0) = one-shot (interval zero); None = no timer set.
     pub itimer_iv: Option<u64>,
+    /// kqueue registrations owned by this process. Execve clears it.
+    pub kregs: Vec<Kevent>,
 }
 
 struct ProcTable(UnsafeCell<Vec<Option<Process>>>);
@@ -200,6 +202,8 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         tpidr: crate::user::TPIDR_VAL,
         itimer_at: None,
         itimer_iv: None,
+        // fork(2) does not inherit kqueue registrations.
+        kregs: Vec::new(),
     }));
     CURRENT.store(0, Ordering::Relaxed);
     NEXT_PID.store(1, Ordering::Relaxed);
@@ -514,8 +518,14 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         tpidr: read_tpidr(),
         itimer_at: None, // ITIMER_REAL does not survive fork()
         itimer_iv: None,
+        // fork(2) does not inherit kqueue registrations.
+        kregs: Vec::new(),
     });
-    kprintln!("proc: fork pid {} (parent {})", pid, t[cur].as_ref().unwrap().pid);
+    let parent_pid = t[cur].as_ref().unwrap().pid;
+    kprintln!("proc: fork pid {} (parent {})", pid, parent_pid);
+    // NOTE_FORK is reported on the PARENT, with the new pid in the low bits
+    // of `data` (see kevent_arm).
+    proc_notify(parent_pid, pid, NOTE_FORK);
     Ok(pid)
 }
 
@@ -562,6 +572,9 @@ fn terminate(frame: &mut TrapFrame, code: u64, signaled: bool) {
         file::release_all(&p.fds);
     }
     let pid = table()[cur].as_ref().unwrap().pid;
+    // Raised here, before reap() frees the slot. The event is keyed by pid
+    // so it survives the slot going away.
+    proc_notify(pid, pid, NOTE_EXIT);
     if signaled {
         kprintln!("proc: pid {pid} killed by signal {code}");
     } else {
@@ -650,6 +663,9 @@ fn reap(slot: usize) {
     let c = t[slot].take().unwrap();
     vm::free_space(&c.tables);
     kprintln!("proc: reaped pid {}", c.pid);
+    // Only reclaims the event entry if no EVFILT_PROC registration still
+    // wants this pid's pending NOTE_EXIT.
+    proc_events_drop(c.pid);
 }
 
 fn write_user_i32(addr: usize, val: i32) -> bool {
@@ -780,13 +796,22 @@ pub fn sys_execve(frame: &mut TrapFrame, path_ptr: u64, argv_ptr: u64) -> Result
         p.mmap_next = 0;
         // Registrations do not survive exec: the descriptors they name are
         // kept across exec, but a caller re-registers after any change.
-        kq_regs().clear();
+        // Cleared on THIS process only -- the list is per-process, so a
+        // child's exec cannot take the parent's watchers with it.
+        p.kregs.clear();
     }
     frame.elr = entry as u64;
     frame.spsr = 0; // EL0t, interrupts on
     frame.x[0] = argc;
     frame.x[1] = argv;
     write_sp_el0(sp);
+    // NOTE_EXEC is reported like NOTE_FORK: raised against the process's
+    // own pid, which for exec is unchanged.
+    let exec_pid = table()[CURRENT.load(Ordering::Relaxed)]
+        .as_ref()
+        .map(|p| p.pid)
+        .unwrap_or(0);
+    proc_notify(exec_pid, exec_pid, NOTE_EXEC);
     kprintln!("proc: exec {path} argc={argc} entry={entry:#x}");
     Ok(())
 }
@@ -1790,6 +1815,124 @@ pub struct Kevent {
 pub const EVFILT_READ: u32 = 0;
 pub const EVFILT_WRITE: u32 = 1;
 pub const EVFILT_VNODE: u32 = 2;
+pub const EVFILT_PROC: u32 = 3;
+
+// NOTE_* for EVFILT_PROC (sys/sys/event.h). These are distinct values from
+// the vnode notes -- NOTE_EXEC is 0x20000000 here and there is no vnode
+// note with that value.
+pub const NOTE_EXIT: u32 = 0x8000_0000;
+pub const NOTE_FORK: u32 = 0x4000_0000;
+pub const NOTE_EXEC: u32 = 0x2000_0000;
+
+/// Pending process events, keyed by pid rather than by table slot.
+///
+/// A slot cannot be used: reap() frees it, so a NOTE_EXIT recorded against
+/// a slot would vanish before a watcher could collect it. The pid outlives
+/// the slot, and the entry is reclaimed only once no registration wants it.
+///
+/// Same shape as the vnode generation counter -- a monotonic `seq` plus a
+/// pending bitmap -- so a watcher cannot miss an event that happened while
+/// it was not inside a syscall.
+struct ProcEvents(UnsafeCell<Vec<ProcEvent>>);
+unsafe impl Sync for ProcEvents {}
+
+#[derive(Clone, Copy)]
+struct ProcEvent {
+    pid: usize,
+    seq: u32,
+    notes: u32,
+    /// The child pid when `notes` carries NOTE_FORK, so the watcher learns
+    /// WHICH pid forked. Stored rather than read from a global because two
+    /// forks can be pending at once.
+    child: usize,
+}
+
+static PEVENTS: ProcEvents = ProcEvents(UnsafeCell::new(Vec::new()));
+
+fn pevents() -> &'static mut Vec<ProcEvent> {
+    unsafe { &mut *PEVENTS.0.get() }
+}
+
+/// Record `notes` against `pid`. `NOTE_FORK` is delivered to the PARENT,
+/// so `ident` is the parent while the note is raised on the child.
+pub fn proc_notify(parent: usize, child: usize, notes: u32) {
+    let v = pevents();
+    if let Some(e) = v.iter_mut().find(|e| e.pid == parent) {
+        e.seq = e.seq.wrapping_add(1);
+        e.notes |= notes;
+        if notes & NOTE_FORK != 0 {
+            e.child = child;
+        }
+        return;
+    }
+    if v.len() >= 256 {
+        return;
+    }
+    v.push(ProcEvent {
+        pid: parent,
+        seq: 1,
+        notes,
+        child,
+    });
+}
+
+/// The generation a new watcher records.
+pub fn proc_seq(pid: usize) -> u32 {
+    pevents()
+        .iter()
+        .find(|e| e.pid == pid)
+        .map_or(0, |e| e.seq)
+}
+
+/// Take the pending notes, clearing them. Restored by `proc_restore` when a
+/// filter's fflags do not match -- otherwise narrowing a filter would
+/// silently discard events.
+/// Read without clearing. The filter decision must not consume the event.
+pub fn proc_peek(pid: usize) -> Option<(u32, u32, usize)> {
+    pevents()
+        .iter()
+        .find(|e| e.pid == pid)
+        .map(|e| (e.seq, e.notes, e.child))
+}
+
+pub fn proc_take(pid: usize) -> Option<(u32, u32, usize)> {
+    let v = pevents();
+    let e = v.iter_mut().find(|e| e.pid == pid)?;
+    let out = e.notes;
+    e.notes = 0;
+    Some((e.seq, out, e.child))
+}
+
+
+/// Drop any pending history for a pid, so a first-time watcher is not woken
+/// by events it never asked about.
+pub fn proc_clear(pid: usize) {
+    if let Some(e) = pevents().iter_mut().find(|e| e.pid == pid) {
+        e.notes = 0;
+        e.child = 0;
+    }
+}
+
+/// Does the pid exist (runnable or zombie)? EVFILT_PROC must refuse a pid
+/// that does not exist, rather than registering for an event that can
+/// never arrive.
+pub fn pid_exists(pid: usize) -> bool {
+    table().iter().any(|p| p.as_ref().is_some_and(|q| q.pid == pid))
+}
+
+
+/// Reclaim a pid's event entry once it holds nothing worth delivering.
+///
+/// The entry is kept while it still carries pending notes OR a watcher:
+/// dropping it at reap() time would destroy a NOTE_EXIT for a pid whose
+/// registration has not been made yet -- which is precisely the case
+/// EVFILT_PROC exists for. A pid can therefore be watched *after* it dies.
+pub fn proc_events_drop(pid: usize) {
+    if kq_watching_pid(pid) {
+        return;
+    }
+    pevents().retain(|e| e.pid != pid || e.notes != 0);
+}
 
 /// NOTE_FF* modifiers on an EVFILT_VNODE registration (sys/sys/event.h).
 /// A watcher with fflags 0 wants every note; with NOTE_FFAND it wants only
@@ -1809,16 +1952,38 @@ pub const EV_CLEAR: u32 = 0x0020;
 /// Registration cap. A caller asking for more is EINVAL, matching poll.
 pub const KQUEUE_MAX: usize = 64;
 
-/// The registration list. kqueues are not multiplexable here: one
-/// registration set per process, so kqueue() hands back a shared
-/// descriptor. Single-core, so a plain static needs no synchronisation.
-struct KqTable(UnsafeCell<Vec<Kevent>>);
-unsafe impl Sync for KqTable {}
-
-static KQ: KqTable = KqTable(UnsafeCell::new(Vec::new()));
-
+/// The current process's registration list.
+///
+/// kqueues are not multiplexable here: one registration set per process, so
+/// kqueue() hands back a shared descriptor. The list therefore lives in the
+/// `Process`, not in a static. A static is only correct while no second
+/// process exists, and execve then clears it -- which silently destroyed
+/// every OTHER process's watchers the moment any child execed.
 pub fn kq_regs() -> &'static mut Vec<Kevent> {
-    unsafe { &mut *KQ.0.get() }
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut();
+    match p {
+        Some(p) => &mut p.kregs,
+        // No current process (only reachable before pid 0 is installed).
+        // Returning a real static keeps the borrow total rather than
+        // Option-ing every call site.
+        None => unsafe { &mut *UNCLAIMED_KQ.0.get() },
+    }
+}
+
+/// Holds registrations made before a current process exists. Unreachable in
+/// practice; it exists so `kq_regs` need not return an Option.
+struct UnclaimedKq(UnsafeCell<Vec<Kevent>>);
+unsafe impl Sync for UnclaimedKq {}
+static UNCLAIMED_KQ: UnclaimedKq = UnclaimedKq(UnsafeCell::new(Vec::new()));
+
+/// Does ANY process hold an EVFILT_PROC registration for `pid`? Reaping a
+/// pid must consult every process, not just the reaper's own list.
+pub fn kq_watching_pid(pid: usize) -> bool {
+    table()
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .any(|p| p.kregs.iter().any(|k| k.filter == EVFILT_PROC && k.ident == pid as u64))
 }
 
 /// Add or update a registration. `ident` is the fd.
@@ -1879,6 +2044,39 @@ pub fn kq_vnode_ready(k: &Kevent) -> Option<u32> {
     Some(notes)
 }
 
+/// Match pending process notes against a filter's fflags, honouring
+/// NOTE_FFAND / NOTE_FFOR. `data` bits carry the pid for NOTE_FORK.
+fn proc_match(fflags: u32, pending: u32) -> bool {
+    match fflags & NOTE_FFCTRLMASK {
+        NOTE_FFAND => pending != 0 && pending & (fflags & !NOTE_FFCTRLMASK) != 0,
+        NOTE_FFOR => pending & (fflags & !NOTE_FFCTRLMASK) != 0,
+        _ => pending != 0,
+    }
+}
+
+/// Is an EVFILT_PROC registration ready? Returns the pending notes and, for
+/// NOTE_FORK, the child pid they came from.
+pub fn kq_proc_ready(k: &Kevent) -> Option<(u32, usize)> {
+    if k.flags & EV_DISABLE != 0 {
+        return None;
+    }
+    let pid = k.ident as usize;
+    // PEEK, do not take: nothing is consumed unless this registration
+    // actually fires. Taking here and restoring on the "not ready" path
+    // looked equivalent but was not -- a second poll of the SAME
+    // registration would see the notes already gone.
+    let (seq, notes, child) = proc_peek(pid)?;
+    if seq == k.vseq {
+        return None;
+    }
+    if !proc_match(k.fflags, notes) {
+        return None;
+    }
+    // Consume for real, and only now.
+    proc_take(pid);
+    Some((notes, child))
+}
+
 /// Is any enabled registration currently ready? Lets poll() treat a kqueue
 /// descriptor like any other readable fd.
 pub fn kq_any_ready() -> bool {
@@ -1912,6 +2110,9 @@ pub fn kq_any_ready() -> bool {
             },
             #[cfg(not(feature = "net"))]
             FdTarget::Socket(_) => (false, false),
+            // Deliberately not ready: a kqueue descriptor must not report
+            // its own readiness, and making it call kq_any_ready() here
+            // would recurse unboundedly for a kqueue watching a kqueue.
             FdTarget::Kqueue => (false, false),
         };
         match r.filter {

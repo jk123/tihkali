@@ -262,12 +262,79 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         let Some(k) = ke_read(addr) else {
             return Io::Err(14);
         };
+        if k.filter == crate::proc::EVFILT_PROC {
+            // EVFILT_PROC watches a PID, not a path or a descriptor.
+            let pid = k.ident as usize;
+            if pid == 0 || !crate::proc::pid_exists(pid) {
+                // ESRCH: the process this asks about is gone. Registering
+                // anyway would watch an event that can never arrive.
+                return Io::Err(3);
+            }
+            if k.flags & crate::proc::EV_DELETE != 0 {
+                match crate::proc::kq_delete(pid as u64, k.filter) {
+                    Ok(()) => {}
+                    Err(e) => return Io::Err(e),
+                }
+                continue;
+            }
+            if k.flags & (crate::proc::EV_ADD | crate::proc::EV_ENABLE) == 0 {
+                if k.flags & crate::proc::EV_DISABLE != 0 {
+                    let regs = crate::proc::kq_regs();
+                    let hit = regs
+                        .iter_mut()
+                        .find(|e| e.ident == pid as u64 && e.filter == k.filter);
+                    match hit {
+                        Some(e) => e.flags |= crate::proc::EV_DISABLE,
+                        None => return Io::Err(2),
+                    }
+                    continue;
+                }
+                return Io::Err(22);
+            }
+            // Same rule as EVFILT_VNODE: only a first registration
+            // baselines history, so re-widening a narrowed filter does not
+            // discard events that arrived in between.
+            let prior = crate::proc::kq_regs()
+                .iter()
+                .find(|e| e.ident == pid as u64 && e.filter == k.filter)
+                .map(|e| e.vseq);
+            // A pid whose slot is GONE can only have pending events: it has
+            // no future to baseline against. Clearing there would discard
+            // exactly the NOTE_EXIT/NOTE_EXEC the watcher came for.
+            let seq = match prior {
+                Some(v) => v,
+                None => {
+                    if crate::proc::pid_exists(pid) {
+                        crate::proc::proc_clear(pid);
+                    }
+                    crate::proc::proc_seq(pid)
+                }
+            };
+            let mut r = crate::proc::Kevent {
+                ident: pid as u64,
+                vseq: seq,
+                filter: k.filter,
+                flags: if k.flags & crate::proc::EV_DISABLE != 0 {
+                    crate::proc::EV_DISABLE
+                } else {
+                    0
+                },
+                fflags: k.fflags,
+                udata: k.udata,
+            };
+            r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
+            if let Err(e) = crate::proc::kq_add(r) {
+                return Io::Err(e);
+            }
+            continue;
+        }
         let is_vnode = k.filter == crate::proc::EVFILT_VNODE;
         // Filters needing kernel objects this kernel does not have are
         // refused here rather than registered and never delivered.
         if k.filter != crate::proc::EVFILT_READ
             && k.filter != crate::proc::EVFILT_WRITE
             && !is_vnode
+            && k.filter != crate::proc::EVFILT_PROC
         {
             return Io::Err(22); // EINVAL
         }
@@ -412,28 +479,40 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         // reported twice.
         let ready = if r.filter == crate::proc::EVFILT_VNODE {
             crate::proc::kq_vnode_ready(r).map(|notes| (notes, 0i64))
+        } else if r.filter == crate::proc::EVFILT_PROC {
+            crate::proc::kq_proc_ready(r).map(|(notes, child)| (notes, child as i64))
         } else {
             ke_ready(r).map(|nbytes| (0u32, nbytes))
         };
         match ready {
             Some((notes, val)) => {
                 let is_vn = r.filter == crate::proc::EVFILT_VNODE;
+                let is_pp = r.filter == crate::proc::EVFILT_PROC;
+                // For EVFILT_PROC, `data` carries the pid that triggered the
+                // event -- the child for NOTE_FORK, the process itself for
+                // NOTE_EXEC/NOTE_EXIT. It is taken from the low bits of the
+                // pending note so a watcher learns WHICH pid it was.
+                let data = val;
                 ke_write(
                     eventlist + n * KEVENT_SIZE as u64,
                     r,
                     r.filter,
                     0,
-                    val as i64,
-                    if is_vn { notes } else { r.fflags },
+                    data,
+                    if is_vn || is_pp { notes } else { r.fflags },
                 );
                 n += 1;
-                if is_vn {
+                if is_vn || is_pp {
                     // Re-base the registration's generation so the next
                     // call reports only what happens after this one, then
                     // KEEP it. Dropping it here would silently unregister
                     // the watcher after its first event.
                     let mut next = *r;
-                    next.vseq = crate::fs::vnode_seq(r.ident as usize);
+                    next.vseq = if is_pp {
+                        crate::proc::proc_seq(r.ident as usize)
+                    } else {
+                        crate::fs::vnode_seq(r.ident as usize)
+                    };
                     if r.flags & crate::proc::EV_ONESHOT != 0 {
                         continue; // drop it
                     }

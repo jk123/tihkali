@@ -80,7 +80,12 @@ fn print_num(name: &str, v: i64) {
     let mut buf = [0u8; 24];
     let mut n = 0;
     let neg = v < 0;
+    if neg {
+        buf[n] = b'-';
+        n += 1;
+    }
     let mut u = v.unsigned_abs();
+    let start = n;
     if u == 0 {
         buf[n] = b'0';
         n += 1;
@@ -90,10 +95,7 @@ fn print_num(name: &str, v: i64) {
         u /= 10;
         n += 1;
     }
-    if neg {
-        buf[n] = b'-';
-        n += 1;
-    }
+    buf[start..n].reverse();
     unsafe {
         write(1, b"kq: num   ");
         write(1, name.as_bytes());
@@ -131,6 +133,100 @@ unsafe fn wr(fd: i64, buf: &[u8]) -> Result<i64, i64> {
         );
     }
     if err != 0 { Err(ret) } else { Ok(ret) }
+}
+
+/// SYS_fork() = 2
+unsafe fn fork() -> Result<i64, i64> {
+    let ret: i64;
+    let err: isize;
+    unsafe {
+        asm!(
+            "svc #2",
+            "cset {err}, hs",
+            inlateout("x0") 0i64 => ret,
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 { Err(ret) } else { Ok(ret) }
+}
+
+/// SYS_wait4(pid, status, options) = **449** (WAIT4__2), blocking.
+///
+/// NOT 7: that is the obsolete compat WAIT4, and the kernel dispatches
+/// only __2 -- so `svc #7` would hit an undispatched arm. Same trap as
+/// MMAP=71 vs MMAP__2=197.
+unsafe fn wait4_block(pid: i64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "svc #449",
+            inlateout("x0") pid => ret,
+            in("x1") 0i64,
+            in("x2") 0i64, // no WNOHANG: block, yielding the CPU
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// SYS_wait4(pid, status, options) = 449, WNOHANG.
+unsafe fn wait4(pid: i64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "svc #449",
+            inlateout("x0") pid => ret,
+            in("x1") 0i64,
+            in("x2") 1i64, // WNOHANG
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// SYS_getpid() = 20 (GETPID_WITH_PPID)
+unsafe fn getpid() -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("svc #20", inlateout("x0") 0i64 => ret, options(nostack));
+    }
+    ret
+}
+
+/// SYS_getppid() = 39
+unsafe fn getppid() -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("svc #39", inlateout("x0") 0i64 => ret, options(nostack));
+    }
+    ret
+}
+
+/// SYS_execve(path, argv, envp) = 59
+unsafe fn execve(path: *const u8) -> Result<i64, i64> {
+    let ret: i64;
+    let err: isize;
+    let mut argv: [*const u8; 2] = [path, core::ptr::null()];
+    unsafe {
+        asm!(
+            "svc #59",
+            "cset {err}, hs",
+            inlateout("x0") path => ret,
+            in("x1") argv.as_mut_ptr(),
+            in("x2") 0i64,
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 { Err(ret) } else { Ok(ret) }
+}
+
+/// SYS_exit(code) = 1
+unsafe fn exit(code: i64) -> ! {
+    unsafe {
+        asm!("svc #1", in("x0") code, options(nostack, noreturn));
+    }
 }
 
 /// SYS_unlink(path) = 10
@@ -262,6 +358,13 @@ const KE_SIZE: usize = 72;
 const EVFILT_READ: u32 = 0;
 const EVFILT_WRITE: u32 = 1;
 const EVFILT_VNODE: u32 = 2;
+const EVFILT_PROC: u32 = 3;
+
+// NOTE_* for EVFILT_PROC. These overlap the vnode NOTE_* space, so a
+// misdispatched filter is visible as a wrong fflags mask.
+const NOTE_EXIT: u32 = 0x8000_0000;
+const NOTE_FORK: u32 = 0x4000_0000;
+const NOTE_EXEC: u32 = 0x2000_0000;
 
 // Registration flags.
 const EV_ADD: u32 = 0x0001;
@@ -609,6 +712,195 @@ pub extern "C" fn _start() -> ! {
         let _ = kevent(kq, &clr2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
         let clr3 = fill(1, EVFILT_WRITE, EV_DELETE, 0);
         let _ = kevent(kq, &clr3 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+
+        // --- EVFILT_PROC: watch a PID for exit/fork/exec ------------------
+        // Unlike the other filters this one keys on a pid, and the pid
+        // outlives the table slot -- reap() frees the slot, so an event
+        // recorded against a slot would vanish before a watcher saw it.
+        let me = getpid();
+        let pp = getppid();
+        check("proc pid known", me > 0);
+        check("proc ppid known", pp >= 0);
+
+        // A pid that does not exist must be refused, not watched forever.
+        let ghost = fillf(9999, EVFILT_PROC, EV_ADD, 0, 0);
+        let ng = kevent(kq, &ghost as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("proc missing ESRCH", ng == Err(3));
+        print_num("proc ESRCH", ng.unwrap_or(-999));
+
+        // Watch our OWN pid for NOTE_EXIT. We are about to exit, and the
+        // event must survive our own reaping.
+        let pe = fillf(me as u64, EVFILT_PROC, EV_ADD, 0, 0xF00D);
+        let npe = kevent(kq, &pe as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("proc watch self", npe == Ok(0));
+
+        // A forked child raises NOTE_FORK on the PARENT. Fork, let it exit,
+        // reap it -- the child's pid is gone by then, and the parent's
+        // NOTE_FORK must still be deliverable.
+        let ppf = fillf(pp as u64, EVFILT_PROC, EV_ADD, NOTE_FFOR, 0xBEEF);
+        let npf = kevent(kq, &ppf as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        if pp > 0 {
+            check("proc watch parent", npf == Ok(0));
+        }
+
+        let Ok(child) = fork() else {
+            check("fork ok", false);
+            finish();
+        };
+        if child == 0 {
+            // Child exits immediately. It must not run the parent's
+            // assertions: the check below is `child > 0`, which is false in
+            // exactly this branch.
+            exit(7);
+        }
+        check("fork child", child > 0);
+        // Reap it so its slot is gone -- this is what a slot-indexed
+        // implementation would lose the event to.
+        let _ = wait4(child);
+
+        // Now ask: is the parent's NOTE_FORK still there? We are the child
+        // from the kernel's point of view relative to `pp`, and the shell
+        // forked us long before, so this must NOT fire. But our OWN fork
+        // just happened, and `me` is the parent of `child` -- so watching
+        // `me` for NOTE_FORK is the positive case.
+        let pf2 = fillf(me as u64, EVFILT_PROC, EV_ADD, NOTE_FFOR | NOTE_FORK, 0x1111);
+        let npf2 = kevent(kq, &pf2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("proc watch self fork", npf2 == Ok(0));
+
+        // The fork already happened, so it is history: a first
+        // registration must baseline it away.
+        let mut po = core::mem::zeroed::<Ke>();
+        let np1 = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        print_num("proc first poll", np1.unwrap_or(-999));
+
+        // Fork again -- NOW the watcher is registered, so this one must fire.
+        let Ok(child2) = fork() else {
+            check("fork child2", false);
+            finish();
+        };
+        if child2 == 0 {
+            exit(9);
+        }
+        check("fork child2", child2 > 0);
+        let _ = wait4(child2);
+
+        let np2 = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("proc fires on fork", np2 == Ok(1));
+        if np2 == Ok(1) {
+            let g = core::ptr::read_volatile(&po);
+            check("fork filter is PROC", g.filter == EVFILT_PROC);
+            check("fork fflags", g.fflags & NOTE_FORK != 0);
+            check("fork udata", g.udata == 0x1111);
+            check("fork ident is me", g.ident == me as u64);
+            print_num("fork data (child pid)", g.data);
+            check("fork data is child", g.data == child2);
+        }
+        // Edge-preserving: one fork, one event.
+        let np3 = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("proc not level-triggered", np3 == Ok(0));
+
+        // A filter narrowed to NOTE_EXIT must ignore the NOTE_FORK we are
+        // about to cause, and keep it pending.
+        let narrow = fillf(me as u64, EVFILT_PROC, EV_ENABLE, NOTE_FFOR | NOTE_EXIT, 0);
+        check("proc narrow set", kevent(kq, &narrow as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let Ok(child3) = fork() else {
+            check("fork child3", false);
+            finish();
+        };
+        if child3 == 0 {
+            exit(11);
+        }
+        check("fork child3", child3 > 0);
+        let _ = wait4(child3);
+        let npn = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("narrowed proc ignores fork", npn == Ok(0));
+
+        // Widen back: the fork must still be pending, not consumed.
+        let wide = fillf(me as u64, EVFILT_PROC, EV_ENABLE, 0, 0);
+        check("proc widen", kevent(kq, &wide as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let npw = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("proc pending survives narrowing", npw == Ok(1));
+        if npw == Ok(1) {
+            let g = core::ptr::read_volatile(&po);
+            check("recovered note is FORK", g.fflags & NOTE_FORK != 0);
+        }
+
+        // EV_DISABLE silences without unregistering.
+        let dis = fillf(me as u64, EVFILT_PROC, EV_DISABLE, 0, 0);
+        check("proc disable", kevent(kq, &dis as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let Ok(child4) = fork() else {
+            check("fork child4", false);
+            finish();
+        };
+        if child4 == 0 {
+            exit(13);
+        }
+        check("fork child4", child4 > 0);
+        let _ = wait4(child4);
+        let npd = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("disabled proc silent", npd == Ok(0));
+        // Re-enable: the fork made while disabled is delivered.
+        let en = fillf(me as u64, EVFILT_PROC, EV_ENABLE, 0, 0);
+        check("proc enable", kevent(kq, &en as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let npe2 = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("disabled proc recovers", npe2 == Ok(1));
+
+        // NOTE_EXEC is raised against the pid that execs. Watching a
+        // long-lived process is the deterministic case: this binary's own
+        // pid never execs, so instead the watcher is put on a child that
+        // execs, and the child is allowed to run by BLOCKING on wait4
+        // (which yields the single CPU) BEFORE the event is collected.
+        //
+        // The pid is gone by then on purpose: that is the case a
+        // slot-indexed implementation loses, and the reason the event table
+        // is keyed by pid.
+        let pex = fillf(me as u64, EVFILT_PROC, EV_ENABLE, NOTE_FFOR | NOTE_EXEC, 0xC0DE);
+        check("proc watch exec", kevent(kq, &pex as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+
+        let Ok(child5) = fork() else {
+            check("fork child5", false);
+            finish();
+        };
+        if child5 == 0 {
+            if execve(p!("/bin/hello")).is_err() {
+                exit(17);
+            }
+            exit(19);
+        }
+        check("fork child5", child5 > 0);
+        let pex2 = fillf(child5 as u64, EVFILT_PROC, EV_ADD, NOTE_FFOR | NOTE_EXEC, 0xC0DE);
+        let rex = kevent(kq, &pex2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("exec watch child ok", rex == Ok(0));
+
+        // /bin/hello FORKS and waits, so child5 does not exit on its own.
+        // Spin on the CHILD'S exit with a blocking wait4, which is the only
+        // thing on a single core that yields the CPU to the child.
+        let _ = wait4_block(child5);
+
+        let mut po2 = core::mem::zeroed::<Ke>();
+        let npex2 = kevent(kq, core::ptr::null(), 0, &mut po2 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("proc fires on exec", npex2 == Ok(1));
+        if npex2 == Ok(1) {
+            let g = core::ptr::read_volatile(&po2);
+            check("exec fflags", g.fflags & NOTE_EXEC != 0);
+            check("exec udata", g.udata == 0xC0DE);
+            check("exec ident is child", g.ident == child5 as u64);
+        }
+        let dch = fillf(child5 as u64, EVFILT_PROC, EV_DELETE, 0, 0);
+        let _ = kevent(kq, &dch as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+
+        // Unregister cleanly.
+        let delp = fillf(me as u64, EVFILT_PROC, EV_DELETE, 0, 0);
+        let dp = kevent(kq, &delp as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("proc delete", dp == Ok(0));
+        print_num("proc delete ret", dp.unwrap_or(-999));
+        check("proc double delete ENOENT", {
+            let d2 = fillf(me as u64, EVFILT_PROC, EV_DELETE, 0, 0);
+            kevent(kq, &d2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(2)
+        });
+        // With the registration gone, the pending fork must not surface.
+        let npx = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("proc gone is silent", npx == Ok(0));
 
         close(fd);
         close(kq);
