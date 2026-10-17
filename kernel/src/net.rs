@@ -164,6 +164,16 @@ struct SockMeta {
     /// SO_SNDBUF / SO_RCVBUF as set by the user (0 = kernel default).
     so_sndbuf: u32,
     so_rcvbuf: u32,
+    /// Local endpoint. `lip_set` separates "bound to 0.0.0.0" from "not
+    /// bound yet": getpeername must report ENOTCONN before a connect, and
+    /// getsockname must report the port the stack actually chose rather
+    /// than the requested 0.
+    lip: [u8; 4],
+    lport_bound: u16,
+    lip_set: bool,
+    /// Peer endpoint recorded by connect/accept, for getpeername.
+    rip: [u8; 4],
+    rport: u16,
 }
 const SOCK_META_EMPTY: SockMeta = SockMeta {
     used: false,
@@ -180,6 +190,11 @@ const SOCK_META_EMPTY: SockMeta = SockMeta {
     so_flags: 0,
     so_sndbuf: 0,
     so_rcvbuf: 0,
+    lip: [0; 4],
+    lport_bound: 0,
+    lip_set: false,
+    rip: [0; 4],
+    rport: 0,
 };
 static SOCK_META: NetCell<[SockMeta; NSOCK]> =
     NetCell(UnsafeCell::new([SOCK_META_EMPTY; NSOCK]));
@@ -1120,6 +1135,9 @@ pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
     match meta[slot].kind {
         SockKind::Tcp => {
             meta[slot].lport = port;
+            meta[slot].lip = if ip == [0, 0, 0, 0] { local_ip() } else { ip };
+            meta[slot].lport_bound = port;
+            meta[slot].lip_set = true;
             Ok(())
         }
         SockKind::Udp => with_set(|set| {
@@ -1132,6 +1150,7 @@ pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
             // (busybox ping/wget) always binds this way before sending a
             // query, and abandoning the bind makes it report a lookup
             // failure instead of querying.
+            let _ = &s;
             let port: u16 = match port {
                 0 => {
                     let p = ephemeral_port(slot);
@@ -1158,6 +1177,9 @@ pub fn sock_bind(slot: usize, ip: [u8; 4], port: u16) -> Result<(), u8> {
                 return Err(EINVAL);
             }
             meta[slot].lport = port;
+            meta[slot].lip = if ip == [0, 0, 0, 0] { local_ip() } else { ip };
+            meta[slot].lport_bound = port;
+            meta[slot].lip_set = true;
             Ok(())
         }),
         SockKind::Icmp => {
@@ -1196,6 +1218,8 @@ pub fn sock_connect(slot: usize, ip: [u8; 4], port: u16) -> Result<Conn, u8> {
             // No handshake: record the peer for NULL-dest sends.
             meta[slot].peer_ip = ip;
             meta[slot].connected = true;
+            meta[slot].rip = ip;
+            meta[slot].rport = port;
             Ok(Conn::Done)
         }
         SockKind::Udp => Err(EINVAL),
@@ -1844,4 +1868,60 @@ pub fn sock_poll(slot: usize) -> Option<(bool, bool)> {
             Some((s.can_recv(), s.can_send()))
         }
     })
+}
+
+/// The local endpoint of a socket, as `(ip, port)`.
+///
+/// A socket that never bound reports port 0, and an unbound socket reports
+/// the wildcard address -- which is what getsockname must show rather than
+/// the ephemeral port the stack would pick later.
+pub fn sock_local_addr(slot: usize) -> ([u8; 4], u16) {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used {
+        return ([0, 0, 0, 0], 0);
+    }
+    if meta[slot].lport != 0 {
+        (meta[slot].lip, meta[slot].lport)
+    } else if meta[slot].lport_bound != 0 {
+        (meta[slot].lip, meta[slot].lport_bound)
+    } else {
+        ([0, 0, 0, 0], 0)
+    }
+}
+
+/// The peer endpoint recorded by connect/accept, or `None` if unconnected.
+///
+/// getpeername reports ENOTCONN in that case, so "no peer" must be
+/// distinguishable from "peer 0.0.0.0:0".
+pub fn sock_peer_addr(slot: usize) -> Option<([u8; 4], u16)> {
+    let meta = meta();
+    if slot >= NSOCK || !meta[slot].used || !meta[slot].connected {
+        return None;
+    }
+    if meta[slot].rport == 0 {
+        return None;
+    }
+    Some((meta[slot].rip, meta[slot].rport))
+}
+
+/// socketpair(2) is not supported.
+///
+/// Two things would both have to change to support it. smoltcp has no
+/// unix-socket transport, so AF_UNIX cannot exist at all. The alternative
+/// -- synthesising a connected AF_INET loopback pair -- does not work
+/// either, and not for want of trying: this interface has no loopback
+/// route, so a 127.0.0.1 SYN leaves via the default gateway and SLIRP
+/// never delivers it back, and connecting to the guest's own address
+/// completes the client half but the SYN-ACK/ACK still needs poll ticks
+/// that a syscall cannot wait for. A busy loop over `service_iface` does
+/// not advance the exchange, because TCP timing here is driven by
+/// wall-clock, not by poll count.
+///
+/// Returning EOPNOTSUPP is the honest answer: a caller that checks gets a
+/// clear reason, where a half-built pair would fail later and further
+/// from the cause. Any real implementation needs a loopback route plus
+/// deferred completion, which is a kernel-object change, not an arm.
+pub fn sock_pair(fdp: u64, type_word: i64) -> (i64, u8) {
+    let _ = (fdp, type_word);
+    (-1, 95) // EOPNOTSUPP
 }

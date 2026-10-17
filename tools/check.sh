@@ -642,6 +642,34 @@ gate_count "s25: no unknown syscall" "$S25" 'unknown syscall' 0
 gate_has   "s25: clean exit"        "$S25" 'proc: pid 0 exited \(0\)'
 gate_bad   "s25" "$S25"
 
+echo "== session 26: NetBSD socket identity (getpeername/getsockname)"
+S26="$T/s26.log"
+# The sockaddr checks read the BYTES back, not the return code: NetBSD
+# stores sa_len and sa_family as u8 with the port big-endian after them,
+# so a Linux-shaped writer returns 0 here and still fails every field.
+( sleep 5
+  printf 'sockidtest\n'; sleep 5
+  printf 'exit\n'; sleep 3
+) | timeout 28 ./tools/run.sh >"$S26" 2>&1
+gate_has   "s26: unbound succeeds"   "$S26" 'sockid: ok   getsockname unbound ok'
+gate_has   "s26: sa_len is u8"       "$S26" 'sockid: ok   getsockname sa_len'
+gate_has   "s26: family is u8"       "$S26" 'sockid: ok   getsockname family u8'
+gate_has   "s26: unbound port 0"     "$S26" 'sockid: ok   getsockname port 0'
+gate_has   "s26: wildcard"           "$S26" 'sockid: ok   getsockname wildcard'
+gate_has   "s26: writes addrlen"     "$S26" 'sockid: ok   getsockname wrote len'
+gate_has   "s26: ENOTCONN"           "$S26" 'sockid: ok   getpeername ENOTCONN'
+gate_has   "s26: bound port"         "$S26" 'sockid: ok   getsockname bound port'
+gate_has   "s26: real iface ip"      "$S26" 'sockid: ok   getsockname real ip'
+gate_has   "s26: udp ephemeral"      "$S26" 'sockid: ok   udp ephemeral nonzero'
+gate_has   "s26: socketpair refusal" "$S26" 'sockid: ok   socketpair EOPNOTSUPP'
+gate_has   "s26: AF_UNIX refusal"    "$S26" 'sockid: ok   socketpair AF_UNIX too'
+gate_has   "s26: all ok"             "$S26" 'sockid: all ok'
+gate_has   "s26: exit 0"             "$S26" 'sh: sockidtest exited 0'
+gate_count "s26: no panic"           "$S26" 'panic' 0
+gate_count "s26: no unknown syscall" "$S26" 'unknown syscall' 0
+gate_has   "s26: clean exit"         "$S26" 'proc: pid 0 exited \(0\)'
+gate_bad   "s26" "$S26"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

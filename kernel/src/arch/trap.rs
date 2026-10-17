@@ -401,6 +401,49 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 }
             }
         }
+        // --- socket identity ---
+        #[cfg(feature = "net")]
+        nbsys::GETPEERNAME => {
+            // SYS_getpeername(fd, sockaddr, socklen_t *addrlen)
+            match crate::net::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => match crate::net::sock_peer_addr(slot) {
+                    // ENOTCONN, not a zeroed address: a caller that ignored
+                    // the error would otherwise believe it is talking to
+                    // 0.0.0.0:0.
+                    None => (-1, 57),
+                    Some((ip, port)) => {
+                        crate::net::write_netbsd_sockaddr_out(frame.x[1], frame.x[2], ip, port);
+                        (0, 0)
+                    }
+                },
+            }
+        }
+        #[cfg(feature = "net")]
+        nbsys::GETSOCKNAME => {
+            // SYS_getsockname(fd, sockaddr, socklen_t *addrlen)
+            // Unlike getpeername this always succeeds: an unbound socket
+            // reports 0.0.0.0:0.
+            match crate::net::sock_slot(frame.x[0] as usize) {
+                None => (-1, crate::file::EBADF),
+                Some(slot) => {
+                    let (ip, port) = crate::net::sock_local_addr(slot);
+                    crate::net::write_netbsd_sockaddr_out(frame.x[1], frame.x[2], ip, port);
+                    (0, 0)
+                }
+            }
+        }
+        #[cfg(feature = "net")]
+        nbsys::SOCKETPAIR => {
+            // SYS_socketpair(domain, type, protocol, fdp[2]): x3 holds fdp.
+            //
+            // Unsupported for both domains, for the reasons spelled out in
+            // net::sock_pair: smoltcp has no unix-socket transport, and the
+            // AF_INET loopback substitute cannot complete a handshake
+            // inside a syscall. The arm delegates rather than pre-checking
+            // the domain, so there is one place that decides the answer.
+            crate::net::sock_pair(frame.x[3], frame.x[1] as i64)
+        }
         // --- descriptor duplication and control ---
         nbsys::DUP => {
             // SYS_dup(fd): lowest free descriptor, sharing the file.
