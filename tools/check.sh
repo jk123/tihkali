@@ -579,6 +579,38 @@ gate_count "s23: no unknown syscall" "$S23" 'unknown syscall' 0
 gate_has   "s23: clean exit"         "$S23" 'proc: pid 0 exited \(0\)'
 gate_bad   "s23" "$S23"
 
+echo "== session 24: NetBSD descriptor calls (dup/dup2/fcntl)"
+S24="$T/s24.log"
+# /bin/fdtest duplicates a descriptor (the copy must SHARE the file
+# position), forces dup2 onto an exact number, and round-trips
+# O_NONBLOCK through fcntl. NetBSD's O_NONBLOCK is 0x4, Linux's is 0x800;
+# a kernel that stored the Linux bit would answer 0 here.
+( sleep 5
+  printf 'fdtest\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 25 ./tools/run.sh >"$S24" 2>&1
+gate_has   "s24: open"              "$S24" 'fdctl: ok   open'
+gate_has   "s24: dup new fd"        "$S24" 'fdctl: ok   dup returns new fd'
+gate_has   "s24: dup shares pos"    "$S24" 'fdctl: ok   dup shares position'
+gate_has   "s24: dup next bytes"    "$S24" 'fdctl: ok   dup reads next bytes'
+gate_has   "s24: dup2 exact"        "$S24" 'fdctl: ok   dup2 exact fd'
+gate_has   "s24: dup2 self noop"    "$S24" 'fdctl: ok   dup2 self is no-op'
+gate_has   "s24: dup2 replaces"     "$S24" 'fdctl: ok   dup2 replaces target'
+gate_has   "s24: F_DUPFD"           "$S24" 'fdctl: ok   F_DUPFD >= min'
+gate_has   "s24: F_DUPFD_CLOEXEC"   "$S24" 'fdctl: ok   F_DUPFD_CLOEXEC'
+gate_has   "s24: F_SETFL"           "$S24" 'fdctl: ok   F_SETFL accepted'
+gate_has   "s24: F_GETFL nonblock"  "$S24" 'fdctl: ok   F_GETFL NetBSD nonblock'
+gate_has   "s24: no Linux bit"      "$S24" 'fdctl: ok   F_GETFL no Linux bit'
+gate_has   "s24: F_GETFL clears"    "$S24" 'fdctl: ok   F_GETFL clears'
+gate_has   "s24: unknown EINVAL"    "$S24" 'fdctl: ok   unknown cmd EINVAL'
+gate_has   "s24: fcntl EBADF"       "$S24" 'fdctl: ok   fcntl EBADF'
+gate_has   "s24: all ok"            "$S24" 'fdctl: all ok'
+gate_has   "s24: exit 0"            "$S24" 'sh: fdtest exited 0'
+gate_count "s24: no panic"          "$S24" 'panic' 0
+gate_count "s24: no unknown syscall" "$S24" 'unknown syscall' 0
+gate_has   "s24: clean exit"        "$S24" 'proc: pid 0 exited \(0\)'
+gate_bad   "s24" "$S24"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

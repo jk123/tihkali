@@ -1658,9 +1658,19 @@ pub fn sys_dupfd(oldfd: i64, min: i64) -> Result<usize, u8> {
     while p.fds.len() <= min as usize {
         p.fds.push(None);
     }
-    let slot = (min as usize..p.fds.len())
-        .find(|&i| p.fds[i].is_none())
-        .ok_or(EINVAL)?;
+    // The table only grows when min is past the end, so a full table with
+    // min below the end used to report EINVAL even though every caller
+    // expects a free slot to be found or created. Grow first, then search.
+    let slot = match (min as usize..p.fds.len()).find(|&i| p.fds[i].is_none()) {
+        Some(i) => i,
+        None => {
+            if p.fds.len() > 1024 {
+                return Err(24); // EMFILE
+            }
+            p.fds.push(None);
+            p.fds.len() - 1
+        }
+    };
     if let FdTarget::File(i) = target {
         file::dup(i);
     }

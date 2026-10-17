@@ -51,3 +51,7 @@ path = "src/statprobe.rs"
 [[bin]]
 name = "tihkali-iovtest"
 path = "src/iovtest.rs"
+
+[[bin]]
+name = "tihkali-fdtest"
+path = "src/fdtest.rs"

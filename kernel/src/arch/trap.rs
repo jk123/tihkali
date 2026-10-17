@@ -398,6 +398,87 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 }
             }
         }
+        // --- descriptor duplication and control ---
+        nbsys::DUP => {
+            // SYS_dup(fd): lowest free descriptor, sharing the file.
+            match crate::proc::sys_dupfd(frame.x[0] as i64, 0) {
+                Ok(n) => (n as i64, 0),
+                Err(e) => (-1, e),
+            }
+        }
+        nbsys::DUP2 => {
+            // SYS_dup2(oldfd, newfd): force onto newfd, closing whatever
+            // was there. dup3(old,new,0) already implements this, including
+            // the oldfd == newfd no-op.
+            match crate::proc::sys_dup3(frame.x[0] as i64, frame.x[1] as i64) {
+                Ok(n) => (n as i64, 0),
+                Err(e) => (-1, e),
+            }
+        }
+        nbsys::FCNTL => {
+            // SYS_fcntl(fd, cmd, arg)
+            //
+            // NetBSD's O_* file-status flags are the POSIX values, not
+            // Linux's: O_NONBLOCK is 0x4 here and 0x800 in asm-generic, and
+            // O_WRONLY/O_RDWR are 1/2 in both. Passing NetBSD's bit to the
+            // socket layer unchanged would silently do nothing, since the
+            // stored flag is the Linux one -- so the two are translated.
+            match frame.x[1] as i64 {
+                0 => match crate::proc::sys_dupfd(frame.x[0] as i64, frame.x[2] as i64) {
+                    Ok(n) => (n as i64, 0), // F_DUPFD
+                    Err(e) => (-1, e),
+                },
+                1 | 2 => (0, 0), // F_GETFD / F_SETFD: no cloexec tracking
+                3 => match crate::proc::current_target(frame.x[0] as usize) {
+                    // F_GETFL
+                    Some(crate::file::FdTarget::File(i)) => match crate::file::is_writable(i) {
+                        Ok(true) => (2, 0), // O_RDWR
+                        Ok(false) => (1, 0), // O_WRONLY
+                        Err(e) => (-1, e),
+                    },
+                    Some(crate::file::FdTarget::Socket(s)) => {
+                        #[cfg(feature = "net")]
+                        {
+                            // Report NetBSD's 0x4, not the stored Linux bit.
+                            if crate::net::sock_is_nonblock(s) {
+                                (0x4, 0)
+                            } else {
+                                (0, 0)
+                            }
+                        }
+                        #[cfg(not(feature = "net"))]
+                        {
+                            let _ = s;
+                            (0, 0)
+                        }
+                    }
+                    None => (-1, crate::file::EBADF),
+                    _ => (0, 0), // TtyIn/TtyOut/Pipe: no flags tracked
+                },
+                4 => {
+                    // F_SETFL: O_NONBLOCK is load-bearing -- musl's resolver
+                    // polls a non-blocking UDP socket and expects EAGAIN.
+                    match crate::proc::current_target(frame.x[0] as usize) {
+                        Some(crate::file::FdTarget::Socket(s)) => {
+                            #[cfg(feature = "net")]
+                            crate::net::sock_set_nonblock(s, frame.x[2] & 0x4 != 0);
+                            #[cfg(not(feature = "net"))]
+                            {
+                                let _ = (s, frame.x[2]);
+                            }
+                            (0, 0)
+                        }
+                        _ => (0, 0),
+                    }
+                }
+                12 => match crate::proc::sys_dupfd(frame.x[0] as i64, frame.x[2] as i64) {
+                    // F_DUPFD_CLOEXEC (12 on NetBSD, 1030 on Linux)
+                    Ok(n) => (n as i64, 0),
+                    Err(e) => (-1, e),
+                },
+                _ => (-1, 22), // EINVAL: unknown command
+            }
+        }
         nbsys::ACCESS => {
             // SYS_access(path, mode): the fs is a readable initramfs, so
             // mode is advisory -- existence is the only real question.
