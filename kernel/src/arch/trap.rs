@@ -634,6 +634,64 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 },
             }
         }
+        // --- process identity / credentials ---
+        nbsys::GETPPID => {
+            // SYS_getppid(). Distinct from GETPID_WITH_PPID (20), which
+            // merges getpid and getppid onto one number; aarch64 NetBSD
+            // keeps a separate getppid at 39.
+            (crate::proc::current_ppid(), 0)
+        }
+        nbsys::FTRUNCATE => {
+            // SYS_ftruncate(fd, length): by descriptor, so no path lookup
+            // and no cwd involvement. Refuses a read-only descriptor rather
+            // than silently truncating -- a caller that ignored the error
+            // would believe it had shortened the file.
+            match crate::file::fd_is_writable(frame.x[0] as usize) {
+                Err(e) => (-1, e),
+                Ok(idx) => {
+                    let len = frame.x[1];
+                    if len > i64::MAX as u64 {
+                        (-1, 22) // EINVAL
+                    } else {
+                        match crate::fs::set_len(idx, len as usize) {
+                            Ok(()) => (0, 0),
+                            Err(e) => (-1, e),
+                        }
+                    }
+                }
+            }
+        }
+        nbsys::TRUNCATE => {
+            // SYS_truncate(path, length)
+            match crate::proc::read_user_cstr(frame.x[0], 128) {
+                None => (-1, 14),
+                Some(path) => match crate::fs::lookup(&crate::proc::abspath(&path)) {
+                    None => (-1, crate::file::ENOENT),
+                    Some(idx) => {
+                        let len = frame.x[1];
+                        if len > i64::MAX as u64 {
+                            (-1, 22)
+                        } else {
+                            match crate::fs::set_len(idx, len as usize) {
+                                Ok(()) => (0, 0),
+                                Err(e) => (-1, e),
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        nbsys::UNAME => {
+            // SYS_uname(buf): NetBSD's struct utsname is five 256-byte
+            // char arrays = 1280 bytes, with no padding and no fields Linux
+            // has. The Linux arm writes 390 bytes of a different layout.
+            if !crate::proc::user_range_ok(frame.x[0], crate::netbsd_abi::UTSNAME_SIZE) {
+                (-1, 14)
+            } else {
+                crate::netbsd_abi::write_utsname(frame.x[0]);
+                (0, 0)
+            }
+        }
         // --- process / credential ---
         //
         // NetBSD merges these into single numbered calls: getuid+geteuid

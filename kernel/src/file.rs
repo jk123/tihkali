@@ -340,6 +340,20 @@ pub fn is_writable(idx: usize) -> Result<bool, u8> {
     Ok(table()[idx].as_ref().ok_or(EBADF)?.writable)
 }
 
+/// Whether the description behind an *fd* was opened for writing. The
+/// fd-resolved counterpart of `is_writable`, which takes a table index.
+pub fn fd_is_writable(fd: usize) -> Result<usize, u8> {
+    match crate::proc::current_target(fd) {
+        Some(FdTarget::File(i)) => {
+            if !table()[i].as_ref().ok_or(EBADF)?.writable {
+                return Err(EACCES);
+            }
+            Ok(node_of(i)?)
+        }
+        _ => Err(EBADF),
+    }
+}
+
 /// lseek(2): SEEK_SET/CUR/END; returns the new absolute position.
 pub fn lseek(idx: usize, offset: i64, whence: u32) -> Result<i64, u8> {
     let (node, pos) = {

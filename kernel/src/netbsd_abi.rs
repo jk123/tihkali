@@ -379,3 +379,33 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
     crate::proc::sleep_current(frame);
     Io::Slept
 }
+
+// ---------- uname ----------
+
+/// NetBSD `struct utsname`: five 256-byte char arrays, no padding.
+/// 1280 bytes total -- not Linux's 390, and not a subset of it.
+///
+/// Measured with the vendored cross gcc against sys/sys/utsname.h:
+///   sysname@0 nodename@256 release@512 version@768 machine@1024
+pub const UTSNAME_SIZE: usize = 1280;
+
+const NMLN: usize = 256;
+
+pub fn write_utsname(buf: u64) {
+    let fields: [(usize, &[u8]); 5] = [
+        (0, b"NetBSD\0"),
+        (NMLN, b"tihkali\0"),
+        (2 * NMLN, b"0.1.0\0"),
+        (3 * NMLN, b"tihkali aarch64\0"),
+        (4 * NMLN, b"aarch64\0"),
+    ];
+    unsafe {
+        let p = buf as *mut u8;
+        // Zero the whole struct first: a caller that memcmp()s it must not
+        // see stack garbage in the unused tail of each 256-byte field.
+        core::ptr::write_bytes(p, 0, UTSNAME_SIZE);
+        for (off, s) in fields {
+            core::ptr::copy_nonoverlapping(s.as_ptr(), p.add(off), s.len());
+        }
+    }
+}

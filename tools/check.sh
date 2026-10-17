@@ -716,6 +716,52 @@ gate_count "s27: no unknown syscall" "$S27" 'unknown syscall' 0
 gate_has   "s27: clean exit"      "$S27" 'proc: pid 0 exited \(0\)'
 gate_bad   "s27" "$S27"
 
+echo "== session 28: NetBSD identity + length (getppid/uname/ftruncate)"
+S28="$T/s28.log"
+# uname is the substance: NetBSD's struct utsname is 1280 bytes of five
+# 256-byte fields, not Linux's 390. A Linux-shaped writer returns 0 and
+# still leaves every field at the wrong offset, so these gates read the
+# bytes. `field tails zeroed` catches a writer that stores only the string
+# and leaves the rest of each 256-byte field as stack garbage.
+( sleep 5
+  printf 'idtest\n'; sleep 6
+  printf 'exit\n'; sleep 3
+) | timeout 29 ./tools/run.sh >"$S28" 2>&1
+gate_has   "s28: ppid not self"   "$S28" 'idt: ok   ppid differs from pid'
+gate_has   "s28: ppid sane"       "$S28" 'idt: ok   ppid sane'
+gate_has   "s28: ppid stable"     "$S28" 'idt: ok   ppid is stable'
+gate_has   "s28: uname succeeds"  "$S28" 'idt: ok   uname succeeds'
+gate_has   "s28: sysname"         "$S28" 'idt: ok   sysname is NetBSD'
+gate_has   "s28: nodename"        "$S28" 'idt: ok   nodename'
+gate_has   "s28: release"         "$S28" 'idt: ok   release'
+gate_has   "s28: machine"         "$S28" 'idt: ok   machine is aarch64'
+gate_has   "s28: all terminated"  "$S28" 'idt: ok   all fields terminated'
+gate_has   "s28: sysname len 6"   "$S28" 'idt: ok   sysname len 6'
+gate_has   "s28: machine len 7"   "$S28" 'idt: ok   machine len 7'
+gate_has   "s28: field tails zero" "$S28" 'idt: ok   field tails zeroed'
+gate_has   "s28: not Linux"       "$S28" 'idt: ok   not Linux'
+gate_has   "s28: version present" "$S28" 'idt: ok   version present'
+gate_has   "s28: shrink"          "$S28" 'idt: ok   ftruncate to 4'
+gate_has   "s28: size after shrink" "$S28" 'idt: ok   size after shrink'
+gate_has   "s28: extend"          "$S28" 'idt: ok   ftruncate to 12'
+gate_has   "s28: size after extend" "$S28" 'idt: ok   size after extend'
+gate_has   "s28: zero len"        "$S28" 'idt: ok   size zeroed'
+gate_has   "s28: read after zero" "$S28" 'idt: ok   read after zero'
+gate_has   "s28: zero-fill"       "$S28" 'idt: ok   extending zeroes'
+gate_has   "s28: ro refused"      "$S28" 'idt: ok   ftruncate ro refused'
+gate_has   "s28: badfd EBADF"     "$S28" 'idt: ok   ftruncate badfd EBADF'
+gate_has   "s28: truncate path"   "$S28" 'idt: ok   truncate path to 3'
+gate_has   "s28: truncate size"   "$S28" 'idt: ok   size after truncate'
+gate_has   "s28: truncate ENOENT" "$S28" 'idt: ok   truncate missing ENOENT'
+gate_has   "s28: truncate EISDIR" "$S28" 'idt: ok   truncate dir EISDIR'
+gate_has   "s28: cleanup"         "$S28" 'idt: ok   unlink scratch'
+gate_has   "s28: all ok"          "$S28" 'idt: all ok'
+gate_has   "s28: exit 0"          "$S28" 'sh: idtest exited 0'
+gate_count "s28: no panic"        "$S28" 'panic' 0
+gate_count "s28: no unknown syscall" "$S28" 'unknown syscall' 0
+gate_has   "s28: clean exit"      "$S28" 'proc: pid 0 exited \(0\)'
+gate_bad   "s28" "$S28"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"
