@@ -1190,6 +1190,11 @@ fn signal_one(slot: usize, cur: usize, sig: u64) {
     let t = table();
     if slot == cur {
         t[cur].as_mut().unwrap().pending |= 1 << sig;
+        // Watched by this process's own EVFILT_SIGNAL registrations. Only
+        // the self-raise is watched: the filter attaches to the caller's
+        // knote list, so a signal this process sends to ANOTHER pid is not
+        // an event for it.
+        sig_notify(sig);
         return;
     }
     let action = t[slot].as_ref().unwrap().handlers[sig as usize];
@@ -1398,6 +1403,21 @@ pub fn deliver_signals(frame: &mut TrapFrame) {
             return;
         }
         let action = p.handlers[sig];
+
+        // A signal with an ACTIVE EVFILT_SIGNAL knote belongs to the
+        // knote list, not to the handler: it is delivered by kevent, and
+        // taking its default action here would kill the process that
+        // registered the filter to watch it. This is why the filter is
+        // checked before SIGKILL too -- an explicit handler cannot change
+        // SIGKILL, but a knote can intercept anything.
+        if sig != SIGKILL && kq_signal_watching(sig) {
+            // Leave it pending: kevent drains it. Clearing here would
+            // make the event uncollectable.
+            if action != SIG_IGN {
+                table()[cur].as_mut().unwrap().pending &= !(1 << sig);
+            }
+            continue;
+        }
 
         if sig == SIGKILL || (action == SIG_DFL && default_is_term(sig)) {
             terminate(frame, sig as u64, true);
@@ -1814,8 +1834,10 @@ pub struct Kevent {
 /// EVFILT_READ / EVFILT_WRITE (sys/sys/event.h).
 pub const EVFILT_READ: u32 = 0;
 pub const EVFILT_WRITE: u32 = 1;
-pub const EVFILT_VNODE: u32 = 2;
-pub const EVFILT_PROC: u32 = 3;
+pub const EVFILT_AIO: u32 = 2;
+pub const EVFILT_VNODE: u32 = 3;
+pub const EVFILT_PROC: u32 = 4;
+pub const EVFILT_SIGNAL: u32 = 5;
 
 // NOTE_* for EVFILT_PROC (sys/sys/event.h). These are distinct values from
 // the vnode notes -- NOTE_EXEC is 0x20000000 here and there is no vnode
@@ -2052,6 +2074,93 @@ fn proc_match(fflags: u32, pending: u32) -> bool {
         NOTE_FFOR => pending & (fflags & !NOTE_FFCTRLMASK) != 0,
         _ => pending != 0,
     }
+}
+
+// ---------- EVFILT_SIGNAL ----------
+//
+// Pending signals per signal number, for the calling process only. Same
+// shape as the process-event table: a monotonic `seq` plus a pending
+// bitmap, so a signal raised while no watcher exists is still deliverable
+// afterwards, and re-enabling a filter does not lose what arrived while
+// it was disabled.
+//
+// Per signal NUMBER rather than per process, because `ident` for this
+// filter is the signal, not a pid -- and because it is attached to the
+// process's own knote list, so a process cannot watch another's signals.
+struct SigEvents(UnsafeCell<[SigEvent; NSIG]>);
+unsafe impl Sync for SigEvents {}
+
+#[derive(Clone, Copy)]
+struct SigEvent {
+    seq: u32,
+    /// Set once any instance of this signal has been raised and not yet
+    /// consumed. A bitmap would be wrong here: two SIGUSR1s are one
+    /// event to a watcher, not two.
+    pending: bool,
+}
+
+static SIGEVENTS: SigEvents = SigEvents(UnsafeCell::new([SigEvent {
+    seq: 0,
+    pending: false,
+}; NSIG]));
+
+fn sigevents() -> &'static mut [SigEvent; NSIG] {
+    unsafe { &mut *SIGEVENTS.0.get() }
+}
+
+/// Record that `sig` was raised for the current process.
+pub fn sig_notify(sig: u64) {
+    if sig == 0 || sig >= NSIG as u64 {
+        return;
+    }
+    let e = &mut sigevents()[sig as usize];
+    e.seq = e.seq.wrapping_add(1);
+    e.pending = true;
+}
+
+/// The generation a new watcher records.
+pub fn sig_seq(sig: u64) -> u32 {
+    sigevents()
+        .get(sig as usize)
+        .map_or(0, |e| e.seq)
+}
+
+/// Drop history so a first-time watcher is not woken by signals it never
+/// asked about.
+pub fn sig_clear(sig: u64) {
+    if let Some(e) = sigevents().get_mut(sig as usize) {
+        e.pending = false;
+    }
+}
+
+/// Is the current process holding an enabled EVFILT_SIGNAL knote for
+/// `sig`? Read at every delivery boundary, so it must consult the CURRENT
+/// process's list only.
+pub fn kq_signal_watching(sig: usize) -> bool {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    table()[cur]
+        .as_ref()
+        .is_some_and(|p| {
+            p.kregs
+                .iter()
+                .any(|k| k.filter == EVFILT_SIGNAL && k.ident == sig as u64 && k.flags & EV_DISABLE == 0)
+        })
+}
+
+/// Is an EVFILT_SIGNAL registration ready? Returns the signal number, which
+/// kevent reports in `data` (fflags is unused for this filter).
+pub fn kq_sig_ready(k: &Kevent) -> Option<u64> {
+    if k.flags & EV_DISABLE != 0 {
+        return None;
+    }
+    let sig = k.ident;
+    let e = sigevents().get(sig as usize)?;
+    if !e.pending || e.seq == k.vseq {
+        return None;
+    }
+    // Consume only now that the filter is known to fire.
+    sigevents()[sig as usize].pending = false;
+    Some(sig)
 }
 
 /// Is an EVFILT_PROC registration ready? Returns the pending notes and, for

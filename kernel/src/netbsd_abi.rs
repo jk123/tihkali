@@ -262,6 +262,67 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         let Some(k) = ke_read(addr) else {
             return Io::Err(14);
         };
+        if k.filter == crate::proc::EVFILT_SIGNAL {
+            // EVFILT_SIGNAL watches a SIGNAL NUMBER on the calling process.
+            // fflags carries no note bits: the note IS the signal, and it
+            // comes back in `data`. There is nothing to narrow with, so no
+            // NOTE_FFAND/NOTE_FFOR handling here.
+            let sig = k.ident;
+            if sig == 0 || sig >= crate::proc::NSIG as u64 {
+                return Io::Err(22); // EINVAL: not a signal number
+            }
+            if k.flags & crate::proc::EV_DELETE != 0 {
+                match crate::proc::kq_delete(sig, k.filter) {
+                    Ok(()) => {}
+                    Err(e) => return Io::Err(e),
+                }
+                continue;
+            }
+            if k.flags & (crate::proc::EV_ADD | crate::proc::EV_ENABLE) == 0 {
+                if k.flags & crate::proc::EV_DISABLE != 0 {
+                    let regs = crate::proc::kq_regs();
+                    match regs
+                        .iter_mut()
+                        .find(|e| e.ident == sig && e.filter == k.filter)
+                    {
+                        Some(e) => e.flags |= crate::proc::EV_DISABLE,
+                        None => return Io::Err(2),
+                    }
+                    continue;
+                }
+                return Io::Err(22);
+            }
+            // Only a FIRST registration baselines history, so re-enabling a
+            // filter that was disabled while signals arrived does not
+            // discard them.
+            let prior = crate::proc::kq_regs()
+                .iter()
+                .find(|e| e.ident == sig && e.filter == k.filter)
+                .map(|e| e.vseq);
+            let seq = match prior {
+                Some(v) => v,
+                None => {
+                    crate::proc::sig_clear(sig);
+                    crate::proc::sig_seq(sig)
+                }
+            };
+            let mut r = crate::proc::Kevent {
+                ident: sig,
+                vseq: seq,
+                filter: k.filter,
+                flags: 0,
+                fflags: k.fflags,
+                udata: k.udata,
+            };
+            if k.flags & crate::proc::EV_DISABLE != 0 {
+                r.flags |= crate::proc::EV_DISABLE;
+            }
+            r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
+            if let Err(e) = crate::proc::kq_add(r) {
+                return Io::Err(e);
+            }
+            continue;
+        }
         if k.filter == crate::proc::EVFILT_PROC {
             // EVFILT_PROC watches a PID, not a path or a descriptor.
             let pid = k.ident as usize;
@@ -330,12 +391,19 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         }
         let is_vnode = k.filter == crate::proc::EVFILT_VNODE;
         // Filters needing kernel objects this kernel does not have are
-        // refused here rather than registered and never delivered.
+        // refused here rather than registered and never delivered. The
+        // remaining NetBSD filters are EVFILT_AIO (no async I/O at all),
+        // EVFILT_TIMER (ident is a nanosecond timeout, a different clock
+        // from the tick timer signals use), EVFILT_FS and EVFILT_USER.
         if k.filter != crate::proc::EVFILT_READ
             && k.filter != crate::proc::EVFILT_WRITE
             && !is_vnode
             && k.filter != crate::proc::EVFILT_PROC
+            && k.filter != crate::proc::EVFILT_SIGNAL
         {
+            if k.filter == crate::proc::EVFILT_AIO {
+                return Io::Err(38); // ENOSYS: no aio subsystem to attach to
+            }
             return Io::Err(22); // EINVAL
         }
         if is_vnode {
@@ -481,6 +549,8 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
             crate::proc::kq_vnode_ready(r).map(|notes| (notes, 0i64))
         } else if r.filter == crate::proc::EVFILT_PROC {
             crate::proc::kq_proc_ready(r).map(|(notes, child)| (notes, child as i64))
+        } else if r.filter == crate::proc::EVFILT_SIGNAL {
+            crate::proc::kq_sig_ready(r).map(|sig| (0u32, sig as i64))
         } else {
             ke_ready(r).map(|nbytes| (0u32, nbytes))
         };
@@ -492,17 +562,21 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                 // event -- the child for NOTE_FORK, the process itself for
                 // NOTE_EXEC/NOTE_EXIT. It is taken from the low bits of the
                 // pending note so a watcher learns WHICH pid it was.
-                let data = val;
+                // For EVFILT_PROC, `data` carries the pid that triggered the
+                // event -- the child for NOTE_FORK, the process itself for
+                // NOTE_EXEC/NOTE_EXIT. For EVFILT_SIGNAL it carries the
+                // signal number.
                 ke_write(
                     eventlist + n * KEVENT_SIZE as u64,
                     r,
                     r.filter,
                     0,
-                    data,
+                    val,
                     if is_vn || is_pp { notes } else { r.fflags },
                 );
                 n += 1;
-                if is_vn || is_pp {
+                let is_sig = r.filter == crate::proc::EVFILT_SIGNAL;
+                if is_vn || is_pp || is_sig {
                     // Re-base the registration's generation so the next
                     // call reports only what happens after this one, then
                     // KEEP it. Dropping it here would silently unregister
@@ -510,6 +584,8 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                     let mut next = *r;
                     next.vseq = if is_pp {
                         crate::proc::proc_seq(r.ident as usize)
+                    } else if is_sig {
+                        crate::proc::sig_seq(r.ident)
                     } else {
                         crate::fs::vnode_seq(r.ident as usize)
                     };

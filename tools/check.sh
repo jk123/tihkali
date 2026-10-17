@@ -678,9 +678,9 @@ S27="$T/s27.log"
 # reader. `returned udata` is the one that proves the offsets, because it
 # reads a caller-supplied value back out of kernel-written memory.
 ( sleep 5
-  printf 'kqtest\n'; sleep 12
+  printf 'kqtest\n'; sleep 15
   printf 'exit\n'; sleep 3
-) | timeout 36 ./tools/run.sh >"$S27" 2>&1
+) | timeout 40 ./tools/run.sh >"$S27" 2>&1
 gate_has   "s27: offset ident"    "$S27" 'kq: ok    offset ident'
 gate_has   "s27: offset filter"   "$S27" 'kq: ok    offset filter'
 gate_has   "s27: offset flags"    "$S27" 'kq: ok    offset flags'
@@ -763,6 +763,35 @@ gate_has   "s27: exec ident"      "$S27" 'kq: ok    exec ident is child'
 gate_has   "s27: proc delete"     "$S27" 'kq: ok    proc delete'
 gate_has   "s27: proc del ENOENT" "$S27" 'kq: ok    proc double delete ENOENT'
 gate_has   "s27: proc gone quiet" "$S27" 'kq: ok    proc gone is silent'
+# EVFILT_SIGNAL gates. The filter-number ones matter as much as the
+# behavioural ones: NetBSD numbers AIO=2, VNODE=3, PROC=4, SIGNAL=5, so
+# skipping AIO silently renumbers every later filter and a probe using the
+# wrong constants still passes every behavioural check. `knote suppresses
+# SIGUSR1 death` is the one that needs a real kernel fix -- without it the
+# watched signal takes its default action and kills the watcher.
+gate_has   "s27: signal 0 EINVAL" "$S27" 'kq: ok    signal 0 EINVAL'
+gate_has   "s27: signal oob EINVAL" "$S27" 'kq: ok    signal oob EINVAL'
+gate_has   "s27: signal add"    "$S27" 'kq: ok    signal add'
+gate_has   "s27: signal silent" "$S27" 'kq: ok    signal silent until raised'
+gate_has   "s27: self raise"    "$S27" 'kq: ok    self raise ok'
+gate_has   "s27: signal fires"  "$S27" 'kq: ok    signal fires'
+gate_has   "s27: signal filter" "$S27" 'kq: ok    signal filter is SIGNAL'
+gate_has   "s27: signal ident"  "$S27" 'kq: ok    signal ident roundtrips'
+gate_has   "s27: signal udata"  "$S27" 'kq: ok    signal udata'
+gate_has   "s27: signal data"   "$S27" 'kq: ok    signal data is sig'
+gate_has   "s27: not level-trig signal" "$S27" 'kq: ok    signal not level-triggered'
+gate_has   "s27: signal 17 add" "$S27" 'kq: ok    signal 17 add'
+gate_has   "s27: sig10 fires"   "$S27" 'kq: ok    sig10 still fires'
+gate_has   "s27: sig17 isolated" "$S27" 'kq: ok    sig17 not woken by 10'
+gate_has   "s27: signal disable" "$S27" 'kq: ok    signal disable'
+gate_has   "s27: disabled silent" "$S27" 'kq: ok    disabled signal silent'
+gate_has   "s27: signal enable" "$S27" 'kq: ok    signal enable'
+gate_has   "s27: signal recovers" "$S27" 'kq: ok    disabled signal recovers'
+gate_has   "s27: recovered 17"  "$S27" 'kq: ok    recovered data is 17'
+gate_has   "s27: knote saves USR1" "$S27" 'kq: ok    knote suppresses SIGUSR1 death'
+gate_has   "s27: aio ENOSYS"    "$S27" 'kq: ok    aio ENOSYS'
+gate_has   "s27: signal delete" "$S27" 'kq: ok    signal delete'
+gate_has   "s27: signal del ENOENT" "$S27" 'kq: ok    signal delete ENOENT'
 gate_has   "s27: all ok"          "$S27" 'kq: all ok'
 gate_has   "s27: exit 0"          "$S27" 'sh: kqtest exited 0'
 gate_count "s27: no panic"        "$S27" 'panic' 0

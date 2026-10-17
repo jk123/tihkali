@@ -302,6 +302,23 @@ unsafe fn kqueue() -> Result<i64, i64> {
     if err != 0 { Err(ret) } else { Ok(ret) }
 }
 
+/// SYS_kill(pid, sig) = 37.
+unsafe fn kill(pid: i64, sig: i64) -> Result<i64, i64> {
+    let ret: i64;
+    let err: isize;
+    unsafe {
+        asm!(
+            "svc #37",
+            "cset {err}, hs",
+            inlateout("x0") pid => ret,
+            in("x1") sig,
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 { Err(ret) } else { Ok(ret) }
+}
+
 /// SYS_kevent(kq, changelist, nchanges, eventlist, nevents, timeout) = 345
 unsafe fn kevent(
     kq: i64,
@@ -357,8 +374,10 @@ const KE_SIZE: usize = 72;
 // EVFILT_* (sys/sys/event.h)
 const EVFILT_READ: u32 = 0;
 const EVFILT_WRITE: u32 = 1;
-const EVFILT_VNODE: u32 = 2;
-const EVFILT_PROC: u32 = 3;
+const EVFILT_AIO: u32 = 2;
+const EVFILT_VNODE: u32 = 3;
+const EVFILT_PROC: u32 = 4;
+const EVFILT_SIGNAL: u32 = 5;
 
 // NOTE_* for EVFILT_PROC. These overlap the vnode NOTE_* space, so a
 // misdispatched filter is visible as a wrong fflags mask.
@@ -901,6 +920,93 @@ pub extern "C" fn _start() -> ! {
         // With the registration gone, the pending fork must not surface.
         let npx = kevent(kq, core::ptr::null(), 0, &mut po as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
         check("proc gone is silent", npx == Ok(0));
+
+        // --- EVFILT_SIGNAL: watch a signal on THIS process -------------
+        // ident is the signal number, there are no fflags to narrow with,
+        // and the signal comes back in `data`. Note the numbering: AIO is
+        // filter 2, so VNODE is 3 and PROC is 4 -- skipping AIO silently
+        // renumbers every later filter.
+        let sig0 = fillf(0, EVFILT_SIGNAL, EV_ADD, 0, 0);
+        check("signal 0 EINVAL", kevent(kq, &sig0 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
+        let sigbig = fillf(9999, EVFILT_SIGNAL, EV_ADD, 0, 0);
+        check("signal oob EINVAL", kevent(kq, &sigbig as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
+
+        // SIGUSR1. Raising it against ourselves is the only case a
+        // self-attached filter can see: the knote list belongs to this
+        // process, so a signal this process sends elsewhere is not ours.
+        let su1 = fillf(10, EVFILT_SIGNAL, EV_ADD, 0, 0x5117);
+        check("signal add", kevent(kq, &su1 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+
+        let mut psg = core::mem::zeroed::<Ke>();
+        let nsg0 = kevent(kq, core::ptr::null(), 0, &mut psg as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("signal silent until raised", nsg0 == Ok(0));
+
+        check("self raise ok", kill(getpid() as i64, 10) == Ok(0));
+
+        let mut psg2 = core::mem::zeroed::<Ke>();
+        let nsg1 = kevent(kq, core::ptr::null(), 0, &mut psg2 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("signal fires", nsg1 == Ok(1));
+        if nsg1 == Ok(1) {
+            let g = core::ptr::read_volatile(&psg2);
+            check("signal filter is SIGNAL", g.filter == EVFILT_SIGNAL);
+            check("signal ident roundtrips", g.ident == 10);
+            check("signal udata", g.udata == 0x5117);
+            check("signal data is sig", g.data == 10);
+        }
+        // Edge-preserving: the same signal must not be reported twice.
+        let nsg2 = kevent(kq, core::ptr::null(), 0, &mut psg2 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("signal not level-triggered", nsg2 == Ok(0));
+
+        // A different signal number has its own registration and must not
+        // be woken by SIGUSR1. SIGCHLD (17) is default-IGNORE, so it cannot
+        // kill this process whether or not a knote is attached -- which
+        // makes it the right vehicle for the filter tests below. Using a
+        // terminating signal here would test survival, not the filter.
+        let su2 = fillf(17, EVFILT_SIGNAL, EV_ADD, 0, 0x5225);
+        check("signal 17 add", kevent(kq, &su2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let _ = kill(getpid() as i64, 10);
+        let nsg3 = kevent(kq, core::ptr::null(), 0, &mut psg2 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("sig10 still fires", nsg3 == Ok(1));
+        let nsg4 = kevent(kq, core::ptr::null(), 0, &mut psg as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("sig17 not woken by 10", nsg4 == Ok(0));
+
+        // Disable, raise while disabled, re-enable: the signal that arrived
+        // in between must still be there. This is what re-basing only on a
+        // FIRST registration buys.
+        let sdis = fillf(17, EVFILT_SIGNAL, EV_DISABLE, 0, 0);
+        check("signal disable", kevent(kq, &sdis as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let _ = kill(getpid() as i64, 17);
+        let nsg5 = kevent(kq, core::ptr::null(), 0, &mut psg as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("disabled signal silent", nsg5 == Ok(0));
+        let sen = fillf(17, EVFILT_SIGNAL, EV_ENABLE, 0, 0);
+        check("signal enable", kevent(kq, &sen as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let nsg6 = kevent(kq, core::ptr::null(), 0, &mut psg as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("disabled signal recovers", nsg6 == Ok(1));
+        if nsg6 == Ok(1) {
+            let g = core::ptr::read_volatile(&psg);
+            check("recovered data is 17", g.data == 17);
+        }
+
+        // A terminating signal with a LIVE knote must not kill the process:
+        // it belongs to the knote list, not to the default action. This is
+        // what makes the filter usable for SIGUSR1 at all.
+        let mut psig = core::mem::zeroed::<Ke>();
+        let nsig = kevent(kq, core::ptr::null(), 0, &mut psig as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("knote suppresses SIGUSR1 death", {
+            let _ = kill(getpid() as i64, 10);
+            kevent(kq, core::ptr::null(), 0, &mut psig as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64) == Ok(1)
+        });
+        let _ = nsig;
+
+        // EVFILT_AIO has no kernel object to attach to -- refused as
+        // ENOSYS, distinctly from the EINVAL an unknown filter gets.
+        let aio = fillf(0, EVFILT_AIO, EV_ADD, 0, 0);
+        check("aio ENOSYS", kevent(kq, &aio as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(38));
+
+        let sdel = fillf(10, EVFILT_SIGNAL, EV_DELETE, 0, 0);
+        check("signal delete", kevent(kq, &sdel as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let sdel2 = fillf(10, EVFILT_SIGNAL, EV_DELETE, 0, 0);
+        check("signal delete ENOENT", kevent(kq, &sdel2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(2));
 
         close(fd);
         close(kq);
