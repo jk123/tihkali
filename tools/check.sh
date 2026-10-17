@@ -670,6 +670,52 @@ gate_count "s26: no unknown syscall" "$S26" 'unknown syscall' 0
 gate_has   "s26: clean exit"         "$S26" 'proc: pid 0 exited \(0\)'
 gate_bad   "s26" "$S26"
 
+echo "== session 27: NetBSD kqueue/kevent (event interface)"
+S27="$T/s27.log"
+# The struct-offset checks matter more than the behavioural ones here: a
+# kevent layout that is wrong in any field still returns the right COUNT for
+# a readiness query, so a count-only gate would pass a completely broken
+# reader. `returned udata` is the one that proves the offsets, because it
+# reads a caller-supplied value back out of kernel-written memory.
+( sleep 5
+  printf 'kqtest\n'; sleep 6
+  printf 'exit\n'; sleep 3
+) | timeout 29 ./tools/run.sh >"$S27" 2>&1
+gate_has   "s27: offset ident"    "$S27" 'kq: ok    offset ident'
+gate_has   "s27: offset filter"   "$S27" 'kq: ok    offset filter'
+gate_has   "s27: offset flags"    "$S27" 'kq: ok    offset flags'
+gate_has   "s27: offset fflags"   "$S27" 'kq: ok    offset fflags'
+gate_has   "s27: offset data"     "$S27" 'kq: ok    offset data'
+gate_has   "s27: offset udata"    "$S27" 'kq: ok    offset udata'
+gate_has   "s27: sizeof kevent"   "$S27" 'kq: ok    sizeof kevent'
+gate_has   "s27: kqueue returns"  "$S27" 'kq: ok    kqueue'
+gate_has   "s27: second kqueue"   "$S27" 'kq: ok    second kqueue'
+gate_has   "s27: distinct fds"    "$S27" 'kq: ok    kqueue fds differ'
+gate_has   "s27: add fires"       "$S27" 'kq: ok    add read fires'
+gate_has   "s27: ident roundtrip" "$S27" 'kq: ok    returned ident'
+gate_has   "s27: filter roundtrip" "$S27" 'kq: ok    returned filter'
+gate_has   "s27: udata roundtrip" "$S27" 'kq: ok    returned udata'
+gate_has   "s27: data is count"   "$S27" 'kq: ok    returned data is 1'
+gate_has   "s27: changelist only" "$S27" 'kq: ok    changelist only returns 0'
+gate_has   "s27: state persists"  "$S27" 'kq: ok    two events harvested'
+gate_has   "s27: both filters"    "$S27" 'kq: ok    write event present'
+gate_has   "s27: delete"          "$S27" 'kq: ok    delete returns 0'
+gate_has   "s27: survivor"        "$S27" 'kq: ok    survivor is read'
+gate_has   "s27: double del ENOENT" "$S27" 'kq: ok    double delete ENOENT'
+gate_has   "s27: disable"         "$S27" 'kq: ok    disabled reports nothing'
+gate_has   "s27: enable"          "$S27" 'kq: ok    re-enabled fires'
+gate_has   "s27: oneshot once"    "$S27" 'kq: ok    oneshot fires once'
+gate_has   "s27: oneshot consumed" "$S27" 'kq: ok    oneshot then silent'
+gate_has   "s27: vnode EINVAL"    "$S27" 'kq: ok    EVFILT_VNODE EINVAL'
+gate_has   "s27: bad fd EBADF"    "$S27" 'kq: ok    bad fd EBADF'
+gate_has   "s27: zero timespec"   "$S27" 'kq: ok    zero timeout polls'
+gate_has   "s27: all ok"          "$S27" 'kq: all ok'
+gate_has   "s27: exit 0"          "$S27" 'sh: kqtest exited 0'
+gate_count "s27: no panic"        "$S27" 'panic' 0
+gate_count "s27: no unknown syscall" "$S27" 'unknown syscall' 0
+gate_has   "s27: clean exit"      "$S27" 'proc: pid 0 exited \(0\)'
+gate_bad   "s27" "$S27"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

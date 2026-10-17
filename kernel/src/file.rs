@@ -41,6 +41,10 @@ pub enum FdTarget {
     /// (Never constructed without the `net` feature — hence the allow.)
     #[cfg_attr(not(feature = "net"), allow(dead_code))]
     Socket(usize),
+    /// A kqueue. Not a real kernel object: there is one registration
+    /// list per process, so every kqueue descriptor refers to the same
+    /// thing and readiness comes from that list rather than the fd.
+    Kqueue,
 }
 
 /// Fixed pool of anonymous pipes (v1: 8 × 512 B).

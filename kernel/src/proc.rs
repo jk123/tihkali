@@ -778,6 +778,9 @@ pub fn sys_execve(frame: &mut TrapFrame, path_ptr: u64, argv_ptr: u64) -> Result
         p.brk_start = brk;
         p.brk = brk;
         p.mmap_next = 0;
+        // Registrations do not survive exec: the descriptors they name are
+        // kept across exec, but a caller re-registers after any change.
+        kq_regs().clear();
     }
     frame.elr = entry as u64;
     frame.spsr = 0; // EL0t, interrupts on
@@ -864,6 +867,7 @@ pub fn sys_read(frame: &mut TrapFrame, fd: usize, buf: u64, len: usize) -> Io {
         return Io::Err(EFAULT);
     }
     match target {
+        FdTarget::Kqueue => Io::Val(0),
         FdTarget::TtyIn => {
             // Mask IRQs across the empty-check → sleep window so an RX can't
             // slip in and get lost; eret restores EL0 PSTATE from the frame.
@@ -940,6 +944,9 @@ pub fn sys_write(fd: usize, buf: u64, len: usize) -> Result<i64, u8> {
         return Ok(0);
     }
     match target {
+        // Reading a kqueue fd is not meaningful; report 0 rather than
+        // pretending. Readiness is harvested by kevent(2).
+        FdTarget::Kqueue => Ok(0),
         FdTarget::TtyOut => {
             if !user_range_ok(buf, len) {
                 return Err(EFAULT);
@@ -1748,4 +1755,124 @@ pub fn abspath(path: &str) -> String {
         r.pop();
     }
     r
+}
+
+// ---------- kqueue ----------
+//
+// NetBSD's native event interface. Unlike poll, which is a one-shot query,
+// kqueue returns a descriptor: registrations are held in the kernel and
+// kevent(2) either harvests ready ones or parks the caller until one is.
+//
+// Only EVFILT_READ and EVFILT_WRITE are supported, which is the whole of
+// what a libc uses when it is willing to use kqueue. Filters that need
+// objects this kernel does not have (EVFILT_VNODE, EVFILT_PROC,
+// EVFILT_SIGNAL, EVFILT_TIMER) are rejected at EV_ADD with EINVAL rather
+// than silently ignored, so a caller learns immediately instead of
+// blocking forever on an event that can never arrive.
+
+/// One registered event. Mirrors the ABI-visible fields.
+#[derive(Clone, Copy)]
+pub struct Kevent {
+    pub ident: u64,
+    pub filter: u32,
+    pub flags: u32,
+    pub fflags: u32,
+    pub udata: u64,
+}
+
+/// EVFILT_READ / EVFILT_WRITE (sys/sys/event.h).
+pub const EVFILT_READ: u32 = 0;
+pub const EVFILT_WRITE: u32 = 1;
+
+/// Registration flags (sys/sys/event.h).
+pub const EV_ADD: u32 = 0x0001;
+pub const EV_DELETE: u32 = 0x0002;
+pub const EV_ENABLE: u32 = 0x0004;
+pub const EV_DISABLE: u32 = 0x0008;
+pub const EV_ONESHOT: u32 = 0x0010;
+pub const EV_CLEAR: u32 = 0x0020;
+
+/// Registration cap. A caller asking for more is EINVAL, matching poll.
+pub const KQUEUE_MAX: usize = 64;
+
+/// The registration list. kqueues are not multiplexable here: one
+/// registration set per process, so kqueue() hands back a shared
+/// descriptor. Single-core, so a plain static needs no synchronisation.
+struct KqTable(UnsafeCell<Vec<Kevent>>);
+unsafe impl Sync for KqTable {}
+
+static KQ: KqTable = KqTable(UnsafeCell::new(Vec::new()));
+
+pub fn kq_regs() -> &'static mut Vec<Kevent> {
+    unsafe { &mut *KQ.0.get() }
+}
+
+/// Add or update a registration. `ident` is the fd.
+pub fn kq_add(k: Kevent) -> Result<(), u8> {
+    let v = kq_regs();
+    if let Some(e) = v.iter_mut().find(|e| e.ident == k.ident && e.filter == k.filter) {
+        *e = k;
+        return Ok(());
+    }
+    if v.len() >= KQUEUE_MAX {
+        return Err(24); // EMFILE
+    }
+    v.push(k);
+    Ok(())
+}
+
+/// Remove one registration. ENOENT if it was never there, which is what
+/// EV_DELETE must report.
+pub fn kq_delete(ident: u64, filter: u32) -> Result<(), u8> {
+    let v = kq_regs();
+    match v.iter().position(|e| e.ident == ident && e.filter == filter) {
+        Some(i) => {
+            v.remove(i);
+            Ok(())
+        }
+        None => Err(2), // ENOENT
+    }
+}
+
+/// Is any enabled registration currently ready? Lets poll() treat a kqueue
+/// descriptor like any other readable fd.
+pub fn kq_any_ready() -> bool {
+    kq_regs().iter().any(|r| {
+        if r.flags & EV_DISABLE != 0 {
+            return false;
+        }
+        let fd = r.ident as i64;
+        if fd < 0 {
+            return false;
+        }
+        let Some(target) = current_target(fd as usize) else {
+            return false;
+        };
+        let (recv, send) = match target {
+            FdTarget::TtyIn => (crate::tty::has_data(), false),
+            FdTarget::TtyOut => (false, true),
+            FdTarget::File(_) => (true, true),
+            FdTarget::Pipe { slot, write_end: false } => {
+                (crate::file::pipe_avail(slot) > 0
+                    || pipe_end_count(slot, true) == 0, false)
+            }
+            FdTarget::Pipe { slot, write_end: true } => (
+                false,
+                pipe_end_count(slot, false) > 0 && crate::file::pipe_free(slot) > 0,
+            ),
+            #[cfg(feature = "net")]
+            FdTarget::Socket(s) => match crate::net::sock_poll(s) {
+                Some((r, w)) => (r, w),
+                None => return false,
+            },
+            #[cfg(not(feature = "net"))]
+            FdTarget::Socket(_) => (false, false),
+            FdTarget::Kqueue => (false, false),
+        };
+        match r.filter {
+            EVFILT_READ => recv,
+            EVFILT_WRITE => send,
+            _ => false,
+        }
+    })
 }

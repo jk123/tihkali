@@ -401,6 +401,25 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 }
             }
         }
+        // --- kqueue ---
+        nbsys::KQUEUE => {
+            // SYS_kqueue(): hand back a descriptor for this process's
+            // registration list. There is no descriptor pool for it here --
+            // one list per process -- so the fd is a marker, not a real
+            // kernel object, and every process gets the same number.
+            match crate::proc::install_fd(crate::file::FdTarget::Kqueue) {
+                Ok(fd) => (fd as i64, 0),
+                Err(e) => (-1, e),
+            }
+        }
+        nbsys::KEVENT => {
+            // SYS_kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
+            match crate::netbsd_abi::kevent_arm(frame) {
+                crate::proc::Io::Val(n) => (n, 0),
+                crate::proc::Io::Err(e) => (-1, e),
+                crate::proc::Io::Slept => return,
+            }
+        }
         // --- socket identity ---
         #[cfg(feature = "net")]
         nbsys::GETPEERNAME => {

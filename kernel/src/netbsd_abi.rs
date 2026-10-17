@@ -129,3 +129,253 @@ pub fn walk_iovecs(iov: u64, cnt: u64) -> Result<alloc::vec::Vec<(u64, u64)>, u8
     }
     Ok(out)
 }
+
+// ---------- kqueue ----------
+
+/// NetBSD aarch64 `struct kevent` — **72 bytes**.
+///
+/// Layout measured by compiling the `struct kevent` from `sys/sys/event.h`
+/// against the aarch64 ABI with the vendored cross gcc and reading the
+/// `offsetof` immediates out of the object file:
+///
+///   ident@0 u64, filter@8 u32, flags@12 u32, fflags@16 u32,
+///   data@24 i64, udata@32 u64, ext[4]@40 => 72 bytes
+///
+/// Three traps, each of which compiles and runs while reading garbage:
+/// `ident` is a full 8-byte `uintptr_t`, so `filter` starts at offset 8 and
+/// not 4; `filter` and `flags` are `uint32_t` despite every reference
+/// spelling them as u16 — reading them as u16 yields the right *value*
+/// while putting every later field at the wrong address; and the trailing
+/// `ext[4]` is easy to forget when adding up the size. Linux's kevent also
+/// leads with `udata`, so copying the Linux arm would hand back the wrong
+/// opaque pointer.
+pub const KEVENT_SIZE: usize = 72;
+
+/// `filter` and `flags` are `uint32_t`, not `uint16_t`. Reading them as u16
+/// would appear to work -- the low half holds the value and the value is
+/// small -- while every later field lands at the wrong address.
+struct Ke {
+    ident: u64,
+    filter: u32,
+    flags: u32,
+    fflags: u32,
+    data: i64,
+    udata: u64,
+}
+
+fn ke_read(addr: u64) -> Option<Ke> {
+    if !crate::proc::user_range_ok(addr, KEVENT_SIZE) {
+        return None;
+    }
+    unsafe {
+        let p = addr as *const u8;
+        Some(Ke {
+            ident: (p as *const u64).read_unaligned(),
+            filter: (p as *const u32).add(2).read_unaligned(),
+            flags: (p as *const u32).add(3).read_unaligned(),
+            fflags: (p as *const u32).add(4).read_unaligned(),
+            data: (p as *const i64).add(3).read_unaligned(),
+            udata: (p as *const u64).add(4).read_unaligned(),
+        })
+    }
+}
+
+fn ke_write(addr: u64, k: &crate::proc::Kevent, filter: u32, flags: u32, data: i64) {
+    unsafe {
+        let p = addr as *mut u8;
+        (p as *mut u64).write_unaligned(k.ident);
+        (p as *mut u32).add(2).write_unaligned(filter);
+        (p as *mut u32).add(3).write_unaligned(flags);
+        (p as *mut u32).add(4).write_unaligned(k.fflags);
+        (p as *mut i64).add(3).write_unaligned(data);
+        (p as *mut u64).add(4).write_unaligned(k.udata);
+        for i in 0..4 {
+            (p as *mut u64).add(5 + i).write_unaligned(0);
+        }
+    }
+}
+
+/// Is this registration's fd ready for its filter right now?
+fn ke_ready(k: &crate::proc::Kevent) -> Option<i64> {
+    let fd = k.ident as i64;
+    if fd < 0 {
+        return None;
+    }
+    let target = crate::proc::current_target(fd as usize)?;
+    let (recv, send) = match target {
+        crate::file::FdTarget::TtyIn => (crate::tty::has_data(), false),
+        crate::file::FdTarget::TtyOut => (false, true),
+        crate::file::FdTarget::File(_) => (true, true),
+        crate::file::FdTarget::Pipe { slot, write_end: false } => {
+            let eof = crate::proc::pipe_end_count(slot, true) == 0;
+            (crate::file::pipe_avail(slot) > 0 || eof, false)
+        }
+        crate::file::FdTarget::Pipe { slot, write_end: true } => (
+            false,
+            crate::proc::pipe_end_count(slot, false) > 0 && crate::file::pipe_free(slot) > 0,
+        ),
+        #[cfg(feature = "net")]
+        crate::file::FdTarget::Socket(s) => match crate::net::sock_poll(s) {
+            Some((r, w)) => (r, w),
+            None => return None,
+        },
+        #[cfg(not(feature = "net"))]
+        crate::file::FdTarget::Socket(_) => return None,
+        crate::file::FdTarget::Kqueue => (crate::proc::kq_any_ready(), false),
+    };
+    match k.filter {
+        crate::proc::EVFILT_READ => recv.then_some(1),
+        crate::proc::EVFILT_WRITE => send.then_some(1),
+        _ => None,
+    }
+}
+
+/// `kevent(2)` for the NetBSD personality.
+///
+/// Returns the number of events written, `Err` with an errno, or `Slept`
+/// when the caller parked waiting (the syscall epilogue must not run then).
+pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
+    use crate::proc::Io;
+    let changelist = frame.x[1];
+    let nchanges = frame.x[2] as u64;
+    let eventlist = frame.x[3];
+    let nevents = frame.x[4] as u64;
+    let timeout_ptr = frame.x[5];
+
+    if nchanges > crate::proc::KQUEUE_MAX as u64 || nevents > crate::proc::KQUEUE_MAX as u64 {
+        return Io::Err(22); // EINVAL
+    }
+    if nevents != 0 && !crate::proc::user_range_ok(eventlist, (nevents * KEVENT_SIZE as u64) as usize) {
+        return Io::Err(14); // EFAULT
+    }
+
+    // --- changelist ---
+    for i in 0..nchanges {
+        let addr = changelist + i * KEVENT_SIZE as u64;
+        let Some(k) = ke_read(addr) else {
+            return Io::Err(14);
+        };
+        // Only the two filters this kernel can answer for are accepted;
+        // the rest would otherwise register successfully and never fire.
+        if k.filter != crate::proc::EVFILT_READ && k.filter != crate::proc::EVFILT_WRITE {
+            return Io::Err(22); // EINVAL
+        }
+        if k.ident as i64 >= 0 && crate::proc::current_target(k.ident as usize).is_none() {
+            // EV_ERROR would be reported in the event list; failing the
+            // whole call is simpler and still tells the caller the fd is
+            // bad.
+            return Io::Err(9); // EBADF
+        }
+        if k.flags & crate::proc::EV_DELETE != 0 {
+            match crate::proc::kq_delete(k.ident, k.filter) {
+                Ok(()) => {}
+                Err(e) => return Io::Err(e),
+            }
+            continue;
+        }
+        // EV_ADD and EV_ENABLE both mean "registered"; EV_DISABLE only
+        // silences an existing one, so keep the entry but mark it off.
+        if k.flags & crate::proc::EV_ADD != 0 || k.flags & crate::proc::EV_ENABLE != 0 {
+            let mut r = crate::proc::Kevent {
+                ident: k.ident,
+                filter: k.filter,
+                flags: if k.flags & crate::proc::EV_DISABLE != 0 {
+                    crate::proc::EV_DISABLE
+                } else {
+                    0
+                },
+                fflags: k.fflags,
+                udata: k.udata,
+            };
+            r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
+            if let Err(e) = crate::proc::kq_add(r) {
+                return Io::Err(e);
+            }
+        } else if k.flags & crate::proc::EV_DISABLE != 0 {
+            // Disable an existing registration without adding a new one.
+            let regs = crate::proc::kq_regs();
+            if let Some(e) = regs.iter_mut().find(|e| e.ident == k.ident && e.filter == k.filter) {
+                e.flags |= crate::proc::EV_DISABLE;
+            } else {
+                return Io::Err(2); // ENOENT
+            }
+        }
+    }
+
+    // --- eventlist ---
+    #[cfg(feature = "net")]
+    crate::net::poll_tick();
+
+    let mut n = 0u64;
+    let regs = crate::proc::kq_regs();
+    let mut keep: alloc::vec::Vec<crate::proc::Kevent> = alloc::vec::Vec::new();
+    for r in regs.iter() {
+        if n >= nevents {
+            keep.push(*r);
+            continue;
+        }
+        if r.flags & crate::proc::EV_DISABLE != 0 {
+            keep.push(*r);
+            continue;
+        }
+        match ke_ready(r) {
+            Some(nbytes) => {
+                ke_write(
+                    eventlist + n * KEVENT_SIZE as u64,
+                    r,
+                    r.filter,
+                    0,
+                    nbytes,
+                );
+                n += 1;
+                if r.flags & crate::proc::EV_ONESHOT != 0 {
+                    continue; // drop it
+                }
+                keep.push(*r);
+            }
+            None => keep.push(*r),
+        }
+    }
+    *regs = keep;
+
+    if n > 0 {
+        crate::proc::deadline_clear();
+        return Io::Val(n as i64);
+    }
+    if crate::proc::has_deliverable() {
+        crate::proc::deadline_clear();
+        return Io::Err(4); // EINTR
+    }
+    if nevents == 0 {
+        // A pure changelist call never blocks, whatever the timeout says.
+        crate::proc::deadline_clear();
+        return Io::Val(0);
+    }
+
+    // --- park ---
+    // A null timeout blocks indefinitely; anything else is a timespec.
+    if timeout_ptr != 0 {
+        if !crate::proc::user_range_ok(timeout_ptr, 16) {
+            return Io::Err(14);
+        }
+        let (sec, nsec) = unsafe {
+            (
+                (timeout_ptr as *const i64).read_unaligned(),
+                (timeout_ptr as *const i64).add(1).read_unaligned(),
+            )
+        };
+        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+            return Io::Err(22);
+        }
+        if sec == 0 && nsec == 0 {
+            return Io::Val(0); // pure poll
+        }
+        let ms = (sec as u64).saturating_mul(1000) + (nsec as u64) / 1_000_000;
+        let at = crate::arch::timer::now().saturating_add(ms);
+        crate::proc::sleep_timed(frame, at);
+        return Io::Slept;
+    }
+    crate::proc::deadline_clear();
+    crate::proc::sleep_current(frame);
+    Io::Slept
+}

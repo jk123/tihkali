@@ -920,6 +920,15 @@ fn poll_revents(fd: i32, events: u16) -> u16 {
             }
         }
         FdTarget::TtyOut => events & POLLOUT,
+        // A kqueue descriptor reports readable when any registration is
+        // currently ready, which is what makes poll() a usable front end.
+        FdTarget::Kqueue => {
+            if crate::proc::kq_any_ready() {
+                events & POLLIN
+            } else {
+                0
+            }
+        }
         // Regular files never block: always readable/writable.
         FdTarget::File(_) => events & (POLLIN | POLLOUT),
         FdTarget::Pipe { slot, write_end: false } => {
