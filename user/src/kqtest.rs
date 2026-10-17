@@ -30,7 +30,8 @@ macro_rules! p {
 
 fn check(name: &str, ok: bool) {
     let pad = b"\n                                 " as &[u8];
-    let n = 25 - name.len();
+    // Saturating and clamped: an over-long name must not panic the probe.
+    let n = (25usize).saturating_sub(name.len()).min(pad.len() - 1);
     unsafe {
         write(1, b"kq: ok    ");
         write(1, name.as_bytes());
@@ -43,6 +44,35 @@ fn check(name: &str, ok: bool) {
             write(1, b">>\n");
             FAILURES += 1;
         }
+    }
+}
+
+/// Print a value in hex, which is how NOTE_* masks are read.
+fn print_hex(name: &str, v: u32) {
+    let mut digits = [0u8; 8];
+    let mut n = 0;
+    let mut u = v;
+    if u == 0 {
+        digits[n] = b'0';
+        n += 1;
+    }
+    while u > 0 {
+        digits[n] = b"0123456789abcdef"[(u & 15) as usize];
+        u >>= 4;
+        n += 1;
+    }
+    let mut out = [0u8; 8];
+    let mut w = 0;
+    for i in (0..n).rev() {
+        out[w] = digits[i];
+        w += 1;
+    }
+    unsafe {
+        write(1, b"kq: hex  ");
+        write(1, name.as_bytes());
+        write(1, b" = 0x");
+        write(1, &out[..w]);
+        write(1, b"\n");
     }
 }
 
@@ -83,6 +113,57 @@ unsafe fn write(fd: i64, buf: &[u8]) {
             options(nostack),
         );
     }
+}
+
+/// SYS_write(fd, buf, len) = 4
+unsafe fn wr(fd: i64, buf: &[u8]) -> Result<i64, i64> {
+    let ret: i64;
+    let err: isize;
+    unsafe {
+        asm!(
+            "svc #4",
+            "cset {err}, hs",
+            inlateout("x0") fd => ret,
+            in("x1") buf.as_ptr(),
+            in("x2") buf.len(),
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 { Err(ret) } else { Ok(ret) }
+}
+
+/// SYS_unlink(path) = 10
+unsafe fn unlink(path: *const u8) -> Result<i64, i64> {
+    let ret: i64;
+    let err: isize;
+    unsafe {
+        asm!(
+            "svc #10",
+            "cset {err}, hs",
+            inlateout("x0") path => ret,
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 { Err(ret) } else { Ok(ret) }
+}
+
+/// SYS_truncate(path, length) = 129
+unsafe fn truncate(path: *const u8, len: i64) -> Result<i64, i64> {
+    let ret: i64;
+    let err: isize;
+    unsafe {
+        asm!(
+            "svc #129",
+            "cset {err}, hs",
+            inlateout("x0") path => ret,
+            in("x1") len,
+            err = out(reg) err,
+            options(nostack),
+        );
+    }
+    if err != 0 { Err(ret) } else { Ok(ret) }
 }
 
 /// SYS_open(path, flags) = 5
@@ -180,7 +261,7 @@ const KE_SIZE: usize = 72;
 // EVFILT_* (sys/sys/event.h)
 const EVFILT_READ: u32 = 0;
 const EVFILT_WRITE: u32 = 1;
-const EVFILT_VNODE: u32 = 2; // not supported here
+const EVFILT_VNODE: u32 = 2;
 
 // Registration flags.
 const EV_ADD: u32 = 0x0001;
@@ -188,6 +269,15 @@ const EV_DELETE: u32 = 0x0002;
 const EV_ENABLE: u32 = 0x0004;
 const EV_DISABLE: u32 = 0x0008;
 const EV_ONESHOT: u32 = 0x0010;
+
+// NOTE_* filter flags for EVFILT_VNODE.
+const NOTE_DELETE: u32 = 0x0001;
+const NOTE_WRITE: u32 = 0x0002;
+const NOTE_EXTEND: u32 = 0x0004;
+const NOTE_ATTRIB: u32 = 0x0008;
+const NOTE_RENAME: u32 = 0x0020;
+const NOTE_FFAND: u32 = 0x4000_0000;
+const NOTE_FFOR: u32 = 0x8000_0000;
 
 /// Offsets asserted against the kernel's own writer. If these drift the
 /// probe is reading the wrong bytes and every check below is meaningless.
@@ -205,6 +295,13 @@ const OFF_UDATA: usize = 32;
 /// passes this instead: it is kevent(2)'s documented poll-without-blocking
 /// form.
 const POLL_ONLY: [i64; 2] = [0, 0];
+
+/// As `fill`, but with fflags set -- needed for the NOTE_FF* filters.
+fn fillf(ident: u64, filter: u32, flags: u32, fflags: u32, udata: u64) -> Ke {
+    let mut k = fill(ident, filter, flags, udata);
+    k.fflags = fflags;
+    k
+}
 
 fn fill(ident: u64, filter: u32, flags: u32, udata: u64) -> Ke {
     Ke {
@@ -355,10 +452,117 @@ pub extern "C" fn _start() -> ! {
         let n12 = kevent(kq, core::ptr::null(), 0, &mut out5 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
         check("oneshot then silent", n12 == Ok(0));
 
-        // --- an unsupported filter must be refused, not silently ignored --
-        let bad = fill(fd as u64, EVFILT_VNODE, EV_ADD, 0);
-        let n13 = kevent(kq, &bad as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
-        check("EVFILT_VNODE EINVAL", n13 == Err(22));
+        // --- EVFILT_VNODE: watches a PATH, not a descriptor --------------
+        // The registration is edge-preserving: it fires on a *change*, not
+        // on "something is pending", and re-arms itself. So the ordering
+        // below matters -- register, poll for silence, make a change, poll
+        // again -- and a "fires again without a change" check is what
+        // catches a level-triggered implementation.
+        let vp = p!("/vnodetest.tmp");
+        let vf = fillf(vp as u64, EVFILT_VNODE, EV_ADD, 0, 0xABCD);
+        let n13 = kevent(kq, &vf as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("vnode add on missing ENOENT", n13 == Err(2));
+
+        // Create it: that itself is a change, but the watcher is registered
+        // afterwards so it must not fire on history.
+        let Ok(vfd) = open(vp, 0x0002 | 0x0200) else {
+            check("open vnode scratch", false);
+            finish();
+        };
+        let vf2 = fillf(vp as u64, EVFILT_VNODE, EV_ADD, 0, 0xABCD);
+        let n13b = kevent(kq, &vf2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("vnode add succeeds", n13b == Ok(0));
+
+        // Silent until something actually happens.
+        let mut vo = core::mem::zeroed::<Ke>();
+        let n13c = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("vnode silent when untouched", n13c == Ok(0));
+
+        // A write must wake it with NOTE_WRITE.
+        check("write to scratch", wr(vfd, b"hello") == Ok(5));
+        let n13d = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("vnode fires on write", n13d == Ok(1));
+        if n13d == Ok(1) {
+            let g = core::ptr::read_volatile(&vo);
+            check("vnode filter is VNODE", g.filter == EVFILT_VNODE);
+            check("vnode udata roundtrips", g.udata == 0xABCD);
+            check("vnode fflags has WRITE", g.fflags & NOTE_WRITE != 0);
+            print_hex("vnode notes on write", g.fflags);
+        }
+        // Edge-preserving: having fired once, silence until the next change.
+        let n13e = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("vnode not level-triggered", n13e == Ok(0));
+
+        // Growing the file is NOTE_EXTEND as well as NOTE_WRITE.
+        let tg = truncate(vp, 32);
+        check("truncate to grow", tg == Ok(0));
+        let n13f = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("vnode fires on extend", n13f == Ok(1));
+        if n13f == Ok(1) {
+            let g = core::ptr::read_volatile(&vo);
+            check("extend sets NOTE_EXTEND", g.fflags & NOTE_EXTEND != 0);
+        }
+
+        // NOTE_FFAND: a watcher narrowed to one note must ignore others.
+        // EV_ENABLE (not EV_DISABLE) re-registers with the new fflags: the
+        // kernel's EV_ADD|EV_ENABLE path replaces the entry wholesale.
+        let vf3 = fillf(vp as u64, EVFILT_VNODE, EV_ENABLE, NOTE_FFAND | NOTE_RENAME, 0);
+        let s3 = kevent(kq, &vf3 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0);
+        check("vnode fflags set", s3 == Ok(0));
+        // A write does not match a RENAME-only filter. It must be IGNORED
+        // here and STILL PENDING afterwards -- that is what the restore
+        // path is for. Two polls: the first must see nothing, the second
+        // (after re-widening) must deliver the write.
+        let wn = wr(vfd, b"more");
+        check("write while narrowed", wn == Ok(4));
+        let narrow_poll = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("narrowed ignores write", narrow_poll == Ok(0));
+        // Poll AGAIN under the same narrow filter: the note must still be
+        // pending, not silently consumed by the first non-matching poll.
+        let narrow_poll2 = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("narrowed still silent", narrow_poll2 == Ok(0));
+
+        // Widen back to "any note". The write was never consumed by the
+        // narrow poll, so it must arrive now.
+        let vf5 = fillf(vp as u64, EVFILT_VNODE, EV_ENABLE, 0, 0);
+        check("vnode any-note", kevent(kq, &vf5 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let n13g = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("pending note survives narrowing", n13g == Ok(1));
+        if n13g == Ok(1) {
+            let g = core::ptr::read_volatile(&vo);
+            check("recovered note is WRITE", g.fflags & NOTE_WRITE != 0);
+        }
+
+        // NOTE_FFOR: any-of matching.
+        let vf6 = fillf(vp as u64, EVFILT_VNODE, EV_ENABLE, NOTE_FFOR | NOTE_WRITE | NOTE_ATTRIB, 0);
+        check("vnode ffor set", kevent(kq, &vf6 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        check("write for ffor", wr(vfd, b"x") == Ok(1));
+        let n13h = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("ffor matches write", n13h == Ok(1));
+        // A filter for a note that cannot occur must not fire.
+        let vf7 = fillf(vp as u64, EVFILT_VNODE, EV_ENABLE, NOTE_FFOR | NOTE_DELETE, 0);
+        check("vnode ffor delete set", kevent(kq, &vf7 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        check("write for ffor delete", wr(vfd, b"y") == Ok(1));
+        let n13i = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("ffor delete ignores write", n13i == Ok(0));
+        // Reset to any-note so the deletion below is visible.
+        let vf8 = fillf(vp as u64, EVFILT_VNODE, EV_ENABLE, 0, 0);
+        check("vnode reset to any", kevent(kq, &vf8 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+
+        // Removing the watched file reports NOTE_DELETE.
+        check("unlink watched file", unlink(vp) == Ok(0));
+        let n13j = kevent(kq, core::ptr::null(), 0, &mut vo as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("vnode fires on delete", n13j == Ok(1));
+        if n13j == Ok(1) {
+            let g = core::ptr::read_volatile(&vo);
+            check("delete sets NOTE_DELETE", g.fflags & NOTE_DELETE != 0);
+        }
+
+        // Watching a now-missing path fails, rather than silently passing.
+        let vf9 = fillf(vp as u64, EVFILT_VNODE, EV_DELETE, 0, 0);
+        check("vnode delete missing ENOENT", kevent(kq, &vf9 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(2));
+
+        close(vfd);
 
         // A bad fd must be reported too.
         let badfd = fill(9999, EVFILT_READ, EV_ADD, 0);

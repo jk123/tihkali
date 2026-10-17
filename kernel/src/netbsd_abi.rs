@@ -180,13 +180,20 @@ fn ke_read(addr: u64) -> Option<Ke> {
     }
 }
 
-fn ke_write(addr: u64, k: &crate::proc::Kevent, filter: u32, flags: u32, data: i64) {
+fn ke_write(
+    addr: u64,
+    k: &crate::proc::Kevent,
+    filter: u32,
+    flags: u32,
+    data: i64,
+    fflags: u32,
+) {
     unsafe {
         let p = addr as *mut u8;
         (p as *mut u64).write_unaligned(k.ident);
         (p as *mut u32).add(2).write_unaligned(filter);
         (p as *mut u32).add(3).write_unaligned(flags);
-        (p as *mut u32).add(4).write_unaligned(k.fflags);
+        (p as *mut u32).add(4).write_unaligned(fflags);
         (p as *mut i64).add(3).write_unaligned(data);
         (p as *mut u64).add(4).write_unaligned(k.udata);
         for i in 0..4 {
@@ -255,10 +262,91 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         let Some(k) = ke_read(addr) else {
             return Io::Err(14);
         };
-        // Only the two filters this kernel can answer for are accepted;
-        // the rest would otherwise register successfully and never fire.
-        if k.filter != crate::proc::EVFILT_READ && k.filter != crate::proc::EVFILT_WRITE {
+        let is_vnode = k.filter == crate::proc::EVFILT_VNODE;
+        // Filters needing kernel objects this kernel does not have are
+        // refused here rather than registered and never delivered.
+        if k.filter != crate::proc::EVFILT_READ
+            && k.filter != crate::proc::EVFILT_WRITE
+            && !is_vnode
+        {
             return Io::Err(22); // EINVAL
+        }
+        if is_vnode {
+            // EVFILT_VNODE watches a PATH, not a descriptor, so `ident` is
+            // a pointer to a string rather than an fd.
+            let raw = match crate::proc::read_user_cstr(k.ident, 256) {
+                Some(p) => p,
+                None => return Io::Err(14),
+            };
+            match crate::fs::lookup(&crate::proc::abspath(&raw)) {
+                None => return Io::Err(crate::file::ENOENT),
+                Some(idx) => {
+                    if k.flags & crate::proc::EV_DELETE != 0 {
+                        match crate::proc::kq_delete(idx as u64, k.filter) {
+                            Ok(()) => {}
+                            Err(e) => return Io::Err(e),
+                        }
+                        continue;
+                    }
+                    if k.flags & (crate::proc::EV_ADD | crate::proc::EV_ENABLE) == 0 {
+                        if k.flags & crate::proc::EV_DISABLE != 0 {
+                            let regs = crate::proc::kq_regs();
+                            let hit = regs
+                                .iter_mut()
+                                .find(|e| e.ident == idx as u64 && e.filter == k.filter);
+                            match hit {
+                                Some(e) => e.flags |= crate::proc::EV_DISABLE,
+                                None => return Io::Err(2),
+                            }
+                            continue;
+                        }
+                        return Io::Err(22);
+                    }
+                    // Re-registering must not silently discard a note the
+                    // watcher has not been told about yet, and must not
+                    // re-baseline the generation either: a narrowed filter
+                    // that is widened again must still deliver the events
+                    // that arrived while it was narrowed.
+                    //
+                    // Only the FIRST registration baselines -- a brand new
+                    // watcher must not be woken by history it never asked
+                    // about. A re-registration keeps the existing entry's
+                    // generation, so anything already pending still fires.
+                    let prior = crate::proc::kq_regs()
+                        .iter()
+                        .find(|e| e.ident == idx as u64 && e.filter == k.filter)
+                        .map(|e| e.vseq);
+                    let seq = match prior {
+                        Some(v) => {
+                            if v == 0 {
+                                crate::fs::vnode_clear_notes(idx);
+                            }
+                            v
+                        }
+                        None => {
+                            crate::fs::vnode_clear_notes(idx);
+                            crate::fs::vnode_seq(idx)
+                        }
+                    };
+                    let mut r = crate::proc::Kevent {
+                        ident: idx as u64,
+                        vseq: seq,
+                        filter: k.filter,
+                        flags: if k.flags & crate::proc::EV_DISABLE != 0 {
+                            crate::proc::EV_DISABLE
+                        } else {
+                            0
+                        },
+                        fflags: k.fflags,
+                        udata: k.udata,
+                    };
+                    r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
+                    if let Err(e) = crate::proc::kq_add(r) {
+                        return Io::Err(e);
+                    }
+                    continue;
+                }
+            }
         }
         if k.ident as i64 >= 0 && crate::proc::current_target(k.ident as usize).is_none() {
             // EV_ERROR would be reported in the event list; failing the
@@ -278,6 +366,7 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         if k.flags & crate::proc::EV_ADD != 0 || k.flags & crate::proc::EV_ENABLE != 0 {
             let mut r = crate::proc::Kevent {
                 ident: k.ident,
+                vseq: 0,
                 filter: k.filter,
                 flags: if k.flags & crate::proc::EV_DISABLE != 0 {
                     crate::proc::EV_DISABLE
@@ -318,16 +407,39 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
             keep.push(*r);
             continue;
         }
-        match ke_ready(r) {
-            Some(nbytes) => {
+        // A vnode event reports the NOTE bits that fired in fflags and
+        // re-bases the registration's generation, so the same change is not
+        // reported twice.
+        let ready = if r.filter == crate::proc::EVFILT_VNODE {
+            crate::proc::kq_vnode_ready(r).map(|notes| (notes, 0i64))
+        } else {
+            ke_ready(r).map(|nbytes| (0u32, nbytes))
+        };
+        match ready {
+            Some((notes, val)) => {
+                let is_vn = r.filter == crate::proc::EVFILT_VNODE;
                 ke_write(
                     eventlist + n * KEVENT_SIZE as u64,
                     r,
                     r.filter,
                     0,
-                    nbytes,
+                    val as i64,
+                    if is_vn { notes } else { r.fflags },
                 );
                 n += 1;
+                if is_vn {
+                    // Re-base the registration's generation so the next
+                    // call reports only what happens after this one, then
+                    // KEEP it. Dropping it here would silently unregister
+                    // the watcher after its first event.
+                    let mut next = *r;
+                    next.vseq = crate::fs::vnode_seq(r.ident as usize);
+                    if r.flags & crate::proc::EV_ONESHOT != 0 {
+                        continue; // drop it
+                    }
+                    keep.push(next);
+                    continue;
+                }
                 if r.flags & crate::proc::EV_ONESHOT != 0 {
                     continue; // drop it
                 }

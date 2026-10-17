@@ -30,6 +30,14 @@ pub struct FsNode {
     mode: u16,
     /// Modification time (unix seconds); persisted through cpio.
     mtime: i64,
+    /// EVFILT_VNODE generation counter. Bumped on every change a watcher
+    /// could care about; kqueue compares it against the value recorded at
+    /// registration, so no notification can be lost between syscalls.
+    vseq: u32,
+    /// NOTE_* bits accumulated since the last drain, for EVFILT_VNODE.
+    /// Held on the node rather than in a global log so that a change made
+    /// while no watcher exists is simply never observed.
+    vnotes: u32,
 }
 
 struct Nodes(UnsafeCell<Option<Vec<FsNode>>>);
@@ -58,6 +66,8 @@ pub fn mount(img: Vec<u8>) -> usize {
             removed: false,
             mode: if perms == 0 { 0o644 } else { perms },
             mtime: e.mtime,
+            vseq: 0,
+            vnotes: 0,
         });
     }
     let n = v.len();
@@ -175,6 +185,7 @@ pub fn write_at(idx: usize, pos: usize, src: u64, len: usize) -> usize {
     }
     n.dirty = true;
     n.mtime = crate::arch::timer::unix_secs();
+    notify(idx, NOTE_WRITE | NOTE_ATTRIB);
     len
 }
 
@@ -183,6 +194,7 @@ pub fn truncate(idx: usize) {
     if !n.data.is_empty() {
         n.data.clear();
         n.dirty = true;
+        notify(idx, NOTE_WRITE | NOTE_ATTRIB);
     }
 }
 
@@ -221,6 +233,8 @@ fn create_node(path: &str, as_dir: bool) -> Result<usize, u8> {
                 removed: false,
                 mode: if as_dir { 0o755 } else { 0o644 },
                 mtime: crate::arch::timer::unix_secs(),
+                vseq: 1,
+                vnotes: 0,
             });
             Ok(n.len() - 1)
         }
@@ -254,6 +268,7 @@ pub fn set_mode(idx: usize, mode: u16) -> Result<(), u8> {
     }
     n.mode = mode & 0o7777;
     n.dirty = true;
+    notify(idx, NOTE_ATTRIB);
     Ok(())
 }
 
@@ -263,6 +278,7 @@ pub fn set_len(idx: usize, len: usize) -> Result<(), u8> {
     if n.is_dir {
         return Err(EISDIR);
     }
+    let grew = len > n.data.len();
     if len < n.data.len() {
         n.data.truncate(len);
     } else {
@@ -270,6 +286,9 @@ pub fn set_len(idx: usize, len: usize) -> Result<(), u8> {
     }
     n.dirty = true;
     n.mtime = crate::arch::timer::unix_secs();
+    // A file that grew is a distinct event from one that merely changed:
+    // a watcher on tail-like behaviour filters on EXTEND alone.
+    notify(idx, NOTE_WRITE | NOTE_ATTRIB | if grew { NOTE_EXTEND } else { 0 });
     Ok(())
 }
 
@@ -278,6 +297,7 @@ pub fn set_mtime(idx: usize, t: i64) {
     let n = &mut nodes()[idx];
     n.mtime = t;
     n.dirty = true;
+    notify(idx, NOTE_ATTRIB);
 }
 
 /// lookup without following the final symlink (lstat/readlink).
@@ -307,6 +327,8 @@ pub fn create_symlink(path: &str, target: &str) -> Result<usize, u8> {
                 removed: false,
                 mode: 0o777,
                 mtime: crate::arch::timer::unix_secs(),
+                vseq: 1,
+                vnotes: 0,
             });
             Ok(n.len() - 1)
         }
@@ -355,7 +377,11 @@ pub fn rename(old: &str, new: &str) -> Result<(), u8> {
         let tn = &mut nodes()[ni];
         tn.removed = true;
         tn.dirty = true;
+        // The clobbered name is gone from the namespace, which is the only
+        // note that matters for it.
+        notify(ni, NOTE_DELETE);
     }
+    let mut moved: Vec<usize> = Vec::new();
     if o_dir {
         let prefix = format!("{o}/");
         let kids: Vec<usize> = nodes()
@@ -368,11 +394,19 @@ pub fn rename(old: &str, new: &str) -> Result<(), u8> {
             let m = &mut nodes()[i];
             m.path = format!("{}/{}", n, &m.path[prefix.len()..]);
             m.dirty = true;
+            moved.push(i);
         }
     }
-    let nn = &mut nodes()[oi];
-    nn.path = n;
-    nn.dirty = true;
+    {
+        let nn = &mut nodes()[oi];
+        nn.path = n;
+        nn.dirty = true;
+    }
+    // Notified after the mutable borrows are dropped.
+    notify(oi, NOTE_RENAME | NOTE_LINK);
+    for i in moved {
+        notify(i, NOTE_RENAME);
+    }
     Ok(())
 }
 
@@ -387,9 +421,13 @@ pub fn remove_file(path: &str) -> Result<(), u8> {
     if is_dir(i) {
         return Err(EISDIR);
     }
-    let n = &mut nodes()[i];
-    n.removed = true;
-    n.dirty = true;
+    {
+        let n = &mut nodes()[i];
+        n.removed = true;
+        n.dirty = true;
+    }
+    // Outside the borrow: notify() takes &mut nodes() itself.
+    notify(i, NOTE_DELETE);
     Ok(())
 }
 
@@ -409,9 +447,13 @@ pub fn remove_dir(path: &str) -> Result<(), u8> {
     if !empty {
         return Err(ENOTEMPTY);
     }
-    let n = &mut nodes()[i];
-    n.removed = true;
-    n.dirty = true;
+    {
+        let n = &mut nodes()[i];
+        n.removed = true;
+        n.dirty = true;
+    }
+    // Outside the borrow: notify() takes &mut nodes() itself.
+    notify(i, NOTE_DELETE);
     Ok(())
 }
 
@@ -496,4 +538,67 @@ pub fn sync_to_disk() -> Result<usize, u8> {
         n.dirty = false;
     }
     Ok(img.len().div_ceil(512))
+}
+
+// ---------- EVFILT_VNODE notifications ----------
+
+// NOTE_* bits from sys/sys/event.h. Only the ones this fs can actually
+// produce are listed; NOTE_DELETE/EXTEND/LINK/RENAME all follow from a
+// change here, so they are reported deliberately rather than incidentally.
+pub const NOTE_DELETE: u32 = 0x0001;
+pub const NOTE_WRITE: u32 = 0x0002;
+pub const NOTE_EXTEND: u32 = 0x0004;
+pub const NOTE_ATTRIB: u32 = 0x0008;
+pub const NOTE_LINK: u32 = 0x0010;
+pub const NOTE_RENAME: u32 = 0x0020;
+
+/// Record a change to `idx` and wake any EVFILT_VNODE watcher.
+///
+/// Bumping the generation AND accumulating the note bits means a watcher
+/// cannot miss a change by not being in the syscall at the moment it
+/// happened: it compares generations, and it reports whichever notes
+/// accumulated since it last drained. Notes left on a node nobody watches
+/// are simply never read, so there is no global log to overflow.
+pub fn notify(idx: usize, notes: u32) {
+    let n = &mut nodes()[idx];
+    // A removed node is a tombstone: it keeps its index for open fds but
+    // is gone from the namespace, and only NOTE_DELETE is meaningful.
+    if n.removed && notes & NOTE_DELETE == 0 {
+        return;
+    }
+    n.vseq = n.vseq.wrapping_add(1);
+    n.vnotes |= notes;
+
+}
+
+/// Current generation, for a watcher recording its starting point.
+pub fn vnode_seq(idx: usize) -> u32 {
+    nodes()[idx].vseq
+}
+
+/// Take the accumulated notes and clear them. Returns `(new_seq, notes)`.
+pub fn vnode_take_notes(idx: usize) -> (u32, u32) {
+    let n = &mut nodes()[idx];
+    let out = n.vnotes;
+
+    n.vnotes = 0;
+    (n.vseq, out)
+}
+
+/// Put notes back. A watcher took them to test them and found no match, so
+/// they must remain pending for the next call.
+pub fn vnode_restore_notes(idx: usize, notes: u32) {
+    nodes()[idx].vnotes |= notes;
+}
+
+/// Number of nodes, for bounds-checking a watcher's stored index.
+pub fn node_count() -> usize {
+    nodes().len()
+}
+
+/// Drop accumulated notes without reporting them — used when a watcher's
+/// registration is first established, so it does not immediately fire on
+/// history it never asked about.
+pub fn vnode_clear_notes(idx: usize) {
+    nodes()[idx].vnotes = 0;
 }

@@ -1773,7 +1773,13 @@ pub fn abspath(path: &str) -> String {
 /// One registered event. Mirrors the ABI-visible fields.
 #[derive(Clone, Copy)]
 pub struct Kevent {
+    /// For EVFILT_READ/WRITE this is the descriptor; for EVFILT_VNODE it is
+    /// the fs node index, because that filter watches a path.
     pub ident: u64,
+    /// Node generation observed at registration time. A mismatch means the
+    /// node changed since; this is what makes the filter edge-preserving
+    /// rather than merely "is there anything pending".
+    pub vseq: u32,
     pub filter: u32,
     pub flags: u32,
     pub fflags: u32,
@@ -1783,6 +1789,14 @@ pub struct Kevent {
 /// EVFILT_READ / EVFILT_WRITE (sys/sys/event.h).
 pub const EVFILT_READ: u32 = 0;
 pub const EVFILT_WRITE: u32 = 1;
+pub const EVFILT_VNODE: u32 = 2;
+
+/// NOTE_FF* modifiers on an EVFILT_VNODE registration (sys/sys/event.h).
+/// A watcher with fflags 0 wants every note; with NOTE_FFAND it wants only
+/// the notes it named, and NOTE_FFOR widens to any-of.
+pub const NOTE_FFAND: u32 = 0x4000_0000;
+pub const NOTE_FFOR: u32 = 0x8000_0000;
+pub const NOTE_FFCTRLMASK: u32 = 0xc000_0000;
 
 /// Registration flags (sys/sys/event.h).
 pub const EV_ADD: u32 = 0x0001;
@@ -1832,6 +1846,37 @@ pub fn kq_delete(ident: u64, filter: u32) -> Result<(), u8> {
         }
         None => Err(2), // ENOENT
     }
+}
+
+/// The NOTE bits a registration should fire on, per its NOTE_FF* modifier.
+/// NOTE_FFNOP (fflags 0, no modifier) means "every note".
+fn vnode_match(fflags: u32, pending: u32) -> bool {
+    match fflags & NOTE_FFCTRLMASK {
+        NOTE_FFAND => pending != 0 && pending & (fflags & !NOTE_FFCTRLMASK) != 0,
+        NOTE_FFOR => pending & (fflags & !NOTE_FFCTRLMASK) != 0,
+        _ => pending != 0,
+    }
+}
+
+/// Is an EVFILT_VNODE registration ready? The node changed since the
+/// recorded generation and the notes match the filter's fflags.
+pub fn kq_vnode_ready(k: &Kevent) -> Option<u32> {
+    if k.flags & EV_DISABLE != 0 {
+        return None;
+    }
+    let idx = k.ident as usize;
+    if idx >= crate::fs::node_count() {
+        return None;
+    }
+    let (seq, notes) = crate::fs::vnode_take_notes(idx);
+    if seq == k.vseq || !vnode_match(k.fflags, notes) {
+        // Put back what we took: a non-matching note is still pending.
+        if seq != k.vseq {
+            crate::fs::vnode_restore_notes(idx, notes);
+        }
+        return None;
+    }
+    Some(notes)
 }
 
 /// Is any enabled registration currently ready? Lets poll() treat a kqueue
