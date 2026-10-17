@@ -26,6 +26,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../user/src/fdtest.rs");
     println!("cargo:rerun-if-changed=../user/src/kqtest.rs");
     println!("cargo:rerun-if-changed=../user/src/idtest.rs");
+    println!("cargo:rerun-if-changed=../user/src/ioctltest.rs");
     println!("cargo:rerun-if-changed=../user/src/pathtest.rs");
     println!("cargo:rerun-if-changed=../user/src/sockidtest.rs");
     println!("cargo:rerun-if-changed=../user/src/gui.rs");
@@ -73,10 +74,11 @@ fn main() {
     let fdtest = bindir.join("tihkali-fdtest");
     let kqtest = bindir.join("tihkali-kqtest");
     let idtest = bindir.join("tihkali-idtest");
+    let ioctltest = bindir.join("tihkali-ioctltest");
     let pathtest = bindir.join("tihkali-pathtest");
     let sockidtest = bindir.join("tihkali-sockidtest");
     let gui = bindir.join("tihkali-gui");
-    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt, &dnsprobe, &memtest, &statprobe, &iovtest, &fdtest, &kqtest, &idtest, &pathtest, &sockidtest, &gui] {
+    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt, &dnsprobe, &memtest, &statprobe, &iovtest, &fdtest, &kqtest, &idtest, &ioctltest, &pathtest, &sockidtest, &gui] {
         assert!(p.exists(), "user binary not produced at {}", p.display());
     }
     // Still used by main.rs until M4 switches pid0/exec to the VFS.
@@ -233,6 +235,7 @@ fn main() {
     let fdtest_bytes = std::fs::read(&fdtest).expect("read tihkali-fdtest");
     let kqtest_bytes = std::fs::read(&kqtest).expect("read tihkali-kqtest");
     let idtest_bytes = std::fs::read(&idtest).expect("read tihkali-idtest");
+    let ioctltest_bytes = std::fs::read(&ioctltest).expect("read tihkali-ioctltest");
     let pathtest_bytes = std::fs::read(&pathtest).expect("read tihkali-pathtest");
     let sockidtest_bytes = std::fs::read(&sockidtest).expect("read tihkali-sockidtest");
     let gui_bytes = std::fs::read(&gui).expect("read tihkali-gui");
@@ -265,6 +268,7 @@ fn main() {
         CpioEntry::file("bin/fdtest", &fdtest_bytes),
         CpioEntry::file("bin/kqtest", &kqtest_bytes),
         CpioEntry::file("bin/idtest", &idtest_bytes),
+        CpioEntry::file("bin/ioctltest", &ioctltest_bytes),
         CpioEntry::file("bin/pathtest", &pathtest_bytes),
         CpioEntry::file("bin/sockidtest", &sockidtest_bytes),
         CpioEntry::file("bin/gui", &gui_bytes),

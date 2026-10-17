@@ -762,6 +762,52 @@ gate_count "s28: no unknown syscall" "$S28" 'unknown syscall' 0
 gate_has   "s28: clean exit"      "$S28" 'proc: pid 0 exited \(0\)'
 gate_bad   "s28" "$S28"
 
+echo "== session 29: NetBSD ioctl (tty request encoding)"
+S29="$T/s29.log"
+# The substance is the ENCODING. NetBSD's TIOCGWINSZ is 0x80087468 and
+# Linux's is 0x5413 -- same name, same 't' group, same param size. The
+# Linux-request gates are the half that matters: a kernel which merely ADDED
+# the NetBSD table would pass every positive check while answering Linux
+# numbers too, and would have no boundary between the two personalities.
+( sleep 5
+  printf 'ioctltest\n'; sleep 6
+  printf 'exit\n'; sleep 3
+) | timeout 29 ./tools/run.sh >"$S29" 2>&1
+gate_has   "s29: gwinsz"          "$S29" 'io: ok   gwinsz succeeds'
+gate_has   "s29: winsz rows"      "$S29" 'io: ok   winsz rows'
+gate_has   "s29: winsz cols"      "$S29" 'io: ok   winsz cols'
+gate_has   "s29: swinsz accepted" "$S29" 'io: ok   swinsz accepted'
+gate_has   "s29: winsz unchanged" "$S29" 'io: ok   winsz unchanged'
+gate_has   "s29: geta"            "$S29" 'io: ok   geta succeeds'
+gate_has   "s29: NetBSD ICANON"   "$S29" 'io: ok   lflag has ICANON'
+gate_has   "s29: NetBSD ECHO"     "$S29" 'io: ok   lflag has ECHO'
+gate_has   "s29: not Linux ICANON" "$S29" 'io: ok   lflag not Linux ICANON'
+gate_has   "s29: not Linux ECHO"  "$S29" 'io: ok   lflag not Linux ECHO'
+gate_has   "s29: byte 43 written" "$S29" 'io: ok   byte 43 written'
+gate_has   "s29: speeds match"    "$S29" 'io: ok   speeds match'
+gate_has   "s29: seta accepted"   "$S29" 'io: ok   seta accepted'
+gate_has   "s29: glined N_TTY"    "$S29" 'io: ok   glined is N_TTY'
+gate_has   "s29: gpgrp succeeds"  "$S29" 'io: ok   gpgrp succeeds'
+gate_has   "s29: spgrp roundtrip" "$S29" 'io: ok   gpgrp roundtrips'
+gate_has   "s29: spgrp neg EINVAL" "$S29" 'io: ok   spgrp rejects negative'
+gate_has   "s29: EFAULT on ptr"   "$S29" 'io: ok   gwinsz bad ptr EFAULT'
+gate_has   "s29: EBADF on fd"     "$S29" 'io: ok   bad fd EBADF'
+gate_has   "s29: LNX TCGETS"      "$S29" 'io: ok   linux TCGETS refused'
+gate_has   "s29: LNX TCSETS"      "$S29" 'io: ok   linux TCSETS refused'
+gate_has   "s29: LNX GWINSZ"      "$S29" 'io: ok   linux GWINSZ refused'
+gate_has   "s29: LNX GPGRP"       "$S29" 'io: ok   linux GPGRP refused'
+gate_has   "s29: LNX SPGRP"       "$S29" 'io: ok   linux SPGRP refused'
+gate_has   "s29: refused wrote none" "$S29" 'io: ok   refused write nothing'
+gate_has   "s29: other group"     "$S29" 'io: ok   other group refused'
+gate_has   "s29: nonsense"        "$S29" 'io: ok   nonsense refused'
+gate_has   "s29: sti refused"     "$S29" 'io: ok   sti refused'
+gate_has   "s29: all ok"          "$S29" 'io: all ok'
+gate_has   "s29: exit 0"          "$S29" 'sh: ioctltest exited 0'
+gate_count "s29: no panic"        "$S29" 'panic' 0
+gate_count "s29: no unknown syscall" "$S29" 'unknown syscall' 0
+gate_has   "s29: clean exit"      "$S29" 'proc: pid 0 exited \(0\)'
+gate_bad   "s29" "$S29"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

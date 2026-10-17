@@ -681,6 +681,12 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 },
             }
         }
+        nbsys::IOCTL => {
+            // SYS_ioctl(fd, request, arg). NetBSD's request encoding is not
+            // Linux's -- see netbsd_abi::TIOCGWINSZ -- so this cannot share
+            // the Linux arm's table even though the TIOC names match.
+            crate::netbsd_abi::ioctl_arm(frame.x[0] as usize, frame.x[1], frame.x[2])
+        }
         nbsys::UNAME => {
             // SYS_uname(buf): NetBSD's struct utsname is five 256-byte
             // char arrays = 1280 bytes, with no padding and no fields Linux

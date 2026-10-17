@@ -409,3 +409,182 @@ pub fn write_utsname(buf: u64) {
         }
     }
 }
+
+// ---------- ioctl ----------
+
+// NetBSD's ioctl request encoding is NOT Linux's, despite the same TIOC*
+// names, the same 't' group character and the same parameter sizes.
+//
+// Linux:    dir<<30 | size<<16 | 't'<<8 | num      (IOC_VOID 0, O 1<<1, I 1<<2)
+// NetBSD:   dir in bits 29-31, with IOC_IN 0x80000000 and IOC_OUT
+//           0x40000000 -- the two are SWAPPED relative to Linux's sense.
+//
+// Values below are computed from sys/sys/ioccom.h and sys/sys/ttycom.h.
+// Linux's TIOCGWINSZ is 0x5413; NetBSD's is 0x80087468, so a kernel that
+// reused the Linux table would reject every request a NetBSD caller makes
+// with ENOTTY.
+pub const TIOCEXCL: u64 = 0x2000740d;
+pub const TIOCNXCL: u64 = 0x2000740e;
+pub const TIOCFLUSH: u64 = 0x40047410;
+pub const TIOCGETA: u64 = 0x802c7413;
+pub const TIOCSETA: u64 = 0x402c7414;
+pub const TIOCSETAW: u64 = 0x402c7415;
+pub const TIOCSETAF: u64 = 0x402c7416;
+pub const TIOCGETD: u64 = 0x8004741a;
+pub const TIOCSETD: u64 = 0x4004741b;
+pub const TIOCGLINED: u64 = 0x80047442;
+pub const TIOCSLINED: u64 = 0x40047443;
+pub const TIOCSWINSZ: u64 = 0x40087467;
+pub const TIOCGWINSZ: u64 = 0x80087468;
+pub const TIOCREMOTE: u64 = 0x40047469;
+pub const TIOCMGET: u64 = 0x8004746a;
+pub const TIOCMBIC: u64 = 0x4004746b;
+pub const TIOCMBIS: u64 = 0x4004746c;
+pub const TIOCMSET: u64 = 0x4004746d;
+pub const TIOCSTART: u64 = 0x2000746e;
+pub const TIOCSTOP: u64 = 0x2000746f;
+pub const TIOCPKT: u64 = 0x40047470;
+pub const TIOCNOTTY: u64 = 0x20007471;
+pub const TIOCSTI: u64 = 0x40017472;
+pub const TIOCOUTQ: u64 = 0x80047473;
+pub const TIOCSPGRP: u64 = 0x40047476;
+pub const TIOCGPGRP: u64 = 0x80047477;
+pub const TIOCCDTR: u64 = 0x20007478;
+pub const TIOCSDTR: u64 = 0x20007479;
+pub const TIOCCBRK: u64 = 0x2000747a;
+pub const TIOCSBRK: u64 = 0x2000747b;
+
+/// NetBSD `struct termios`: 4 x tcflag_t(u32) + c_cc[NCCS=20] + 2 x int
+/// = **44 bytes**, against Linux's 36 (whose NCCS is 19).
+///
+/// NetBSD's local-flag values are POSIX, not Linux's: ICANON is 0x100
+/// here and 0x2 on Linux, ECHO is 0x8 here and 0x10 on Linux. Copying the
+/// Linux writer would leave the caller reading garbage flags while the
+/// call returned 0.
+pub const TERMIOS_SIZE: usize = 44;
+pub const NB_NCCS: usize = 20;
+pub const NB_ICANON: u32 = 0x100;
+pub const NB_ECHO: u32 = 0x8;
+
+/// Fill a NetBSD `struct termios` with the same state the Linux arm
+/// reports: canonical input, echoing.
+pub fn write_netbsd_termios(arg: u64) -> Result<(), u8> {
+    if !crate::proc::user_range_ok(arg, TERMIOS_SIZE) {
+        return Err(14); // EFAULT
+    }
+    unsafe {
+        let p = arg as *mut u8;
+        core::ptr::write_bytes(p, 0, TERMIOS_SIZE);
+        // c_lflag @12: ICANON | ECHO
+        (p as *mut u32).add(3).write_unaligned(NB_ICANON | NB_ECHO);
+        // c_ispeed @36, c_ospeed @40: 4 flags (16 B) + c_cc[20] (20 B).
+        // B115200 (13) is what a real tty reports and what a libc uses to
+        // pick its baud divisor. Writing these at 40/44 would be 4 B past
+        // the end of a 44-byte struct -- corrupting the caller's stack.
+        (p as *mut u32).add(9).write_unaligned(0x0000_000d);
+        (p as *mut u32).add(10).write_unaligned(0x0000_000d);
+    }
+    Ok(())
+}
+
+/// `ioctl(2)` for the NetBSD personality.
+///
+/// Shares the same fake-terminal policy as the Linux arm — the same winsize,
+/// the same process-group handling — but with NetBSD's request encoding and
+/// NetBSD's termios layout.
+pub fn ioctl_arm(fd: usize, cmd: u64, arg: u64) -> (i64, u8) {
+    use crate::file::EBADF;
+    if crate::proc::current_target(fd).is_none() {
+        return (-1, EBADF);
+    }
+    match cmd {
+        TIOCGETA => match write_netbsd_termios(arg) {
+            Ok(()) => (0, 0),
+            Err(e) => (-1, e),
+        },
+        // Accept and ignore. A tty with no real line discipline here cannot
+        // honour these, but refusing them would make a libc's termios setup
+        // fail outright rather than degrade.
+        TIOCSETA | TIOCSETAW | TIOCSETAF | TIOCSETD | TIOCSLINED | TIOCREMOTE
+        | TIOCMSET | TIOCMBIS | TIOCMBIC | TIOCPKT => (0, 0),
+        TIOCGLINED => {
+            // The only line discipline a libc asks for is N_TTY (1).
+            if !crate::proc::user_range_ok(arg, 4) {
+                return (-1, 14);
+            }
+            unsafe { (arg as *mut u32).write_volatile(1) };
+            (0, 0)
+        }
+        TIOCGWINSZ => {
+            // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel }: u16 x4
+            if !crate::proc::user_range_ok(arg, 8) {
+                return (-1, 14);
+            }
+            unsafe {
+                let p = arg as *mut u16;
+                p.add(0).write_unaligned(24);
+                p.add(1).write_unaligned(80);
+                p.add(2).write_unaligned(0);
+                p.add(3).write_unaligned(0);
+            }
+            (0, 0)
+        }
+        TIOCSWINSZ => {
+            if !crate::proc::user_range_ok(arg, 8) {
+                return (-1, 14);
+            }
+            (0, 0)
+        }
+        TIOCGPGRP => {
+            if !crate::proc::user_range_ok(arg, 4) {
+                return (-1, 14);
+            }
+            let g = crate::proc::fg_pgrp().unwrap_or_else(crate::proc::current_pgrp) as i32;
+            unsafe { (arg as *mut i32).write_volatile(g) };
+            (0, 0)
+        }
+        TIOCSPGRP => {
+            if !crate::proc::user_range_ok(arg, 4) {
+                return (-1, 14);
+            }
+            let g = unsafe { (arg as *const i32).read_volatile() };
+            if g < 0 {
+                return (-1, 22);
+            }
+            crate::proc::set_fg_pgrp(g as usize);
+            (0, 0)
+        }
+        TIOCOUTQ => {
+            if !crate::proc::user_range_ok(arg, 4) {
+                return (-1, 14);
+            }
+            unsafe { (arg as *mut i32).write_volatile(0) };
+            (0, 0)
+        }
+        TIOCMGET => {
+            // No modem: a console UART on the other end reports nothing
+            // about carrier or line state.
+            if !crate::proc::user_range_ok(arg, 4) {
+                return (-1, 14);
+            }
+            unsafe { (arg as *mut i32).write_volatile(0) };
+            (0, 0)
+        }
+        TIOCFLUSH => (0, 0),
+        TIOCGETD => {
+            if !crate::proc::user_range_ok(arg, 4) {
+                return (-1, 14);
+            }
+            unsafe { (arg as *mut i32).write_volatile(1) }; // N_TTY
+            (0, 0)
+        }
+        // Accepted no-ops: there is no modem, no packet mode and no break
+        // bit to set on a fixed emulated console.
+        TIOCEXCL | TIOCNXCL | TIOCSTART | TIOCSTOP | TIOCNOTTY | TIOCCDTR
+        | TIOCSDTR | TIOCCBRK | TIOCSBRK => (0, 0),
+        _ => {
+            crate::kprintln!("[netbsd] ioctl ENOTTY cmd={cmd:#x} fd={fd}");
+            (-1, 25) // ENOTTY
+        }
+    }
+}
