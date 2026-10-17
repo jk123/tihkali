@@ -47,3 +47,7 @@ path = "src/memtest.rs"
 [[bin]]
 name = "tihkali-statprobe"
 path = "src/statprobe.rs"
+
+[[bin]]
+name = "tihkali-iovtest"
+path = "src/iovtest.rs"

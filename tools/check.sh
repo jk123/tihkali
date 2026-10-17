@@ -553,6 +553,32 @@ gate_count "s22: no unknown syscall" "$S22" 'unknown syscall' 0
 gate_has   "s22: clean exit"         "$S22" 'proc: pid 0 exited \(0\)'
 gate_bad   "s22" "$S22"
 
+echo "== session 23: NetBSD vectored I/O (readv/writev)"
+S23="$T/s23.log"
+# /bin/iovtest writes four vectors (one empty) to stdout and reads a file
+# back through four more. NetBSD numbers these 120/121, not Linux's 65/66,
+# so a wrong number shows up as ENOSYS rather than as a wrong count.
+( sleep 5
+  printf 'iovtest\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 25 ./tools/run.sh >"$S23" 2>&1
+# The 9 bytes the four writev vectors carry, in order and with no NUL.
+gate_has   "s23: writev payload"     "$S23" '^abcdefghiiov: ok'
+gate_has   "s23: writev sums"        "$S23" 'iov: ok   writev sums vectors'
+gate_has   "s23: readv fills"        "$S23" 'iov: ok   readv fills vectors'
+gate_has   "s23: readv vector 0"     "$S23" 'iov: ok   readv vector 0'
+gate_has   "s23: readv skips 0-len"  "$S23" 'iov: ok   readv skipped 0-len vector'
+gate_has   "s23: iovcnt 0"           "$S23" 'iov: ok   writev zero iovcnt'
+gate_has   "s23: iovcnt EINVAL"      "$S23" 'iov: ok   writev EINVAL iovcnt'
+gate_has   "s23: iovec EFAULT"       "$S23" 'iov: ok   writev EFAULT iovec'
+gate_has   "s23: bad fd EBADF"       "$S23" 'iov: ok   writev EBADF'
+gate_has   "s23: all ok"             "$S23" 'iov: all ok'
+gate_has   "s23: exit 0"             "$S23" 'sh: iovtest exited 0'
+gate_count "s23: no panic"           "$S23" 'panic' 0
+gate_count "s23: no unknown syscall" "$S23" 'unknown syscall' 0
+gate_has   "s23: clean exit"         "$S23" 'proc: pid 0 exited \(0\)'
+gate_bad   "s23" "$S23"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

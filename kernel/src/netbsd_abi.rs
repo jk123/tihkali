@@ -104,3 +104,28 @@ pub fn write_stat_fd(addr: u64, fd: usize) -> Result<(), u8> {
         }
     }
 }
+/// Cap on iovcnt, matching the Linux arm's existing bound.
+const IOV_MAX: u64 = 64;
+
+/// Read a user iovec array into `(base, len)` pairs.
+///
+/// NetBSD's `struct iovec` is `{ void *iov_base; size_t iov_len; }` —
+/// verified against `sys/sys/uio.h`, and identical to Linux's, so the
+/// 16-byte stride is shared rather than assumed.
+///
+/// `None` means iovcnt is out of range; `Err` is the errno for an
+/// unreadable entry. Validating every entry up front matters: a partial
+/// walk that faults halfway would leave the caller unable to tell which
+/// vectors were consumed.
+pub fn walk_iovecs(iov: u64, cnt: u64) -> Result<alloc::vec::Vec<(u64, u64)>, u8> {
+    if cnt > IOV_MAX {
+        return Err(22); // EINVAL
+    }
+    let mut out = alloc::vec::Vec::with_capacity(cnt as usize);
+    for i in 0..cnt {
+        let base = crate::proc::read_user_u64(iov + 16 * i).ok_or(14u8)?;
+        let len = crate::proc::read_user_u64(iov + 16 * i + 8).ok_or(14u8)?;
+        out.push((base, len));
+    }
+    Ok(out)
+}

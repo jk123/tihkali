@@ -320,6 +320,84 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         nbsys::GETPAGESIZE => (4096, 0),
+        // --- vectored I/O ---
+        //
+        // NetBSD's struct iovec is { void*, size_t } — the same 16 bytes
+        // Linux uses — so only the numbers differ (NetBSD 120/121 vs
+        // Linux 65/66). Both stop at the first error and return the
+        // bytes already transferred, which is what a short write means.
+        nbsys::READV => {
+            // SYS_readv(fd, iov, iovcnt). A blocking tty read must not
+            // report EOF, so the walker signals Slept by returning early
+            // through a sentinel the arm turns into a bare return.
+            match crate::netbsd_abi::walk_iovecs(frame.x[1], frame.x[2]) {
+                Err(e) => (-1, e), // EINVAL or EFAULT
+                Ok(iovs) => {
+                    let mut total: i64 = 0;
+                    let mut err: Option<u8> = None;
+                    for (base, len) in iovs {
+                        if len == 0 {
+                            continue;
+                        }
+                        match crate::proc::sys_read(
+                            frame,
+                            frame.x[0] as usize,
+                            base,
+                            len as usize,
+                        ) {
+                            crate::proc::Io::Val(n) => {
+                                total += n;
+                                // Short read: the caller's vectors are full.
+                                if (n as u64) < len {
+                                    break;
+                                }
+                            }
+                            crate::proc::Io::Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                            // A blocking tty read slept; the epilogue must
+                            // not run, so signal it with a bare return.
+                            crate::proc::Io::Slept => return,
+                        }
+                    }
+                    match err {
+                        // Report the bytes already read, not -1: POSIX says
+                        // a partial read must not be lost to the errno.
+                        Some(e) => (total, e),
+                        None => (total, 0),
+                    }
+                }
+            }
+        }
+        nbsys::WRITEV => {
+            // SYS_writev(fd, iov, iovcnt)
+            match crate::netbsd_abi::walk_iovecs(frame.x[1], frame.x[2]) {
+                Err(e) => (-1, e),
+                Ok(iovs) => {
+                    let mut total: i64 = 0;
+                    let mut err: Option<u8> = None;
+                    for (base, len) in iovs {
+                        if len == 0 {
+                            continue;
+                        }
+                        match crate::proc::sys_write(frame.x[0] as usize, base, len as usize) {
+                            Ok(n) => total += n,
+                            // Stop at the first error but keep the count:
+                            // the bytes already written really were written.
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match err {
+                        Some(e) => (total, e),
+                        None => (total, 0),
+                    }
+                }
+            }
+        }
         nbsys::ACCESS => {
             // SYS_access(path, mode): the fs is a readable initramfs, so
             // mode is advisory -- existence is the only real question.
