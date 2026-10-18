@@ -42,6 +42,10 @@ pub struct FsNode {
     /// needs somewhere real to write or it is a silent success.
     uid: u32,
     gid: u32,
+    /// chflags(2) value (UF_*/SF_* bits). Reported through st_flags@132.
+    flags: u32,
+    /// Extended attributes: (name, value). Ordered so listxattr is stable.
+    xattrs: Vec<(String, Vec<u8>)>,
 }
 
 struct Nodes(UnsafeCell<Option<Vec<FsNode>>>);
@@ -74,6 +78,8 @@ pub fn mount(img: Vec<u8>) -> usize {
             vnotes: 0,
             uid: 0,
             gid: 0,
+            flags: 0,
+            xattrs: Vec::new(),
         });
     }
     let n = v.len();
@@ -259,6 +265,8 @@ fn create_node(path: &str, as_dir: bool, mode: u16) -> Result<usize, u8> {
                 vnotes: 0,
                 uid: 0,
                 gid: 0,
+                flags: 0,
+                xattrs: Vec::new(),
             });
             Ok(n.len() - 1)
         }
@@ -325,6 +333,104 @@ pub fn pathconf(idx: usize, name: u32) -> (i64, u8) {
         17 => (256, 0),                       // _PC_NAME_MAX ceiling
         _ => (-1, 22),                        // EINVAL: unknown _PC_ request
     }
+}
+
+
+/// chflags(2): file flags, the values behind `UF_*`/`SF_*` in sys/stat.h.
+/// Stored per node so stat can report them and a caller that sets UF_APPEND
+/// can see it come back.
+pub fn set_flags(idx: usize, flags: u32) -> Result<(), u8> {
+    let n = &mut nodes()[idx];
+    if n.removed {
+        return Err(ENOENT);
+    }
+    n.flags = flags;
+    n.dirty = true;
+    // SF_IMMUTABLE/UF_IMMUTABLE change what a later write may do, so this
+    // is an attribute change a vnode watcher must be told about.
+    notify(idx, NOTE_ATTRIB);
+    Ok(())
+}
+
+/// File flags for node `idx`.
+pub fn flags_of(idx: usize) -> u32 {
+    nodes()[idx].flags
+}
+
+
+/// --- extended attributes ---------------------------------------------
+///
+/// `setxattr`/`getxattr` and their l- and f- variants. This is real
+/// storage per node, not a constant: a caller that sets an attribute and
+/// reads it back must get what it wrote, and listing must report the names
+/// it stored. An implementation that returned 0 without storing anything
+/// would be indistinguishable from one that worked until the value was
+/// needed.
+///
+/// Names are the caller's bytes; values are bounded so a runaway caller
+/// cannot exhaust the node arena.
+const XATTR_MAX_VALUE: usize = 1024;
+const XATTR_MAX_PER_NODE: usize = 16;
+const XATTR_NAME_MAX: usize = 64;
+
+pub fn xattr_set(idx: usize, name: &str, value: &[u8]) -> Result<(), u8> {
+    if nodes()[idx].removed {
+        return Err(ENOENT);
+    }
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(22); // EINVAL
+    }
+    if value.len() > XATTR_MAX_VALUE {
+        return Err(28); // E2BIG
+    }
+    let n = &mut nodes()[idx];
+    if let Some(a) = n.xattrs.iter_mut().find(|a| a.0 == name) {
+        a.1.clear();
+        a.1.extend_from_slice(value);
+        n.dirty = true;
+        notify(idx, NOTE_ATTRIB);
+        return Ok(());
+    }
+    if n.xattrs.len() >= XATTR_MAX_PER_NODE {
+        return Err(28); // ENOSPC
+    }
+    n.xattrs.push((name.to_string(), value.to_vec()));
+    n.dirty = true;
+    notify(idx, NOTE_ATTRIB);
+    Ok(())
+}
+
+/// The stored value, or ENODATA when the name is not present. `None`
+/// distinguishes "absent" from "present but empty".
+pub fn xattr_get(idx: usize, name: &str) -> Result<Option<Vec<u8>>, u8> {
+    if nodes()[idx].removed {
+        return Err(ENOENT);
+    }
+    Ok(nodes()[idx]
+        .xattrs
+        .iter()
+        .find(|a| a.0 == name)
+        .map(|a| a.1.clone()))
+}
+
+/// All names on a node, in insertion order.
+pub fn xattr_list(idx: usize) -> Vec<String> {
+    nodes()[idx].xattrs.iter().map(|a| a.0.clone()).collect()
+}
+
+pub fn xattr_remove(idx: usize, name: &str) -> Result<(), u8> {
+    let n = &mut nodes()[idx];
+    if n.removed {
+        return Err(ENOENT);
+    }
+    let before = n.xattrs.len();
+    n.xattrs.retain(|a| a.0 != name);
+    if n.xattrs.len() == before {
+        return Err(ENOENT);
+    }
+    n.dirty = true;
+    notify(idx, NOTE_ATTRIB);
+    Ok(())
 }
 
 /// chmod(2): replace permission bits (type unchanged).
@@ -426,6 +532,8 @@ pub fn create_symlink(path: &str, target: &str) -> Result<usize, u8> {
                 vnotes: 0,
                 uid: 0,
                 gid: 0,
+                flags: 0,
+                xattrs: Vec::new(),
             });
             Ok(n.len() - 1)
         }

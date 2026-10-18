@@ -109,7 +109,7 @@ pub fn write_stat_node(addr: u64, idx: usize) -> Result<(), u8> {
         i64at(112, size as i64); // st_size
         i64at(120, ((size + 511) / 512) as i64); // st_blocks
         u32at(128, 4096); // st_blksize
-        u32at(132, 0); // st_flags
+        u32at(132, crate::fs::flags_of(idx)); // st_flags
         u32at(136, 0); // st_gen
     }
     Ok(())

@@ -324,8 +324,18 @@ pub fn read_disk() -> Result<Vec<u8>, &'static str> {
     if bytes == 0 {
         return Err("zero-capacity disk");
     }
-    if bytes > 1024 * 1024 {
-        return Err("disk image larger than 1 MiB");
+    // This used to refuse anything over 1 MiB. That cap was never a
+    // device limit -- `submit` already rejects a length that is not a
+    // multiple of the 512-byte sector size, and the device reports its own
+    // capacity -- but once the packed initramfs passed 1 MiB every session
+    // silently fell back to the EMBEDDED copy. That fallback is a build
+    // artifact, so the symptom was a boot missing every probe added since,
+    // which looks like dozens of unrelated failures rather than one cause.
+    //
+    // The bound that matters is memory: a bogus capacity must not make the
+    // kernel try to allocate the world.
+    if bytes > 64 * 1024 * 1024 {
+        return Err("implausible disk capacity");
     }
     let mut buf = alloc::vec![0u8; bytes];
     read_sectors(0, &mut buf)?;

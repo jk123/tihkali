@@ -1213,6 +1213,80 @@ gate_count "s33: no panic"        "$S33" 'panic' 0
 gate_has   "s33: clean exit"      "$S33" 'proc: pid 0 exited \(0\)'
 gate_bad   "s33" "$S33"
 
+echo "== session 34: NetBSD *at() variants, chflags, preadv/pwritev"
+S34="$T/s34.log"
+# Each of these is a second spelling of a call that already exists, which is
+# exactly why a shared path with the wrong flag value or register produces a
+# plausible wrong answer rather than a failure.
+#
+# preadv/pwritev take the offset in x4, NOT x3 -- the prototype carries an
+# explicit PAD word, the same trap as pread/pwrite. NetBSD's
+# AT_SYMLINK_NOFOLLOW is 0x200 where Linux's is 0x100.
+( sleep 5
+  printf 'at6test\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 26 ./tools/run.sh >"$S34" 2>&1
+gate_has   "s34: created file                        " "$S34" 'at6: ok    created file'
+gate_has   "s34: flags start clear                   " "$S34" 'at6: ok    flags start clear'
+gate_has   "s34: chflags UF_APPEND                   " "$S34" 'at6: ok    chflags UF_APPEND'
+gate_has   "s34: chflags observable                  " "$S34" 'at6: ok    chflags observable'
+gate_has   "s34: chflags SF_ARCHIVED                 " "$S34" 'at6: ok    chflags SF_ARCHIVED'
+gate_has   "s34: chflags replaces                    " "$S34" 'at6: ok    chflags replaces'
+gate_has   "s34: chflags clear                       " "$S34" 'at6: ok    chflags clear[[:space:]]+ok'
+gate_has   "s34: chflags cleared                     " "$S34" 'at6: ok    chflags cleared'
+gate_has   "s34: chflags ENOENT                      " "$S34" 'at6: ok    chflags ENOENT'
+gate_has   "s34: fchflags ok                         " "$S34" 'at6: ok    fchflags ok'
+gate_has   "s34: fchflags observable                 " "$S34" 'at6: ok    fchflags observable'
+gate_has   "s34: fchflags EBADF                      " "$S34" 'at6: ok    fchflags EBADF'
+gate_has   "s34: fchflags clear                      " "$S34" 'at6: ok    fchflags clear'
+gate_has   "s34: symlink for lchflags                " "$S34" 'at6: ok    symlink for lchflags'
+gate_has   "s34: lchflags ok                         " "$S34" 'at6: ok    lchflags ok'
+gate_has   "s34: lchflags did NOT follow             " "$S34" 'at6: ok    lchflags did NOT follow'
+gate_has   "s34: lchflags clear                      " "$S34" 'at6: ok    lchflags clear'
+gate_has   "s34: fchmodat                            " "$S34" 'at6: ok    fchmodat[[:space:]]+ok'
+gate_has   "s34: fchmodat observable                 " "$S34" 'at6: ok    fchmodat observable'
+gate_has   "s34: fchmodat NOFOLLOW                   " "$S34" 'at6: ok    fchmodat NOFOLLOW[[:space:]]+ok[[:space:]]*$'
+gate_has   "s34: fchmodat NOFOLLOW ok                " "$S34" 'at6: ok    fchmodat NOFOLLOW ok'
+gate_has   "s34: fchmodat ENOENT                     " "$S34" 'at6: ok    fchmodat ENOENT'
+gate_has   "s34: fchmodat bad flag EINVAL            " "$S34" 'at6: ok    fchmodat bad flag EINVAL'
+gate_has   "s34: lchmod ok                           " "$S34" 'at6: ok    lchmod ok'
+gate_has   "s34: lchmod did NOT follow               " "$S34" 'at6: ok    lchmod did NOT follow'
+gate_has   "s34: fchownat noop                       " "$S34" 'at6: ok    fchownat noop'
+gate_has   "s34: fchownat -1 no-op                   " "$S34" 'at6: ok    fchownat -1 no-op'
+gate_has   "s34: fchownat set uid                    " "$S34" 'at6: ok    fchownat set uid'
+gate_has   "s34: fchownat observable                 " "$S34" 'at6: ok    fchownat observable'
+gate_has   "s34: fchownat gid only                   " "$S34" 'at6: ok    fchownat gid only'
+gate_has   "s34: fchownat kept uid                   " "$S34" 'at6: ok    fchownat kept uid'
+gate_has   "s34: fchownat restore                    " "$S34" 'at6: ok    fchownat restore'
+gate_has   "s34: fchownat ENOENT                     " "$S34" 'at6: ok    fchownat ENOENT'
+gate_has   "s34: utimensat ok                        " "$S34" 'at6: ok    utimensat ok'
+gate_has   "s34: utimensat observable                " "$S34" 'at6: ok    utimensat observable'
+gate_has   "s34: utimensat bad nsec EINVAL           " "$S34" 'at6: ok    utimensat bad nsec EINVAL'
+gate_has   "s34: utimensat NULL                      " "$S34" 'at6: ok    utimensat NULL'
+gate_has   "s34: utimensat ENOENT                    " "$S34" 'at6: ok    utimensat ENOENT'
+gate_has   "s34: lpathconf PATH_MAX                  " "$S34" 'at6: ok    lpathconf PATH_MAX'
+gate_has   "s34: lpathconf on a link                 " "$S34" 'at6: ok    lpathconf on a link'
+gate_has   "s34: lpathconf ENOENT                    " "$S34" 'at6: ok    lpathconf ENOENT'
+gate_has   "s34: posix_rename ok                     " "$S34" 'at6: ok    posix_rename ok'
+gate_has   "s34: posix_rename moved                  " "$S34" 'at6: ok    posix_rename moved'
+gate_has   "s34: posix_rename back                   " "$S34" 'at6: ok    posix_rename back'
+gate_has   "s34: posix_rename ENOENT                 " "$S34" 'at6: ok    posix_rename ENOENT'
+gate_has   "s34: pwritev one vec                     " "$S34" 'at6: ok    pwritev one vec'
+gate_has   "s34: pwritev second vec                  " "$S34" 'at6: ok    pwritev second vec'
+gate_has   "s34: pwritev two vecs                    " "$S34" 'at6: ok    pwritev two vecs'
+gate_has   "s34: preadv two vecs                     " "$S34" 'at6: ok    preadv two vecs'
+gate_has   "s34: preadv vec1                         " "$S34" 'at6: ok    preadv vec1'
+gate_has   "s34: preadv vec2                         " "$S34" 'at6: ok    preadv vec2'
+gate_has   "s34: preadv zero cnt                     " "$S34" 'at6: ok    preadv zero cnt'
+gate_has   "s34: preadv IOV_MAX EINVAL               " "$S34" 'at6: ok    preadv IOV_MAX EINVAL'
+gate_has   "s34: preadv left the position            " "$S34" 'at6: ok    preadv left the position'
+gate_has   "s34: pwritev on O_RDONLY EACCES          " "$S34" 'at6: ok    pwritev on O_RDONLY EACCES'
+gate_has   "s34: all ok"          "$S34" 'at6: all ok'
+gate_has   "s34: exit 0"          "$S34" 'sh: at6test exited 0'
+gate_count "s34: no panic"        "$S34" 'panic' 0
+gate_has   "s34: clean exit"      "$S34" 'proc: pid 0 exited \(0\)'
+gate_bad   "s34" "$S34"
+
 echo "== session 30: NetBSD credentials, groups and process groups"
 S30="$T/s30.log"
 # Every call here was a hardcoded 0 or absent before. A umask that returns
@@ -1255,6 +1329,68 @@ gate_has   "s30: exit 0"          "$S30" 'sh: credtest exited 0'
 gate_count "s30: no panic"        "$S30" 'panic' 0
 gate_has   "s30: clean exit"      "$S30" 'proc: pid 0 exited \(0\)'
 gate_bad   "s30" "$S30"
+
+echo "== session 35: NetBSD extended attributes"
+S35="$T/s35.log"
+# Twelve xattr calls over one storage path. Every way to get this wrong is a
+# SILENT SUCCESS -- a set that returns 0 without storing anything looks
+# identical to one that worked until the caller reads the value back.
+#
+# NetBSD's setxattr is (path, name, value, size, flags) -- size BEFORE
+# flags -- and a size of 0 on get/list asks for the LENGTH and writes
+# nothing; a buffer too small is ERANGE, not a truncated value.
+( sleep 5
+  printf 'xatest\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 26 ./tools/run.sh >"$S35" 2>&1
+gate_has   "s35: created file                 " "$S35" '^xa: ok[[:space:]]+created\ file[[:space:]]+ok'
+gate_has   "s35: setxattr                     " "$S35" '^xa: ok[[:space:]]+setxattr[[:space:]]+ok'
+gate_has   "s35: getxattr round trip          " "$S35" '^xa: ok[[:space:]]+getxattr\ round\ trip[[:space:]]+ok'
+gate_has   "s35: setxattr replace             " "$S35" '^xa: ok[[:space:]]+setxattr\ replace[[:space:]]+ok'
+gate_has   "s35: setxattr replaced            " "$S35" '^xa: ok[[:space:]]+setxattr\ replaced[[:space:]]+ok'
+gate_has   "s35: setxattr empty               " "$S35" '^xa: ok[[:space:]]+setxattr\ empty[[:space:]]+ok'
+gate_has   "s35: empty value readable         " "$S35" '^xa: ok[[:space:]]+empty\ value\ readable[[:space:]]+ok'
+gate_has   "s35: getxattr size 0 is length    " "$S35" '^xa: ok[[:space:]]+getxattr\ size\ 0\ is\ length[[:space:]]+ok'
+gate_has   "s35: getxattr ERANGE              " "$S35" '^xa: ok[[:space:]]+getxattr\ ERANGE[[:space:]]+ok'
+gate_has   "s35: getxattr ENODATA             " "$S35" '^xa: ok[[:space:]]+getxattr\ ENODATA[[:space:]]+ok'
+gate_has   "s35: getxattr ENOENT              " "$S35" '^xa: ok[[:space:]]+getxattr\ ENOENT[[:space:]]+ok'
+gate_has   "s35: setxattr CREATE              " "$S35" '^xa: ok[[:space:]]+setxattr\ CREATE[[:space:]]+ok'
+gate_has   "s35: CREATE twice EEXIST          " "$S35" '^xa: ok[[:space:]]+CREATE\ twice\ EEXIST[[:space:]]+ok'
+gate_has   "s35: REPLACE missing ENODATA      " "$S35" '^xa: ok[[:space:]]+REPLACE\ missing\ ENODATA[[:space:]]+ok'
+gate_has   "s35: REPLACE present              " "$S35" '^xa: ok[[:space:]]+REPLACE\ present[[:space:]]+ok'
+gate_has   "s35: REPLACE observable           " "$S35" '^xa: ok[[:space:]]+REPLACE\ observable[[:space:]]+ok'
+gate_has   "s35: CREATE+REPLACE EINVAL        " "$S35" '^xa: ok[[:space:]]+CREATE\+REPLACE\ EINVAL[[:space:]]+ok'
+gate_has   "s35: unknown flag EINVAL          " "$S35" '^xa: ok[[:space:]]+unknown\ flag\ EINVAL[[:space:]]+ok'
+gate_has   "s35: NULL name EINVAL             " "$S35" '^xa: ok[[:space:]]+NULL\ name\ EINVAL[[:space:]]+ok'
+gate_has   "s35: NULL path EINVAL             " "$S35" '^xa: ok[[:space:]]+NULL\ path\ EINVAL[[:space:]]+ok'
+gate_has   "s35: NULL value EFAULT            " "$S35" '^xa: ok[[:space:]]+NULL\ value\ EFAULT[[:space:]]+ok'
+gate_has   "s35: listxattr size 0 length      " "$S35" '^xa: ok[[:space:]]+listxattr\ size\ 0\ length[[:space:]]+ok'
+gate_has   "s35: listxattr names              " "$S35" '^xa: ok[[:space:]]+listxattr\ names[[:space:]]+ok'
+gate_has   "s35: listxattr ERANGE             " "$S35" '^xa: ok[[:space:]]+listxattr\ ERANGE[[:space:]]+ok'
+gate_has   "s35: removexattr                  " "$S35" '^xa: ok[[:space:]]+removexattr[[:space:]]+ok'
+gate_has   "s35: removed is ENODATA           " "$S35" '^xa: ok[[:space:]]+removed\ is\ ENODATA[[:space:]]+ok'
+gate_has   "s35: removexattr ENOENT           " "$S35" '^xa: ok[[:space:]]+removexattr\ ENOENT[[:space:]]+ok'
+gate_has   "s35: fsetxattr                    " "$S35" '^xa: ok[[:space:]]+fsetxattr[[:space:]]+ok'
+gate_has   "s35: fgetxattr round trip         " "$S35" '^xa: ok[[:space:]]+fgetxattr\ round\ trip[[:space:]]+ok'
+gate_has   "s35: fd and path agree            " "$S35" '^xa: ok[[:space:]]+fd\ and\ path\ agree[[:space:]]+ok'
+gate_has   "s35: fremovexattr                 " "$S35" '^xa: ok[[:space:]]+fremovexattr[[:space:]]+ok'
+gate_has   "s35: fremoved is ENODATA          " "$S35" '^xa: ok[[:space:]]+fremoved\ is\ ENODATA[[:space:]]+ok'
+gate_has   "s35: fgetxattr EBADF              " "$S35" '^xa: ok[[:space:]]+fgetxattr\ EBADF[[:space:]]+ok'
+gate_has   "s35: fsetxattr EBADF              " "$S35" '^xa: ok[[:space:]]+fsetxattr\ EBADF[[:space:]]+ok'
+gate_has   "s35: flistxattr ok                " "$S35" '^xa: ok[[:space:]]+flistxattr\ ok[[:space:]]+ok'
+gate_has   "s35: symlink for l                " "$S35" '^xa: ok[[:space:]]+symlink\ for\ l[[:space:]]+ok'
+gate_has   "s35: lgetxattr did NOT follow     " "$S35" '^xa: ok[[:space:]]+lgetxattr\ did\ NOT\ follow[[:space:]]+ok'
+gate_has   "s35: getxattr did follow          " "$S35" '^xa: ok[[:space:]]+getxattr\ did\ follow[[:space:]]+ok'
+gate_has   "s35: lsetxattr on link            " "$S35" '^xa: ok[[:space:]]+lsetxattr\ on\ link[[:space:]]+ok'
+gate_has   "s35: lsetxattr observable         " "$S35" '^xa: ok[[:space:]]+lsetxattr\ observable[[:space:]]+ok'
+gate_has   "s35: lsetxattr did NOT follow     " "$S35" '^xa: ok[[:space:]]+lsetxattr\ did\ NOT\ follow[[:space:]]+ok'
+gate_has   "s35: lremovexattr                 " "$S35" '^xa: ok[[:space:]]+lremovexattr[[:space:]]+ok'
+gate_has   "s35: llistxattr empty after rm    " "$S35" '^xa: ok[[:space:]]+llistxattr\ empty\ after\ rm[[:space:]]+ok'
+gate_has   "s35: llistxattr kept target attrs " "$S35" '^xa: ok[[:space:]]+llistxattr\ kept\ target\ attrs[[:space:]]+ok'
+gate_has   "s35: all ok"                       "$S35" 'xa: all ok'
+gate_has   "s35: exit 0"                       "$S35" 'sh: xatest exited 0'
+gate_count "s35: no panic"                     "$S35" 'panic' 0
+gate_bad   "s35" "$S35"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

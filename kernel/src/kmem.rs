@@ -79,13 +79,22 @@ unsafe fn link_sorted(h: *mut Header) {
     }
 }
 
-unsafe fn grow() -> bool {
+/// Add at least `need` bytes of free heap in ONE contiguous run.
+///
+/// The run size has to track the request: a fixed HEAP_FRAMES chunk means a
+/// request larger than one chunk can never be satisfied, because the heap
+/// grows in place-anchored runs and the caller gets one retry -- a 6 MiB
+/// image against a 4 MiB grow() failed with "allocation of 6333952 bytes"
+/// even with hundreds of MiB free.
+unsafe fn grow(need: usize) -> bool {
+    let frames = (need + FRAME - 1) / FRAME;
+    let frames = frames.max(HEAP_FRAMES);
     unsafe {
-        let Some(base) = pmm::alloc_contiguous(HEAP_FRAMES) else {
+        let Some(base) = pmm::alloc_contiguous(frames) else {
             return false;
         };
         let h = base as *mut Header;
-        (*h).size = HEAP_FRAMES * FRAME;
+        (*h).size = frames * FRAME;
         link_sorted(h);
         true
     }
@@ -93,7 +102,7 @@ unsafe fn grow() -> bool {
 
 unsafe fn alloc_inner(need: usize) -> *mut u8 {
     unsafe {
-        if free_head().is_null() && !grow() {
+        if free_head().is_null() && !grow(need) {
             return ptr::null_mut();
         }
         let mut b = free_head();
@@ -124,7 +133,7 @@ unsafe fn alloc_inner(need: usize) -> *mut u8 {
             }
             b = (*b).next;
         }
-        if !grow() {
+        if !grow(need) {
             return ptr::null_mut();
         }
         alloc_inner(need) // one retry after extending

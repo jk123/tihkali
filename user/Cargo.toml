@@ -91,3 +91,11 @@ path = "src/attest.rs"
 [[bin]]
 name = "tihkali-iotest5"
 path = "src/iotest5.rs"
+
+[[bin]]
+name = "tihkali-at6test"
+path = "src/at6test.rs"
+
+[[bin]]
+name = "tihkali-xatest"
+path = "src/xatest.rs"

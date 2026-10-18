@@ -815,6 +815,159 @@ fn netbsd_fstatat(dirfd: i64, path: &str, buf: u64, flags: u64) -> (i64, u8) {
     }
 }
 
+/// Resolve the node a *xattr family call names. `by_fd` selects the `f`
+/// spelling (an open descriptor) over the path spellings, and `nofollow`
+/// selects `l` over the plain form.
+///
+/// Returns EINVAL for a NULL path (a null pointer is not the root), which
+/// is what the pointer arguments here deserve.
+fn xattr_node(path_ptr: u64, dirfd: i64, by_fd: bool, nofollow: bool) -> Result<usize, u8> {
+    if by_fd {
+        return crate::file::node_of_fd(dirfd as usize);
+    }
+    if path_ptr == 0 {
+        return Err(22); // EINVAL: NULL path
+    }
+    let Some(path) = crate::proc::read_user_cstr(path_ptr, 256) else {
+        return Err(14); // EFAULT
+    };
+    let abs = crate::proc::abspath(&path);
+    match if nofollow {
+        crate::fs::lookup_nofollow(&abs)
+    } else {
+        crate::fs::lookup(&abs)
+    } {
+        Some(i) => Ok(i),
+        None => Err(crate::file::ENOENT),
+    }
+}
+
+/// setxattr/lsetxattr/fsetxattr. NetBSD's order is (path, name, value,
+/// size, flags) -- `size` BEFORE `flags`, unlike Linux's.
+fn netbsd_xattr_set(path_ptr: u64, dirfd: i64, by_fd: bool, nofollow: bool, name_ptr: u64, val_ptr: u64, size: u64, flags: u64) -> (i64, u8) {
+    const XATTR_CREATE: u64 = 1;
+    const XATTR_REPLACE: u64 = 2;
+    if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        return (-1, 22); // EINVAL
+    }
+    if flags == (XATTR_CREATE | XATTR_REPLACE) {
+        return (-1, 22); // EINVAL: exclusive
+    }
+    let idx = match xattr_node(path_ptr, dirfd, by_fd, nofollow) {
+        Ok(i) => i,
+        Err(e) => return (-1, e),
+    };
+    if name_ptr == 0 {
+        return (-1, 22);
+    }
+    let Some(name) = crate::proc::read_user_cstr(name_ptr, 64) else {
+        return (-1, 14);
+    };
+    // A non-NULL value pointer must be readable for `size` bytes; a NULL
+    // one is only legal with size 0 (an empty value).
+    if val_ptr == 0 && size != 0 {
+        return (-1, 14); // EFAULT
+    }
+    if size != 0 && !crate::proc::user_range_ok(val_ptr, size as usize) {
+        return (-1, 14);
+    }
+    let exists = crate::fs::xattr_get(idx, &name).ok().flatten().is_some();
+    if flags & XATTR_CREATE != 0 && exists {
+        return (-1, 17); // EEXIST
+    }
+    if flags & XATTR_REPLACE != 0 && !exists {
+        return (-1, 89); // ENODATA
+    }
+    let mut value = alloc::vec::Vec::new();
+    if size != 0 {
+        value.resize(size as usize, 0);
+        unsafe {
+            core::ptr::copy_nonoverlapping(val_ptr as *const u8, value.as_mut_ptr(), size as usize);
+        }
+    }
+    match crate::fs::xattr_set(idx, &name, &value) {
+        Ok(()) => (0, 0),
+        Err(e) => (-1, e),
+    }
+}
+
+/// getxattr/lgetxattr/fgetxattr. A `size` of 0 asks for the LENGTH and
+/// writes nothing; otherwise a buffer too small is ERANGE rather than a
+/// truncated value the caller would act on as complete.
+fn netbsd_xattr_get(path_ptr: u64, dirfd: i64, by_fd: bool, nofollow: bool, name_ptr: u64, val_ptr: u64, size: u64) -> (i64, u8) {
+    let idx = match xattr_node(path_ptr, dirfd, by_fd, nofollow) {
+        Ok(i) => i,
+        Err(e) => return (-1, e),
+    };
+    if name_ptr == 0 {
+        return (-1, 22);
+    }
+    let Some(name) = crate::proc::read_user_cstr(name_ptr, 64) else {
+        return (-1, 14);
+    };
+    let Some(value) = crate::fs::xattr_get(idx, &name).ok().flatten() else {
+        return (-1, 89); // ENODATA
+    };
+    if size == 0 {
+        return (value.len() as i64, 0);
+    }
+    if val_ptr == 0 || !crate::proc::user_range_ok(val_ptr, size as usize) {
+        return (-1, 14); // EFAULT
+    }
+    if value.len() > size as usize {
+        return (-1, 34); // ERANGE
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(value.as_ptr(), val_ptr as *mut u8, value.len());
+    }
+    (value.len() as i64, 0)
+}
+
+/// listxattr/llistxattr/flistxattr: the names, NUL-separated, in storage
+/// order. Same size-0-means-length contract as getxattr.
+fn netbsd_xattr_list(path_ptr: u64, dirfd: i64, by_fd: bool, nofollow: bool, list_ptr: u64, size: u64) -> (i64, u8) {
+    let idx = match xattr_node(path_ptr, dirfd, by_fd, nofollow) {
+        Ok(i) => i,
+        Err(e) => return (-1, e),
+    };
+    let names = crate::fs::xattr_list(idx);
+    let mut out = alloc::vec::Vec::new();
+    for n in &names {
+        out.extend_from_slice(n.as_bytes());
+        out.push(0);
+    }
+    if size == 0 {
+        return (out.len() as i64, 0);
+    }
+    if list_ptr == 0 || !crate::proc::user_range_ok(list_ptr, size as usize) {
+        return (-1, 14); // EFAULT
+    }
+    if out.len() > size as usize {
+        return (-1, 34); // ERANGE
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(out.as_ptr(), list_ptr as *mut u8, out.len());
+    }
+    (out.len() as i64, 0)
+}
+
+/// removexattr/lremovexattr/fremovexattr
+fn netbsd_xattr_remove(path_ptr: u64, dirfd: i64, by_fd: bool, nofollow: bool, name_ptr: u64) -> (i64, u8) {
+    let idx = match xattr_node(path_ptr, dirfd, by_fd, nofollow) {
+        Ok(i) => i,
+        Err(e) => return (-1, e),
+    };
+    if name_ptr == 0 {
+        return (-1, 22);
+    }
+    let Some(name) = crate::proc::read_user_cstr(name_ptr, 64) else {
+        return (-1, 14);
+    };
+    match crate::fs::xattr_remove(idx, &name) {
+        Ok(()) => (0, 0),
+        Err(e) => (-1, e),
+    }
+}
 /// fchdir(fd): change the working directory through a descriptor. A
 /// descriptor that is not open is EBADF and one that is not a directory
 /// is ENOTDIR -- a wrong-directory here silently corrupts every later
@@ -1451,6 +1604,273 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         nbsys::SETGROUPS => match crate::proc::set_groups(frame.x[0], frame.x[1] as usize) {
             Ok(()) => (0, 0),
             Err(e) => (-1, e),
+        },
+        // --- extended attributes -----------------------------------------
+        //
+        // Twelve calls, one storage path. The `f` spelling takes a
+        // descriptor where the others take a path, and `l` does not follow
+        // the final symlink. NetBSD's setxattr puts `size` BEFORE `flags`,
+        // unlike Linux's, so the two are not interchangeable orderings.
+        nbsys::SETXATTR => netbsd_xattr_set(frame.x[0], 0, false, false, frame.x[1], frame.x[2], frame.x[3], frame.x[4]),
+        nbsys::LSETXATTR => netbsd_xattr_set(frame.x[0], 0, false, true, frame.x[1], frame.x[2], frame.x[3], frame.x[4]),
+        nbsys::FSETXATTR => netbsd_xattr_set(0, frame.x[0] as i64, true, false, frame.x[1], frame.x[2], frame.x[3], frame.x[4]),
+        nbsys::GETXATTR => netbsd_xattr_get(frame.x[0], 0, false, false, frame.x[1], frame.x[2], frame.x[3]),
+        nbsys::LGETXATTR => netbsd_xattr_get(frame.x[0], 0, false, true, frame.x[1], frame.x[2], frame.x[3]),
+        nbsys::FGETXATTR => netbsd_xattr_get(0, frame.x[0] as i64, true, false, frame.x[1], frame.x[2], frame.x[3]),
+        nbsys::LISTXATTR => netbsd_xattr_list(frame.x[0], 0, false, false, frame.x[1], frame.x[2]),
+        nbsys::LLISTXATTR => netbsd_xattr_list(frame.x[0], 0, false, true, frame.x[1], frame.x[2]),
+        nbsys::FLISTXATTR => netbsd_xattr_list(0, frame.x[0] as i64, true, false, frame.x[1], frame.x[2]),
+        nbsys::REMOVEXATTR => netbsd_xattr_remove(frame.x[0], 0, false, false, frame.x[1]),
+        nbsys::LREMOVEXATTR => netbsd_xattr_remove(frame.x[0], 0, false, true, frame.x[1]),
+        nbsys::FREMOVEXATTR => netbsd_xattr_remove(0, frame.x[0] as i64, true, false, frame.x[1]),
+// --- *at() variants of calls that already exist ---------------------
+        //
+        // fchmodat/fchownat/utimensat are the (dirfd, path) spellings of
+        // chmod/chown/futimens, and NetBSD's AT_SYMLINK_NOFOLLOW is 0x200
+        // (verified in sys/sys/fcntl.h) where Linux's is 0x100.
+        nbsys::FCHMODAT => match crate::proc::read_user_cstr(frame.x[1], 256) {
+            None => (-1, 14),
+            Some(path) => {
+                let flag = frame.x[3];
+                if flag & !crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+                    (-1, 22) // EINVAL: unknown flag
+                } else {
+                    match crate::linux_abi::resolve_path(frame.x[0] as i64, path) {
+                        Err(e) => (-1, e),
+                        Ok(abs) => {
+                            let found = if flag & crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+                                crate::fs::lookup_nofollow(&abs)
+                            } else {
+                                crate::fs::lookup(&abs)
+                            };
+                            match found {
+                                None => (-1, crate::file::ENOENT),
+                                Some(idx) => match crate::fs::set_mode(idx, (frame.x[2] as u16) & 0o7777) {
+                                    Ok(()) => (0, 0),
+                                    Err(e) => (-1, e),
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        // fchownat(fd, path, uid, gid, flag): uid/gid of -1 (u32::MAX) leave
+        // that id alone, matching chown(2).
+        nbsys::FCHOWNAT => match crate::proc::read_user_cstr(frame.x[1], 256) {
+            None => (-1, 14),
+            Some(path) => {
+                let flag = frame.x[4];
+                if flag & !crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+                    (-1, 22)
+                } else {
+                    match crate::linux_abi::resolve_path(frame.x[0] as i64, path) {
+                        Err(e) => (-1, e),
+                        Ok(abs) => {
+                            let found = if flag & crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+                                crate::fs::lookup_nofollow(&abs)
+                            } else {
+                                crate::fs::lookup(&abs)
+                            };
+                            match found {
+                                None => (-1, crate::file::ENOENT),
+                                Some(idx) => {
+                                    let cur = crate::fs::owner(idx);
+                                    let uid = if frame.x[2] as u32 == u32::MAX { cur.0 } else { frame.x[2] as u32 };
+                                    let gid = if frame.x[3] as u32 == u32::MAX { cur.1 } else { frame.x[3] as u32 };
+                                    match crate::fs::set_owner(idx, uid, gid) {
+                                        Ok(()) => (0, 0),
+                                        Err(e) => (-1, e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        // utimensat(fd, path, times[2], flag): NULL times means "now".
+        // Only the modification slot is applied -- this filesystem records
+        // one mtime, so applying the access slot would make a read change
+        // mtime and stat would report a write that never happened.
+        nbsys::UTIMENSAT => match crate::proc::read_user_cstr(frame.x[1], 256) {
+            None => (-1, 14),
+            Some(path) => {
+                let ts = frame.x[2];
+                let flag = frame.x[3];
+                if flag & !crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+                    (-1, 22)
+                } else if ts != 0 && !crate::linux_abi::timespecs_valid(ts, 2) {
+                    (-1, 22) // EINVAL: tv_nsec out of range
+                } else {
+                    match crate::linux_abi::resolve_path(frame.x[0] as i64, path) {
+                        Err(e) => (-1, e),
+                        Ok(abs) => {
+                            let found = if flag & crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+                                crate::fs::lookup_nofollow(&abs)
+                            } else {
+                                crate::fs::lookup(&abs)
+                            };
+                            match found {
+                                None => (-1, crate::file::ENOENT),
+                                Some(idx) => {
+                                    if ts == 0 {
+                                        crate::fs::set_mtime(idx, crate::arch::timer::unix_secs());
+                                    } else {
+                                        let sec = unsafe { *(ts as *const i64).add(2) };
+                                        let nsec = unsafe { *(ts as *const i64).add(3) };
+                                        if nsec == 2 {
+                                            crate::fs::set_mtime(idx, crate::arch::timer::unix_secs());
+                                        } else if sec != 1 {
+                                            crate::fs::set_mtime(idx, sec);
+                                        }
+                                    }
+                                    (0, 0)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        // __posix_rename(270): rename(2) with POSIX overwrite semantics.
+        // NetBSD's plain rename already replaces the destination, so this
+        // is the same call under its POSIX name.
+        nbsys::__POSIX_RENAME => match crate::proc::read_user_cstr(frame.x[0], 256) {
+            None => (-1, 14),
+            Some(from) => match crate::proc::read_user_cstr(frame.x[1], 256) {
+                None => (-1, 14),
+                Some(to) => {
+                    match crate::linux_abi::resolve_path(crate::linux_abi::AT_FDCWD, from) {
+                        Err(e) => (-1, e),
+                        Ok(a) => match crate::linux_abi::resolve_path(crate::linux_abi::AT_FDCWD, to) {
+                            Err(e) => (-1, e),
+                            Ok(b) => match crate::fs::rename(&a, &b) {
+                                Ok(()) => (0, 0),
+                                Err(e) => (-1, e),
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        // lchmod(274): chmod without following a symlink. The kernel stores
+        // one mode per node, so a symlink's own mode is what changes.
+        nbsys::LCHMOD => match crate::proc::read_user_cstr(frame.x[0], 256) {
+            None => (-1, 14),
+            Some(path) => match crate::fs::lookup_nofollow(&crate::proc::abspath(&path)) {
+                None => (-1, crate::file::ENOENT),
+                Some(idx) => match crate::fs::set_mode(idx, (frame.x[1] as u16) & 0o7777) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (-1, e),
+                },
+            },
+        },
+        // lpathconf(499): pathconf without following the final symlink.
+        nbsys::LPATHCONF => match crate::proc::read_user_cstr(frame.x[0], 256) {
+            None => (-1, 14),
+            Some(path) => match crate::fs::lookup_nofollow(&crate::proc::abspath(&path)) {
+                None => (-1, crate::file::ENOENT),
+                Some(idx) => crate::fs::pathconf(idx, frame.x[1] as u32),
+            },
+        },
+        // --- chflags(34)/fchflags(35)/lchflags(304) ---
+        //
+        // Real work: the value is stored per node and reported through
+        // st_flags@132. A chflags that returned 0 without storing anything
+        // would leave a caller believing UF_IMMUTABLE is set on a file
+        // that is still writable.
+        nbsys::CHFLAGS => match crate::proc::read_user_cstr(frame.x[0], 256) {
+            None => (-1, 14),
+            Some(path) => match crate::fs::lookup(&crate::proc::abspath(&path)) {
+                None => (-1, crate::file::ENOENT),
+                Some(idx) => match crate::fs::set_flags(idx, frame.x[1] as u32) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (-1, e),
+                },
+            },
+        },
+        nbsys::LCHFLAGS => match crate::proc::read_user_cstr(frame.x[0], 256) {
+            None => (-1, 14),
+            Some(path) => match crate::fs::lookup_nofollow(&crate::proc::abspath(&path)) {
+                None => (-1, crate::file::ENOENT),
+                Some(idx) => match crate::fs::set_flags(idx, frame.x[1] as u32) {
+                    Ok(()) => (0, 0),
+                    Err(e) => (-1, e),
+                },
+            },
+        },
+        nbsys::FCHFLAGS => match crate::file::node_of_fd(frame.x[0] as usize) {
+            Err(e) => (-1, e),
+            Ok(idx) => match crate::fs::set_flags(idx, frame.x[1] as u32) {
+                Ok(()) => (0, 0),
+                Err(e) => (-1, e),
+            },
+        },
+        // --- preadv(289)/pwritev(290) ---
+        //
+        // The offset is x4, NOT x3: the prototype carries an explicit PAD
+        // word, the same trap as pread(173)/pwrite(174). Neither moves the
+        // file position.
+        nbsys::PREADV => match crate::netbsd_abi::walk_iovecs(frame.x[1], frame.x[2]) {
+            Err(e) => (-1, e),
+            Ok(iovs) => {
+                let mut total: i64 = 0;
+                let mut err: Option<u8> = None;
+                let offset = frame.x[4];
+                for (base, len) in iovs {
+                    if len == 0 {
+                        continue;
+                    }
+                    match crate::proc::read_at(frame.x[0] as usize, base, len as usize, offset + total as u64) {
+                        Ok(n) => {
+                            total += n as i64;
+                            // Short read: the caller's vectors are full.
+                            if (n as u64) < len {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                // A partial transfer must not be lost to the errno.
+                match err {
+                    Some(e) => (total, e),
+                    None => (total, 0),
+                }
+            }
+        },
+        nbsys::PWRITEV => match crate::netbsd_abi::walk_iovecs(frame.x[1], frame.x[2]) {
+            Err(e) => (-1, e),
+            Ok(iovs) => {
+                let mut total: i64 = 0;
+                let mut err: Option<u8> = None;
+                let offset = frame.x[4];
+                for (base, len) in iovs {
+                    if len == 0 {
+                        continue;
+                    }
+                    match crate::proc::write_at(frame.x[0] as usize, base, len as usize, offset + total as u64) {
+                        Ok(n) => {
+                            total += n as i64;
+                            if (n as u64) < len {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match err {
+                    Some(e) => (total, e),
+                    None => (total, 0),
+                }
+            }
         },
         // --- the *at() family ---
         //
