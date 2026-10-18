@@ -115,6 +115,10 @@ pub struct Process {
     pub nsignals: u64,
     pub inblock: u64,
     pub oublock: u64,
+    /// RLIMIT_NOFILE (and the rest): soft/hard pairs, 12 resources per
+    /// RLIM_NLIMITS. Stored per process so setrlimit has somewhere real to
+    /// write and getrlimit does not have to answer from a constant.
+    pub rlimits: [[u64; 2]; 12],
     /// Absolute tick deadline while sleeping in a timed syscall
     /// (ppoll/nanosleep); None for untimed sleeps.
     pub wake_at: Option<u64>,
@@ -277,6 +281,39 @@ pub fn current_pgrp() -> usize {
         .unwrap_or(0)
 }
 
+/// RLIM_NLIMITS = 12. Unlimited is (u64::MAX, u64::MAX), matching the
+/// RLIM_INFINITY a caller would pass.
+fn default_rlimits() -> [[u64; 2]; 12] {
+    [[u64::MAX; 2]; 12]
+}
+
+/// Give up the CPU without a deadline. The process is marked Sleeping
+/// then made Runnable again, so `schedule` skips it and picks someone
+/// else; when it comes back round the syscall re-executes.
+pub fn yield_now(frame: &mut TrapFrame) {
+    sleep_current(frame);
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if let Some(p) = table().get_mut(cur).and_then(|s| s.as_mut()) {
+        p.state = State::Runnable;
+    }
+    let _ = frame;
+}
+
+/// The kernel's hostname. Single core, and every access is from a
+/// syscall with interrupts masked, so the same UnsafeCell pattern the
+/// pipe and socket pools use is sufficient here.
+struct HostnameCell(UnsafeCell<String>);
+unsafe impl Sync for HostnameCell {}
+static HOSTNAME: HostnameCell = HostnameCell(UnsafeCell::new(String::new()));
+
+pub fn hostname() -> String {
+    unsafe { (*HOSTNAME.0.get()).clone() }
+}
+
+pub fn set_hostname(name: String) {
+    unsafe { *HOSTNAME.0.get() = name };
+}
+
 pub fn session_of(pid: usize) -> usize {
     table().get(pid).and_then(|s| s.as_ref()).map_or(0, |p| p.sess)
 }
@@ -302,6 +339,35 @@ pub fn usage_of(pid: usize) -> (u64, u64, u64, u64, u64) {
         Some(p) => (p.nvcsw, p.nivcsw, p.nsignals, p.inblock, p.oublock),
         None => (0, 0, 0, 0, 0),
     }
+}
+
+/// getrlimit/setrlimit on the current process. `which` outside
+/// RLIM_NLIMITS is EINVAL rather than silently ignored -- a caller that
+/// set RLIMIT_NOFILE and read back a different resource would never know.
+pub fn get_rlimit(which: usize) -> Result<(u64, u64), u8> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_ref().ok_or(3)?; // ESRCH
+    let r = p.rlimits.get(which).ok_or(22)?;
+    Ok((r[0], r[1]))
+}
+
+pub fn set_rlimit(which: usize, cur: u64, max: u64) -> Result<(), u8> {
+    let cur_slot = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur_slot].as_mut().ok_or(3)?;
+    let Some(slot) = p.rlimits.get_mut(which) else {
+        return Err(22); // EINVAL
+    };
+    // The hard limit cannot be raised by an unprivileged caller, and the
+    // soft limit may never exceed the hard one. Both are checked so a
+    // later getrlimit cannot report a limit the kernel would not honour.
+    if cur > max {
+        return Err(22); // EINVAL
+    }
+    if max > slot[1] {
+        return Err(EPERM_L);
+    }
+    *slot = [cur, max];
+    Ok(())
 }
 
 pub fn current_pid() -> usize {
@@ -382,6 +448,7 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         nsignals: 0,
         inblock: 0,
         oublock: 0,
+        rlimits: default_rlimits(),
         wake_at: None,
         tpidr: crate::user::TPIDR_VAL,
         itimer_at: None,
@@ -779,6 +846,10 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         nsignals: 0,
         inblock: 0,
         oublock: 0,
+        // A child INHERITS its limits -- that is what makes a setrlimit in
+        // a parent mean anything to the work it spawns. Usage counters
+        // above deliberately do NOT inherit.
+        rlimits: t[cur].as_ref().unwrap().rlimits,
         wake_at: None,
         // Child shares the parent's live TLS (COW pages keep it valid).
         tpidr: read_tpidr(),

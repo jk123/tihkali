@@ -491,6 +491,149 @@ fn netbsd_getrusage(who: i64, out: u64) -> (i64, u8) {
     (0, 0)
 }
 
+/// getrlimit(194): struct rlimit is two 64-bit values.
+fn netbsd_getrlimit(which: i64, out: u64) -> (i64, u8) {
+    if out == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(out, 16) {
+        return (-1, 14); // EFAULT
+    }
+    match crate::proc::get_rlimit(which as usize) {
+        Ok((cur, max)) => unsafe {
+            (out as *mut u64).write_unaligned(cur);
+            (out as *mut u64).add(1).write_unaligned(max);
+            (0, 0)
+        },
+        Err(e) => (-1, e),
+    }
+}
+
+/// setrlimit(195).
+fn netbsd_setrlimit(which: i64, inp: u64) -> (i64, u8) {
+    if inp == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(inp, 16) {
+        return (-1, 14); // EFAULT
+    }
+    let cur = unsafe { (inp as *const u64).read_unaligned() };
+    let max = unsafe { (inp as *const u64).add(1).read_unaligned() };
+    match crate::proc::set_rlimit(which as usize, cur, max) {
+        Ok(()) => (0, 0),
+        Err(e) => (-1, e),
+    }
+}
+
+/// gethostname(87): writes the stored name, NUL-terminated, truncated to
+/// `len`. A too-small buffer truncates rather than failing -- that is what
+/// the man page specifies -- so the caller always gets something valid.
+fn netbsd_gethostname(buf: u64, len: usize) -> (i64, u8) {
+    if buf == 0 || len == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(buf, len) {
+        return (-1, 14); // EFAULT
+    }
+    let name = crate::proc::hostname();
+    let n = name.len().min(len - 1);
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
+        *((buf as usize + n) as *mut u8) = 0;
+    }
+    (0, 0)
+}
+
+/// sethostname(88). A name that does not fit the stored buffer is ENAMETOOLONG
+/// rather than silently truncated -- a truncated hostname is a different
+/// name, not the one asked for.
+fn netbsd_sethostname(buf: u64, len: usize) -> (i64, u8) {
+    if buf == 0 || len == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(buf, len) {
+        return (-1, 14); // EFAULT
+    }
+    const MAX_HOSTNAME: usize = 64;
+    if len > MAX_HOSTNAME {
+        return (-1, 63); // ENAMETOOLONG
+    }
+    let mut s = alloc::string::String::new();
+    for i in 0..len {
+        let b = unsafe { *((buf as usize + i) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        s.push(b as char);
+    }
+    if s.is_empty() {
+        return (-1, 22); // EINVAL
+    }
+    crate::proc::set_hostname(s);
+    (0, 0)
+}
+
+/// utimes(420)/lutimes(424): `times` NULL means "set to now"; otherwise
+/// two timevals {atime, mtime}, seconds each.
+fn netbsd_utimes(path_ptr: u64, times: u64, nofollow: bool) -> (i64, u8) {
+    let Some(path) = crate::proc::read_user_cstr(path_ptr, 256) else {
+        return (-1, 14); // EFAULT
+    };
+    let abs = crate::proc::abspath(&path);
+    let found = if nofollow {
+        crate::fs::lookup_nofollow(&abs)
+    } else {
+        crate::fs::lookup(&abs)
+    };
+    let Some(idx) = found else {
+        return (-1, crate::file::ENOENT);
+    };
+    let now = crate::arch::timer::unix_secs();
+    let t = if times == 0 {
+        now
+    } else {
+        if !crate::proc::user_range_ok(times, 16) {
+            return (-1, 14);
+        }
+        unsafe { (times as *const i64).read_unaligned() }
+    };
+    crate::fs::set_mtime(idx, t);
+    (0, 0)
+}
+
+/// futimes(423): same, through a descriptor.
+fn netbsd_futimes(fd: u64, times: u64) -> (i64, u8) {
+    match crate::file::node_of_fd(fd as usize) {
+        Err(e) => (-1, e),
+        Ok(idx) => {
+            let now = crate::arch::timer::unix_secs();
+            let t = if times == 0 {
+                now
+            } else {
+                if !crate::proc::user_range_ok(times, 16) {
+                    return (-1, 14);
+                }
+                unsafe { (times as *const i64).read_unaligned() }
+            };
+            crate::fs::set_mtime(idx, t);
+            (0, 0)
+        }
+    }
+}
+
+/// dup3(454): dup onto an EXPLICIT target, closing it first. `oldfd ==
+/// newfd` is EINVAL because it would close the very descriptor being
+/// duplicated -- a case dup2 historically got wrong.
+fn netbsd_dup3(from: i64, to: i64) -> (i64, u8) {
+    if from == to || from < 0 || to < 0 || to > 1024 {
+        return (-1, 22); // EINVAL
+    }
+    match crate::proc::sys_dup3(from, to) {
+        Ok(n) => (n as i64, 0),
+        Err(e) => (-1, e),
+    }
+}
+
 fn svc_dispatch(frame: &mut TrapFrame) {
     let imm = frame.esr & 0xffff;
     if imm == 0 {
@@ -834,6 +977,11 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 Err(e) => (-1, e),
             }
         }
+        // dup3(454): dup with an EXPLICIT target, atomically closing it.
+        // The two rules that make it different from dup2 are enforced:
+        // oldfd == newfd is EINVAL (it would close the source), and the
+        // target is closed FIRST so the copy cannot clobber itself.
+        nbsys::DUP3 => netbsd_dup3(frame.x[0] as i64, frame.x[1] as i64),
         nbsys::DUP2 => {
             // SYS_dup2(oldfd, newfd): force onto newfd, closing whatever
             // was there. dup3(old,new,0) already implements this, including
@@ -1107,6 +1255,28 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             Ok(()) => (0, 0),
             Err(e) => (-1, e),
         },
+        // --- resource limits ---
+        //
+        // struct rlimit is { rlim_cur; rlim_max } with rlim_t = 64-bit on
+        // aarch64 -- 16 bytes, from sys/resource.h. 194/195 are the live
+        // __2 entries; 144/145 are the compat ones.
+        nbsys::GETRLIMIT__2 => netbsd_getrlimit(frame.x[0] as i64, frame.x[1]),
+        nbsys::SETRLIMIT__2 => netbsd_setrlimit(frame.x[0] as i64, frame.x[1]),
+        // --- misc POSIX ---
+        // sched_yield(350): give up the CPU.
+        nbsys::SCHED_YIELD => {
+            crate::proc::yield_now(frame);
+            return; // re-executed on wake
+        }
+        // gethostname(87)/sethostname(88): stored, so sethostname is
+        // observable rather than a silent success.
+        nbsys::GETHOSTNAME => netbsd_gethostname(frame.x[0], frame.x[1] as usize),
+        nbsys::SETHOSTNAME => netbsd_sethostname(frame.x[0], frame.x[1] as usize),
+        // utimes(420)/futimes(423)/lutimes(424): a NULL times pointer
+        // means "now"; otherwise both timevals are set explicitly.
+        nbsys::UTIMES__2 => netbsd_utimes(frame.x[0], frame.x[1], false),
+        nbsys::FUTIMES__2 => netbsd_futimes(frame.x[0], frame.x[1]),
+        nbsys::LUTIMES__2 => netbsd_utimes(frame.x[0], frame.x[1], true),
         // --- sync / locking ---
         //
         // fsync(95) and fdatasync(241) both flush the whole filesystem

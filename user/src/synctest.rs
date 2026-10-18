@@ -64,6 +64,25 @@ unsafe fn write(fd: i64, buf: &[u8]) {
     }
 }
 
+macro_rules! svc0 {
+    ($name:ident, $nr:expr) => {
+        unsafe fn $name() -> Result<i64, i64> {
+            let ret: i64;
+            let err: isize;
+            unsafe {
+                asm!(
+                    concat!("svc #", $nr),
+                    "cset {err}, hs",
+                    inlateout("x0") 0i64 => ret,
+                    err = out(reg) err,
+                    options(nostack),
+                );
+            }
+            if err != 0 { Err(ret) } else { Ok(ret) }
+        }
+    };
+}
+
 macro_rules! svc1 {
     ($name:ident, $nr:expr, $arg:ident) => {
         unsafe fn $name($arg: i64) -> Result<i64, i64> {
@@ -168,6 +187,15 @@ unsafe fn select(nd: i64, rd: i64, wr: i64, ex: i64, tv: i64) -> Result<i64, i64
     if err != 0 { Err(ret) } else { Ok(ret) }
 }
 svc2!(getrusage, "445", (who, buf));
+svc2!(getrlimit, "194", (which, buf));
+svc2!(setrlimit, "195", (which, buf));
+svc3!(dup3, "454", (from, to, flags));
+svc2!(gethostname, "87", (buf, len));
+svc2!(sethostname, "88", (buf, len));
+svc2!(utimes, "420", (path, times));
+svc2!(futimes, "423", (fd, times));
+svc0!(sched_yield, "350");
+svc2!(crate_stat, "38", (path, buf));
 svc1!(getsid, "286", pid);
 svc2!(getlogin, "49", (buf, len));
 svc1!(sigaltstack, "281", nss);
@@ -352,6 +380,105 @@ pub extern "C" fn _start() -> ! {
     check("getlogin wrote", lbuf[0] == b'r' && lbuf[4] == 0);
     // A too-small buffer is an error, not a truncated name.
     check("getlogin small EINVAL", unsafe { getlogin(lbuf.as_mut_ptr() as i64, 2) }.is_err());
+
+    // ---------- rlimit round-trip ----------
+    // struct rlimit is {u64 cur; u64 max} = 16 bytes. Setting then reading
+    // back is the only way to tell a real setrlimit from one that accepts
+    // the call and stores nothing.
+    let mut rl = [0u64; 2];
+    check("getrlimit ok", unsafe { getrlimit(8, rl.as_mut_ptr() as i64) }.is_ok()); // RLIMIT_NOFILE
+    let max_before = rl[1];
+    let mut set = [0u64; 2];
+    set[0] = 64;
+    set[1] = 4096; // a finite hard limit, so raising it is refused below
+    check("setrlimit ok", unsafe { setrlimit(8, set.as_ptr() as i64) }.is_ok());
+    // Raising the HARD limit is EPERM for an unprivileged caller: the
+    // hard limit is exactly the ceiling on what may later be set.
+    let mut raise = [0u64; 2];
+    raise[0] = 64;
+    raise[1] = u64::MAX;
+    check("setrlimit raise max", unsafe { setrlimit(8, raise.as_ptr() as i64) }.is_err());
+    let mut rl2 = [0u64; 2];
+    check("getrlimit again", unsafe { getrlimit(8, rl2.as_mut_ptr() as i64) }.is_ok());
+    check("setrlimit observable", rl2[0] == 64);
+    // A resource outside RLIM_NLIMITS is EINVAL, not silently accepted.
+    check("getrlimit badres", unsafe { getrlimit(99, rl2.as_mut_ptr() as i64) }.is_err());
+    check("setrlimit badres", unsafe { setrlimit(99, set.as_ptr() as i64) }.is_err());
+    // A soft limit above the hard one is EINVAL.
+    let mut bad = [0u64; 2];
+    bad[0] = 5000; // above the 4096 hard limit just installed
+    bad[1] = 4096;
+    check("setrlimit cur>max", unsafe { setrlimit(8, bad.as_ptr() as i64) }.is_err());
+    // Raise the hard limit back so later runs are unaffected.
+    let mut restore = [0u64; 2];
+    restore[0] = max_before;
+    restore[1] = max_before;
+    let _ = unsafe { setrlimit(8, restore.as_ptr() as i64) };
+
+    // ---------- hostname round-trip ----------
+    let mut hn = [0u8; 64];
+    check("gethostname ok", unsafe { gethostname(hn.as_mut_ptr() as i64, 64) }.is_ok());
+    check("sethostname ok", unsafe { sethostname(b"tihkali-test\0".as_ptr() as i64, 13) }.is_ok());
+    let mut hn2 = [0u8; 64];
+    check("gethostname again", unsafe { gethostname(hn2.as_mut_ptr() as i64, 64) }.is_ok());
+    check("sethostname observable", hn2[0] == b't' && hn2[1] == b'i');
+    // An over-long name is ENAMETOOLONG, not silently truncated: a
+    // truncated hostname is a DIFFERENT name, not the one asked for.
+    let long = [b'x'; 80];
+    check("sethostname toolong", unsafe { sethostname(long.as_ptr() as i64, 80) }.is_err());
+    // An empty name is EINVAL.
+    check("sethostname empty", unsafe { sethostname(b"\0".as_ptr() as i64, 1) }.is_err());
+
+    // ---------- utimes / futimes ----------
+    // Setting mtime must be READABLE back through stat -- otherwise
+    // utimes is a silent success.
+    let tp = b"/etc/p2.tmp\0";
+    if unsafe { open(tp.as_ptr() as i64, 0x2 | 0x200 | 0x400, 0o644) }.is_ok() {
+        check("utimes ok", unsafe { utimes(tp as *const u8 as i64, 0) }.is_ok());
+        let mut times = [0i64; 2];
+        times[0] = 1234567; // atime
+        times[1] = 1234567; // mtime
+        check("utimes explicit", unsafe { utimes(tp as *const u8 as i64, times.as_ptr() as i64) }.is_ok());
+        let mut sb = [0u8; 152];
+        if unsafe { crate_stat(tp.as_ptr() as i64, sb.as_mut_ptr() as i64) }.is_ok() {
+            // st_mtim is at offset 64 (st_atim@48), verified with the cross compiler.
+            let m = i64::from_le_bytes([sb[64], sb[65], sb[66], sb[67], sb[68], sb[69], sb[70], sb[71]]);
+            check("utimes observable", m == 1234567);
+        } else {
+            check("utimes observable", false);
+        }
+        check("utimes ENOENT", unsafe { utimes(b"/etc/nope-b3\0".as_ptr() as i64, 0) }.is_err());
+        // futimes does the same through a descriptor.
+        let mut t3 = [0i64; 2];
+        t3[0] = 7654321;
+        t3[1] = 7654321;
+        let ffd = unsafe { open(tp.as_ptr() as i64, 0x2 | 0x200 | 0x400, 0o644) };
+        check("futimes ok", unsafe { futimes(ffd.unwrap_or(-1), t3.as_ptr() as i64) }.is_ok());
+        if let Ok(f) = ffd { let _ = unsafe { close(f) }; }
+        let mut sb2 = [0u8; 152];
+        if unsafe { crate_stat(tp.as_ptr() as i64, sb2.as_mut_ptr() as i64) }.is_ok() {
+            let m2 = i64::from_le_bytes([sb2[64], sb2[65], sb2[66], sb2[67], sb2[68], sb2[69], sb2[70], sb2[71]]);
+            check("futimes observable", m2 == 7654321);
+        } else {
+            check("futimes observable", false);
+        }
+        check("futimes badfd", unsafe { futimes(999, 0) }.is_err());
+    } else {
+        check("utimes ok", false);
+        check("utimes observable", false);
+    }
+
+    // ---------- dup3 ----------
+    // dup3's distinguishing rule: oldfd == newfd is EINVAL, because it
+    // would close the descriptor being duplicated.
+    let (d3r, _d3w) = unsafe { pipe(pfds.as_mut_ptr() as i64) }.map(|_| (pfds[0] as i64, pfds[1] as i64)).unwrap_or((90, 91));
+    check("dup3 same fd EINVAL", unsafe { dup3(d3r, d3r, 0) }.is_err());
+    check("dup3 target ok", unsafe { dup3(d3r, 60, 0) }.is_ok());
+    let _ = unsafe { close(60) };
+
+    // ---------- sched_yield ----------
+    // Yielding must return; a loop that never comes back would hang here.
+    check("sched_yield returned", unsafe { sched_yield() }.is_ok());
 
     // ---------- refusals, each with its own errno ----------
     // sigaltstack takes sigaltstack13 and statfs takes statfs12: both are
