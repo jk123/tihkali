@@ -813,14 +813,14 @@ pub extern "C" fn _start() -> ! {
         // Returning 0 would create no second name at all, and the caller
         // would believe it had one.
         match linkat(AT_FDCWD, p!("at1"), AT_FDCWD, p!("atlink2")) {
-            Err(e) => check("linkat EOPNOTSUPP", e == 95),
+            Err(e) => check("linkat EOPNOTSUPP", e == 45),
             Ok(_) => check("linkat EOPNOTSUPP", false),
         }
         check("linkat made no file", !exists(p!("/etc/atlink2")));
 
         // --- mkfifo: refused, and it must not create a regular file ----------
         match mkfifo(p!("/etc/atfifo"), 0o644) {
-            Err(e) => check("mkfifo EOPNOTSUPP", e == 95),
+            Err(e) => check("mkfifo EOPNOTSUPP", e == 45),
             Ok(_) => check("mkfifo EOPNOTSUPP", false),
         }
         check("mkfifo made no node", !exists(p!("/etc/atfifo")));

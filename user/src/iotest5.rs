@@ -855,19 +855,19 @@ pub extern "C" fn _start() -> ! {
         // Each of these would have to DO something. Returning 0 would be a
         // silent success, which is worse than the honest refusal.
         match mlock() {
-            Err(e) => check("mlock EOPNOTSUPP", e == 95),
+            Err(e) => check("mlock EOPNOTSUPP", e == 45),
             Ok(_) => check("mlock EOPNOTSUPP", false),
         }
         match munlock() {
-            Err(e) => check("munlock EOPNOTSUPP", e == 95),
+            Err(e) => check("munlock EOPNOTSUPP", e == 45),
             Ok(_) => check("munlock EOPNOTSUPP", false),
         }
         match mlockall() {
-            Err(e) => check("mlockall EOPNOTSUPP", e == 95),
+            Err(e) => check("mlockall EOPNOTSUPP", e == 45),
             Ok(_) => check("mlockall EOPNOTSUPP", false),
         }
         match munlockall() {
-            Err(e) => check("munlockall EOPNOTSUPP", e == 95),
+            Err(e) => check("munlockall EOPNOTSUPP", e == 45),
             Ok(_) => check("munlockall EOPNOTSUPP", false),
         }
         match reboot() {
@@ -891,19 +891,19 @@ pub extern "C" fn _start() -> ! {
             Ok(_) => check("revoke EINVAL", false),
         }
         match mincore() {
-            Err(e) => check("mincore EOPNOTSUPP", e == 95),
+            Err(e) => check("mincore EOPNOTSUPP", e == 45),
             Ok(_) => check("mincore EOPNOTSUPP", false),
         }
         match vfork() {
-            Err(e) => check("vfork EOPNOTSUPP", e == 95),
+            Err(e) => check("vfork EOPNOTSUPP", e == 45),
             Ok(_) => check("vfork EOPNOTSUPP", false),
         }
         match pipe2() {
-            Err(e) => check("pipe2 EOPNOTSUPP", e == 95),
+            Err(e) => check("pipe2 EOPNOTSUPP", e == 45),
             Ok(_) => check("pipe2 EOPNOTSUPP", false),
         }
         match fexecve(0) {
-            Err(e) => check("fexecve EOPNOTSUPP", e == 95),
+            Err(e) => check("fexecve EOPNOTSUPP", e == 45),
             Ok(_) => check("fexecve EOPNOTSUPP", false),
         }
 

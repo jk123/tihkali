@@ -1392,6 +1392,90 @@ gate_has   "s35: exit 0"                       "$S35" 'sh: xatest exited 0'
 gate_count "s35: no panic"                     "$S35" 'panic' 0
 gate_bad   "s35" "$S35"
 
+echo "== session 36: NetBSD ACL, LWP, ksem, SysV IPC and mqueue refusals"
+S36="$T/s36.log"
+# Fifty-six calls with one honest answer: EOPNOTSUPP, which says "this
+# kernel has no such facility" where ENOSYS would say "it never heard of
+# the call". Neither is a silent success -- an ACL get returning 0 bytes
+# is indistinguishable from an empty ACL a caller reads as 'no access'.
+#
+# EOPNOTSUPP is 45 on NetBSD. This kernel returned 95 (ENOLINK) on every
+# refusal for several shipped batches, and every shipped probe passed
+# because each imported the kernel's OWN constant -- the closed-loop
+# oracle. These check the literal 45 from sys/sys/errno.h.
+#
+# _lwp_self (311) must ANSWER, not refuse: the calling thread is real,
+# it is just the only one. A "everything refuses" probe would pass on a
+# kernel that refuses the one thing it can answer.
+( sleep 5
+  printf 'rftest\n'; sleep 5
+  printf 'exit\n'; sleep 3
+) | timeout 26 ./tools/run.sh >"$S36" 2>&1
+gate_has   "s36: probe opened a file          " "$S36" '^rf: ok[[:space:]]+probe\ opened\ a\ file[[:space:]]+ok'
+gate_has   "s36: control getpid 20            " "$S36" '^rf: ok[[:space:]]+control\ getpid\ 20[[:space:]]+ok'
+gate_has   "s36: acl_set_link 488             " "$S36" '^rf: ok[[:space:]]+acl_set_link\ 488[[:space:]]+ok'
+gate_has   "s36: acl_delete_link 489          " "$S36" '^rf: ok[[:space:]]+acl_delete_link\ 489[[:space:]]+ok'
+gate_has   "s36: acl_aclcheck_link 490        " "$S36" '^rf: ok[[:space:]]+acl_aclcheck_link\ 490[[:space:]]+ok'
+gate_has   "s36: acl_get_file 491             " "$S36" '^rf: ok[[:space:]]+acl_get_file\ 491[[:space:]]+ok'
+gate_has   "s36: acl_set_file 492             " "$S36" '^rf: ok[[:space:]]+acl_set_file\ 492[[:space:]]+ok'
+gate_has   "s36: acl_get_fd 493               " "$S36" '^rf: ok[[:space:]]+acl_get_fd\ 493[[:space:]]+ok'
+gate_has   "s36: acl_set_fd 494               " "$S36" '^rf: ok[[:space:]]+acl_set_fd\ 494[[:space:]]+ok'
+gate_has   "s36: acl_delete_file 495          " "$S36" '^rf: ok[[:space:]]+acl_delete_file\ 495[[:space:]]+ok'
+gate_has   "s36: acl_delete_fd 496            " "$S36" '^rf: ok[[:space:]]+acl_delete_fd\ 496[[:space:]]+ok'
+gate_has   "s36: acl_aclcheck_file 497        " "$S36" '^rf: ok[[:space:]]+acl_aclcheck_file\ 497[[:space:]]+ok'
+gate_has   "s36: acl_aclcheck_fd 498          " "$S36" '^rf: ok[[:space:]]+acl_aclcheck_fd\ 498[[:space:]]+ok'
+gate_has   "s36: acl_get_fd bad fd 493        " "$S36" '^rf: ok[[:space:]]+acl_get_fd\ bad\ fd\ 493[[:space:]]+ok'
+gate_has   "s36: lwp_create 309               " "$S36" '^rf: ok[[:space:]]+lwp_create\ 309[[:space:]]+ok'
+gate_has   "s36: lwp_exit 310                 " "$S36" '^rf: ok[[:space:]]+lwp_exit\ 310[[:space:]]+ok'
+gate_has   "s36: lwp_wait 312                 " "$S36" '^rf: ok[[:space:]]+lwp_wait\ 312[[:space:]]+ok'
+gate_has   "s36: lwp_suspend 313              " "$S36" '^rf: ok[[:space:]]+lwp_suspend\ 313[[:space:]]+ok'
+gate_has   "s36: lwp_continue 314             " "$S36" '^rf: ok[[:space:]]+lwp_continue\ 314[[:space:]]+ok'
+gate_has   "s36: lwp_wakeup 315               " "$S36" '^rf: ok[[:space:]]+lwp_wakeup\ 315[[:space:]]+ok'
+gate_has   "s36: lwp_park 320                 " "$S36" '^rf: ok[[:space:]]+lwp_park\ 320[[:space:]]+ok'
+gate_has   "s36: lwp_unpark 321               " "$S36" '^rf: ok[[:space:]]+lwp_unpark\ 321[[:space:]]+ok'
+gate_has   "s36: lwp_unpark_all 322           " "$S36" '^rf: ok[[:space:]]+lwp_unpark_all\ 322[[:space:]]+ok'
+gate_has   "s36: lwp_detach 319               " "$S36" '^rf: ok[[:space:]]+lwp_detach\ 319[[:space:]]+ok'
+gate_has   "s36: lwp_kill 318                 " "$S36" '^rf: ok[[:space:]]+lwp_kill\ 318[[:space:]]+ok'
+gate_has   "s36: lwp_ctl 325                  " "$S36" '^rf: ok[[:space:]]+lwp_ctl\ 325[[:space:]]+ok'
+gate_has   "s36: lwp_setname 323              " "$S36" '^rf: ok[[:space:]]+lwp_setname\ 323[[:space:]]+ok'
+gate_has   "s36: lwp_getname 324              " "$S36" '^rf: ok[[:space:]]+lwp_getname\ 324[[:space:]]+ok'
+gate_has   "s36: lwp_getprivate 316           " "$S36" '^rf: ok[[:space:]]+lwp_getprivate\ 316[[:space:]]+ok'
+gate_has   "s36: lwp_setprivate 317           " "$S36" '^rf: ok[[:space:]]+lwp_setprivate\ 317[[:space:]]+ok'
+gate_has   "s36: lwp_self 311 answers         " "$S36" '^rf: ok[[:space:]]+lwp_self\ 311\ answers[[:space:]]+ok'
+gate_has   "s36: ksem_init 247                " "$S36" '^rf: ok[[:space:]]+ksem_init\ 247[[:space:]]+ok'
+gate_has   "s36: ksem_open 248                " "$S36" '^rf: ok[[:space:]]+ksem_open\ 248[[:space:]]+ok'
+gate_has   "s36: ksem_unlink 249              " "$S36" '^rf: ok[[:space:]]+ksem_unlink\ 249[[:space:]]+ok'
+gate_has   "s36: ksem_close 250               " "$S36" '^rf: ok[[:space:]]+ksem_close\ 250[[:space:]]+ok'
+gate_has   "s36: ksem_post 251                " "$S36" '^rf: ok[[:space:]]+ksem_post\ 251[[:space:]]+ok'
+gate_has   "s36: ksem_wait 252                " "$S36" '^rf: ok[[:space:]]+ksem_wait\ 252[[:space:]]+ok'
+gate_has   "s36: ksem_trywait 253             " "$S36" '^rf: ok[[:space:]]+ksem_trywait\ 253[[:space:]]+ok'
+gate_has   "s36: ksem_getvalue 254            " "$S36" '^rf: ok[[:space:]]+ksem_getvalue\ 254[[:space:]]+ok'
+gate_has   "s36: ksem_destroy 255             " "$S36" '^rf: ok[[:space:]]+ksem_destroy\ 255[[:space:]]+ok'
+gate_has   "s36: ksem_timedwait 256           " "$S36" '^rf: ok[[:space:]]+ksem_timedwait\ 256[[:space:]]+ok'
+gate_has   "s36: semget 221                   " "$S36" '^rf: ok[[:space:]]+semget\ 221[[:space:]]+ok'
+gate_has   "s36: semop 222                    " "$S36" '^rf: ok[[:space:]]+semop\ 222[[:space:]]+ok'
+gate_has   "s36: semconfig 223                " "$S36" '^rf: ok[[:space:]]+semconfig\ 223[[:space:]]+ok'
+gate_has   "s36: msgget 225                   " "$S36" '^rf: ok[[:space:]]+msgget\ 225[[:space:]]+ok'
+gate_has   "s36: msgsnd 226                   " "$S36" '^rf: ok[[:space:]]+msgsnd\ 226[[:space:]]+ok'
+gate_has   "s36: msgrcv 227                   " "$S36" '^rf: ok[[:space:]]+msgrcv\ 227[[:space:]]+ok'
+gate_has   "s36: shmat 228                    " "$S36" '^rf: ok[[:space:]]+shmat\ 228[[:space:]]+ok'
+gate_has   "s36: shmctl 229                   " "$S36" '^rf: ok[[:space:]]+shmctl\ 229[[:space:]]+ok'
+gate_has   "s36: shmdt 230                    " "$S36" '^rf: ok[[:space:]]+shmdt\ 230[[:space:]]+ok'
+gate_has   "s36: shmget 231                   " "$S36" '^rf: ok[[:space:]]+shmget\ 231[[:space:]]+ok'
+gate_has   "s36: mq_open 257                  " "$S36" '^rf: ok[[:space:]]+mq_open\ 257[[:space:]]+ok'
+gate_has   "s36: mq_close 258                 " "$S36" '^rf: ok[[:space:]]+mq_close\ 258[[:space:]]+ok'
+gate_has   "s36: mq_unlink 259                " "$S36" '^rf: ok[[:space:]]+mq_unlink\ 259[[:space:]]+ok'
+gate_has   "s36: mq_getattr 260               " "$S36" '^rf: ok[[:space:]]+mq_getattr\ 260[[:space:]]+ok'
+gate_has   "s36: mq_setattr 261               " "$S36" '^rf: ok[[:space:]]+mq_setattr\ 261[[:space:]]+ok'
+gate_has   "s36: mq_notify 262                " "$S36" '^rf: ok[[:space:]]+mq_notify\ 262[[:space:]]+ok'
+gate_has   "s36: mq_send 263                  " "$S36" '^rf: ok[[:space:]]+mq_send\ 263[[:space:]]+ok'
+gate_has   "s36: mq_receive 264               " "$S36" '^rf: ok[[:space:]]+mq_receive\ 264[[:space:]]+ok'
+gate_has   "s36: refusal errno is 45          " "$S36" '^rf: ok[[:space:]]+refusal\ errno\ is\ 45[[:space:]]+ok'
+gate_has   "s36: all ok"                       "$S36" 'rf: all ok'
+gate_has   "s36: exit 0"                       "$S36" 'sh: rftest exited 0'
+gate_count "s36: no panic"                     "$S36" 'panic' 0
+gate_bad   "s36" "$S36"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"

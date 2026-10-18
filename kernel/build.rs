@@ -32,6 +32,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../user/src/iotest5.rs");
     println!("cargo:rerun-if-changed=../user/src/at6test.rs");
     println!("cargo:rerun-if-changed=../user/src/xatest.rs");
+    println!("cargo:rerun-if-changed=../user/src/rftest.rs");
     println!("cargo:rerun-if-changed=../user/src/ioctltest.rs");
     println!("cargo:rerun-if-changed=../user/src/pathtest.rs");
     println!("cargo:rerun-if-changed=../user/src/sockidtest.rs");
@@ -86,11 +87,12 @@ fn main() {
     let iotest5 = bindir.join("tihkali-iotest5");
     let at6test = bindir.join("tihkali-at6test");
     let xatest = bindir.join("tihkali-xatest");
+    let rftest = bindir.join("tihkali-rftest");
     let ioctltest = bindir.join("tihkali-ioctltest");
     let pathtest = bindir.join("tihkali-pathtest");
     let sockidtest = bindir.join("tihkali-sockidtest");
     let gui = bindir.join("tihkali-gui");
-    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt, &dnsprobe, &memtest, &statprobe, &iovtest, &fdtest, &kqtest, &idtest, &credtest, &synctest, &attest, &iotest5, &at6test, &xatest, &ioctltest, &pathtest, &sockidtest, &gui] {
+    for p in [&sh, &hello, &greet, &nettest, &netserver, &netsend, &sockopt, &dnsprobe, &memtest, &statprobe, &iovtest, &fdtest, &kqtest, &idtest, &credtest, &synctest, &attest, &iotest5, &at6test, &xatest, &rftest, &ioctltest, &pathtest, &sockidtest, &gui] {
         assert!(p.exists(), "user binary not produced at {}", p.display());
     }
     // Still used by main.rs until M4 switches pid0/exec to the VFS.
@@ -253,6 +255,7 @@ fn main() {
     let iotest5_bytes = std::fs::read(&iotest5).expect("read tihkali-iotest5");
     let at6test_bytes = std::fs::read(&at6test).expect("read tihkali-at6test");
     let xatest_bytes = std::fs::read(&xatest).expect("read tihkali-xatest");
+    let rftest_bytes = std::fs::read(&rftest).expect("read tihkali-rftest");
     let ioctltest_bytes = std::fs::read(&ioctltest).expect("read tihkali-ioctltest");
     let pathtest_bytes = std::fs::read(&pathtest).expect("read tihkali-pathtest");
     let sockidtest_bytes = std::fs::read(&sockidtest).expect("read tihkali-sockidtest");
@@ -292,6 +295,7 @@ fn main() {
         CpioEntry::file("bin/iotest5", &iotest5_bytes),
         CpioEntry::file("bin/at6test", &at6test_bytes),
         CpioEntry::file("bin/xatest", &xatest_bytes),
+        CpioEntry::file("bin/rftest", &rftest_bytes),
         CpioEntry::file("bin/ioctltest", &ioctltest_bytes),
         CpioEntry::file("bin/pathtest", &pathtest_bytes),
         CpioEntry::file("bin/sockidtest", &sockidtest_bytes),

@@ -731,7 +731,7 @@ fn netbsd_linkat(fd1: i64, p1: u64, fd2: i64, p2: u64) -> (i64, u8) {
             return (-1, crate::file::EBADF);
         }
     }
-    (-1, 95) // EOPNOTSUPP
+    (-1, 45) // EOPNOTSUPP
 }
 
 /// faccessat(dirfd, path, amode, flag): check permission bits against the
@@ -1872,6 +1872,128 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 }
             }
         },
+        // --- POSIX.1e access control lists (487-498) ----------------------
+        // NetBSD's twelve __ACL_* calls all share one shape --
+        // (path | fd, acl_type_t type, struct acl *aclp) in x0..x2 -- and
+        // split cleanly into three families over the same node:
+        //
+        //   _link  (487-490) path, does NOT follow a trailing symlink
+        //   _file  (491-492, 495, 497) path, follows
+        //   _fd    (493-494, 496, 498) an open descriptor
+        //
+        // This kernel stores a mode and nothing else, so there is no ACL to
+        // get, check or delete. EOPNOTSUPP is the honest answer for all
+        // twelve: it says "this kernel has no ACLs", where ENOSYS would say
+        // "this kernel has never heard of the call". Neither is a silent
+        // success -- a get that returned 0 bytes would be indistinguishable
+        // from an empty ACL the caller then treats as "no access".
+        nbsys::__ACL_GET_LINK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_SET_LINK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_DELETE_LINK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_ACLCHECK_LINK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_GET_FILE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_SET_FILE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_GET_FD => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_SET_FD => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_DELETE_FILE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_DELETE_FD => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_ACLCHECK_FILE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__ACL_ACLCHECK_FD => (-1, 45 /* EOPNOTSUPP */),
+        // --- user-level threads (309-325) ---------------------------------
+        // One process per thread: there is no second thread to create, park,
+        // unpark, name or wait for. _LWP_SELF is the exception -- the
+        // calling thread is real, it is just the only one -- so it returns
+        // the current thread id rather than refusing.
+        nbsys::_LWP_CREATE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_EXIT => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_WAIT => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_SUSPEND => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_CONTINUE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_WAKEUP => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_PARK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_UNPARK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_UNPARK_ALL => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_DETACH => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_KILL => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_CTL => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_SETNAME => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_GETNAME => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_SELF => (crate::proc::current_pid() as i64, 0),
+        // _LWP_GETPRIVATE / _LWP_SETPRIVATE read and write the per-thread
+        // private data word. There is exactly one thread, so the word is
+        // real -- it is the only thread's.
+        nbsys::_LWP_GETPRIVATE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_LWP_SETPRIVATE => (-1, 45 /* EOPNOTSUPP */),
+        // --- kernel semaphores (247-256) ----------------------------------
+        // kqueue already covers the one thing this kernel needs semaphores
+        // for -- waking a process when an fd becomes readable -- so there is
+        // no semaphore object to back these.
+        nbsys::_KSEM_INIT => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_OPEN => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_UNLINK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_CLOSE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_POST => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_WAIT => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_TRYWAIT => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_GETVALUE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_DESTROY => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::_KSEM_TIMEDWAIT => (-1, 45 /* EOPNOTSUPP */),
+
+        // --- System V IPC (221-231) and POSIX message queues (257-264) --
+        // Seventeen calls over two facilities this kernel does not have.
+        //
+        // System V IPC is a shared-memory object identified by a KEY_T
+        // that every process on the machine looks up -- it needs a global
+        // namespace, and this kernel has one process per pid with no
+        // cross-process object store. POSIX message queues are the same
+        // idea with a filesystem name instead of a key; kqueue already
+        // covers the one thing a queue is wanted for here (waiting on a
+        // descriptor), so a queue would be a second way to do the same
+        // thing with more failure modes.
+        //
+        // EOPNOTSUPP is the honest answer: "this kernel does not have
+        // that facility". ENOSYS would say "this kernel has never heard
+        // of the call", which is a different and stronger claim.
+        nbsys::SEMGET => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::SEMOP => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::SEMCONFIG => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MSGGET => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MSGSND => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MSGRCV => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::SHMAT => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::SHMCTL => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::SHMDT => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::SHMGET => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_OPEN => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_CLOSE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_UNLINK => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_GETATTR => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_SETATTR => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_NOTIFY => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_SEND => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::MQ_RECEIVE => (-1, 45 /* EOPNOTSUPP */),
+
+        // --- everything below is a refusal -------------------------------
+        // POSIX AIO has no counterpart here, and even upstream NetBSD
+        // registers EVFILT_AIO with NULL filter operations, so kqueue
+        // cannot wait on one either.
+        nbsys::AIO_CANCEL => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::AIO_ERROR => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::AIO_FSYNC => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::AIO_READ => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::AIO_RETURN => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::AIO_SUSPEND => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::AIO_WRITE => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::LIO_LISTIO => (-1, 45 /* EOPNOTSUPP */),
+        // The Log-structured File System calls operate on a per-filesystem
+        // segment allocator this kernel does not have.
+        nbsys::LFS_BMAPV => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::LFS_MARKV => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::LFS_SEGCLEAN => (-1, 45 /* EOPNOTSUPP */),
+        // Disk quotas need a per-user accounting store; there is none.
+        nbsys::QUOTACTL => (-1, 45 /* EOPNOTSUPP */),
+        nbsys::__QUOTACTL => (-1, 45 /* EOPNOTSUPP */),
+
         // --- the *at() family ---
         //
         // NetBSD's openat/mkdirat/unlinkat/... take the same
@@ -1938,12 +2060,12 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         // link(9): a hard link. This filesystem has no link count, so the
         // honest answer is EOPNOTSUPP -- a "success" would create no
         // second name and the caller's file would appear to have one.
-        nbsys::LINK => (-1, 95), // EOPNOTSUPP
+        nbsys::LINK => (-1, 45), // EOPNOTSUPP
         // mkfifo(132)/mknod(450) and their *at forms: this fs has
         // directories, files and symlinks only. Refused rather than
         // creating a regular file that is not a fifo.
-        nbsys::MKFIFO | nbsys::MKNOD__2 => (-1, 95), // EOPNOTSUPP
-        nbsys::MKFIFOAT | nbsys::MKNODAT => (-1, 95),
+        nbsys::MKFIFO | nbsys::MKNOD__2 => (-1, 45), // EOPNOTSUPP
+        nbsys::MKFIFOAT | nbsys::MKNODAT => (-1, 45),
         // chroot(61)/fchroot(297): one always-mounted root and no way to
         // change it. EPERM says "denied", which is what a caller gets on
         // a real system without CAP_SYS_CHROOT.
@@ -2114,7 +2236,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         // mlock/munlock/mlockall/munlockall: the pages are demand-paged and
         // a "locked" page the kernel can evict is not locked at all. Saying
         // 0 would tell a caller memory that cannot be swapped when it can.
-        nbsys::MLOCK | nbsys::MUNLOCK | nbsys::MLOCKALL | nbsys::MUNLOCKALL => (-1, 95), // EOPNOTSUPP
+        nbsys::MLOCK | nbsys::MUNLOCK | nbsys::MLOCKALL | nbsys::MUNLOCKALL => (-1, 45), // EOPNOTSUPP
         // --- refused: subsystems this kernel does not have ---
         //
         // Each of these would have to do something. A success that does
@@ -2124,14 +2246,14 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         nbsys::OBREAK => (-1, 22),  // EINVAL: no ptrace to break into
         nbsys::ACCT => (-1, 22),    // EINVAL: no process accounting
         nbsys::REVOKE => (-1, 22),  // EINVAL: no device files to revoke
-        nbsys::MINCORE => (-1, 95), // EOPNOTSUPP: no residency to report
-        nbsys::VFORK => (-1, 95),   // EOPNOTSUPP: fork already covers it
-        nbsys::FEXECVE => (-1, 95), // EOPNOTSUPP: execve takes a path
-        nbsys::SENDMMSG | nbsys::RECVMMSG => (-1, 95), // EOPNOTSUPP: sendmsg/recvmsg cover it
+        nbsys::MINCORE => (-1, 45), // EOPNOTSUPP: no residency to report
+        nbsys::VFORK => (-1, 45),   // EOPNOTSUPP: fork already covers it
+        nbsys::FEXECVE => (-1, 45), // EOPNOTSUPP: execve takes a path
+        nbsys::SENDMMSG | nbsys::RECVMMSG => (-1, 45), // EOPNOTSUPP: sendmsg/recvmsg cover it
         // pipe2(453): this kernel has one pipe implementation with no flags.
         // O_NONBLOCK would be ignored, so accepting the call and discarding
         // the flag is exactly the silent success to avoid.
-        nbsys::PIPE2 => (-1, 95), // EOPNOTSUPP: pipe(2) has no flags
+        nbsys::PIPE2 => (-1, 45), // EOPNOTSUPP: pipe(2) has no flags
         // --- resource limits ---
         //
         // struct rlimit is { rlim_cur; rlim_max } with rlim_t = 64-bit on
@@ -2180,7 +2302,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         // flock(131): no locking is implemented, so LOCK_EX/LOCK_UN must
         // not pretend to succeed -- that would let two processes believe
         // they hold a lock. EOPNOTSUPP is the honest answer.
-        nbsys::FLOCK => (-1, 95), // EOPNOTSUPP
+        nbsys::FLOCK => (-1, 45), // EOPNOTSUPP
         // getrusage(445): struct rusage is two timevals then FOURTEEN
         // longs -- 32 + 112 = 144 bytes, read from sys/resource.h. 117 is
         // the compat __getrusage50 entry, which upstream renames this to,

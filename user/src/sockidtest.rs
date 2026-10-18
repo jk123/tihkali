@@ -255,17 +255,17 @@ pub extern "C" fn _start() -> ! {
 
         // --- socketpair ---------------------------------------------------------
         // Not implemented, and deliberately so: see net::sock_pair. Both
-        // AF_INET and AF_UNIX must be refused with EOPNOTSUPP (95) rather
+        // AF_INET and AF_UNIX must be refused with EOPNOTSUPP (45) rather
         // than half-succeeding -- a caller that checks the errno gets a
         // clear reason, where a partial pair would fail later and further
         // from the cause.
         let mut fds = [0i32; 2];
         match socketpair(2, 1, fds.as_mut_ptr()) {
-            Err(e) => check("socketpair EOPNOTSUPP", e == 95),
+            Err(e) => check("socketpair EOPNOTSUPP", e == 45),
             Ok(_) => check("socketpair EOPNOTSUPP", false),
         }
         match socketpair(1, 1, fds.as_mut_ptr()) {
-            Err(e) => check("socketpair AF_UNIX too", e == 95),
+            Err(e) => check("socketpair AF_UNIX too", e == 45),
             Ok(_) => check("socketpair AF_UNIX too", false),
         }
 
