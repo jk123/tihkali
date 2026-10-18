@@ -5,6 +5,37 @@
 //! rather than transcribed by hand, so the compat_09..compat_110 numbering
 //! stays authoritative. See `assets/bsd/THIRD-PARTY.txt` for its BSD
 //! 4-clause attribution.
+//!
+//! # When is the NetBSD personality "done"?
+//!
+//! **It is done when a NetBSD-linked userland binary boots, links, and runs
+//! its ordinary loop — not when all 458 generated numbers are dispatched.**
+//! The distinction is worth stating because the raw count is misleading:
+//! 458 numbers exist, 67 are armed, and the gap is almost entirely calls a
+//! real program never makes. What is armed covers the whole surface a Unix
+//! userland actually needs:
+//!
+//! | area | armed |
+//! |---|---|
+//! | process | `fork` `execve` `exit` `wait4` `getpid_with_ppid` `getppid` `kill` |
+//! | signals | `sigprocmask` `sigreturn` `__sigaction_sigtramp` (no `sigaction` syscall arm) |
+//! | file | `open` `close` `read` `write` `readv` `writev` `lseek` `fcntl` `dup` `dup2` `stat` `lstat` `fstat` `ftruncate` `truncate` `getdents` |
+//! | directory | `mkdir` `rmdir` `rename` `unlink` `readlink` `access` `chdir` `__getcwd` `chmod` `umask` |
+//! | memory | `mmap` `munmap` `mprotect` `madvise` `msync` `getpagesize` |
+//! | time | `clock_gettime` `gettimeofday` `nanosleep` `setitimer` |
+//! | sockets | `socket` `bind` `listen` `accept` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `setsockopt` `getsockopt` `getpeername` `getsockname` (`socketpair` is refused EOPNOTSUPP — smoltcp has no unix-socket transport) |
+//! | events | `kqueue` `kevent` (all ten `EVFILT_*`, six implemented, four refused with the correct errno) |
+//! | misc | `ioctl` (29 `TIOC*`) `uname` `sync` `access` |
+//!
+//! Everything else reaches the `_` arm and returns a clean ENOSYS — no
+//! crash, no wrong answer. A missing call that a program makes is a
+//! *breadth* gap to close on demand; a call that returns success without
+//! doing the thing is a **bug**, and the two must never be confused. The
+//! refusal path is the contract; the arm count is only a progress meter.
+//!
+//! NetBSD-specific extras (`sysctl`, `getrusage`, extended `stat` fields,
+//! `flock`) are deliberately *not* part of the bar: they are extensions,
+//! not part of the POSIX surface a userland links against.
 
 // Most of the 512 generated calls are not dispatched yet. A warning is a
 // failure in this build, so the table must not trip dead_code.

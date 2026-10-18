@@ -906,8 +906,12 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         #[cfg(feature = "net")]
-        394 | 97 => {
-            // SYS___socket30 / SYS_compat_30_socket (domain, type, proto)
+        nbsys::SOCKET__2 | nbsys::SOCKET => {
+            // SOCKET__2 = 394 is the live call; SOCKET = 97 is the
+            // compat_30 entry that shares the encoding. Named rather than
+            // written as a bare `394 | 97`, which is how a wrong number
+            // hides — the generated constants and the generated table
+            // cannot disagree.
             match crate::net::socket_kind(
                 (frame.x[1] & 0xf) as u32,
                 frame.x[2] as u32,

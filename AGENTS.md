@@ -80,6 +80,29 @@ cargo build --release --no-default-features --features rpi3   # Pi kernel only
 - Extra QEMU args pass through run.sh after `-kernel`; `--rpi`/`--no-drive`
   are consumed by the script, not forwarded.
 
+## When the NetBSD personality is done
+
+**Done = a NetBSD-linked userland binary boots, links, and runs its
+ordinary loop. NOT done = all 458 generated syscall numbers dispatched.**
+
+`sys/kern/syscalls.master` yields 458 constants; `svc_dispatch` arms 67.
+The gap is deliberate — it is almost entirely calls no real program
+makes (process accounting, `sysctl`, `flock`, extended `stat` fields).
+The armed set covers the whole POSIX surface: process, signals, file,
+directory, memory, time, sockets, kqueue, ioctl/uname. The full
+per-area table is in the module doc of `kernel/src/netbsd_abi.rs`, which
+is the file to update if this boundary moves.
+
+**The rule that matters while working on it:** an undispatched call
+returning a clean ENOSYS is a *breadth* gap and is fine. A dispatched
+call returning success without doing the thing is a **bug**, and the two
+must never be confused. Every refusal needs its own gate, because no
+return-code gate can detect a silent success. Add an arm with a named
+`nbsys::` constant, never a bare number — the one bare literal that
+survived (`394 | 97` for `socket`) was correct by luck, and
+`socketpair` is the deliberate exception: refused EOPNOTSUPP because
+smoltcp has no unix-socket transport.
+
 ## Build pipeline (kernel/build.rs does more than link)
 
 - Nested `cargo build -p tihkali-user` with a **private `--target-dir` under
