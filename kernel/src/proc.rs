@@ -93,6 +93,20 @@ pub struct Process {
     /// Process group (job control); children inherit it. ^C targets the
     /// tty's foreground group.
     pub pgrp: usize,
+    /// Real/effective uid and gid, plus the saved set-uid values. Single
+    /// user, but recorded per process so chown/seteuid have somewhere real
+    /// to write and getuid cannot be answered by a constant.
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    /// Supplementary group list (getgroups/setgroups).
+    pub groups: Vec<u32>,
+    /// umask applied to newly created files/dirs. Reported by umask(2),
+    /// which returns the PREVIOUS value.
+    pub umask: u16,
+    /// Session id; set by setsid, otherwise the pid at exec time.
+    pub sess: usize,
     /// Absolute tick deadline while sleeping in a timed syscall
     /// (ppoll/nanosleep); None for untimed sleeps.
     pub wake_at: Option<u64>,
@@ -130,6 +144,121 @@ pub fn is_idle() -> bool {
 
 fn table() -> &'static mut Vec<Option<Process>> {
     unsafe { &mut *PROCS.0.get() }
+}
+
+// ---------- credentials (single-user, but per-process so the setters
+// have somewhere real to write) ----------
+
+pub fn set_credentials(uid: u32, gid: u32) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().expect("no current process");
+    p.uid = uid;
+    p.euid = uid;
+    p.gid = gid;
+    p.egid = gid;
+}
+
+pub fn set_reuid(ruid: u32, euid: u32) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().expect("no current process");
+    p.uid = ruid;
+    p.euid = euid;
+}
+
+pub fn set_regid(rgid: u32, egid: u32) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().expect("no current process");
+    p.gid = rgid;
+    p.egid = egid;
+}
+
+pub fn set_fchown_credentials(uid: u32, gid: u32) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_mut().expect("no current process");
+    if uid != u32::MAX {
+        p.uid = uid;
+    }
+    if gid != u32::MAX {
+        p.gid = gid;
+    }
+}
+
+pub fn get_credential(which: u32) -> u32 {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    match table()[cur].as_ref() {
+        Some(p) => match which {
+            0 => p.uid,
+            1 => p.euid,
+            2 => p.gid,
+            _ => p.egid,
+        },
+        None => 0,
+    }
+}
+
+/// getgroups(2): writes the supplementary list and returns its length, or
+/// -1 if the buffer is too small. A caller that sizes the buffer wrong gets
+/// an error rather than a silently truncated list.
+pub fn get_groups(buf: u64, len: usize) -> Result<usize, u8> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let n = table()[cur].as_ref().map(|p| p.groups.len()).unwrap_or(0);
+    if len < n {
+        return Err(34); // EINVAL
+    }
+    if n == 0 {
+        return Ok(0);
+    }
+    if !user_range_ok(buf, n * 4) {
+        return Err(EFAULT);
+    }
+    let gs = table()[cur].as_ref().unwrap().groups.clone();
+    for (i, g) in gs.iter().enumerate() {
+        if !write_user_i32((buf + (i * 4) as u64) as usize, *g as i32) {
+            return Err(EFAULT);
+        }
+    }
+    Ok(n)
+}
+
+pub fn set_groups(buf: u64, len: usize) -> Result<(), u8> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if !user_range_ok(buf, len.saturating_mul(4)) {
+        return Err(EFAULT);
+    }
+    let mut gs = Vec::new();
+    for i in 0..len {
+        match read_user_i32(buf + (i * 4) as u64) {
+            Some(v) => gs.push(v as u32),
+            None => return Err(EFAULT),
+        }
+    }
+    table()[cur].as_mut().unwrap().groups = gs;
+    Ok(())
+}
+
+/// umask(2) returns the PREVIOUS mask and installs the new one.
+pub fn sys_umask(new_mask: u16) -> u16 {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    match table()[cur].as_mut() {
+        Some(p) => {
+            let old = p.umask;
+            p.umask = new_mask & 0o777;
+            old
+        }
+        None => 0,
+    }
+}
+
+pub fn current_umask() -> u16 {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    table()[cur].as_ref().map(|p| p.umask).unwrap_or(0)
+}
+
+pub fn set_pgrp(pid: usize) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if let Some(p) = table()[cur].as_mut() {
+        p.pgrp = pid;
+    }
 }
 
 /// Process group of the running process.
@@ -204,6 +333,15 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         mmap_perms: Vec::new(),
         sig_linux: false,
         pgrp: 0,
+        // Single-user kernel: everyone is uid/gid 0, which is also what
+        // every existing arm already reported.
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        groups: Vec::new(),
+        umask: 0o022,
+        sess: 0,
         wake_at: None,
         tpidr: crate::user::TPIDR_VAL,
         itimer_at: None,
@@ -562,6 +700,16 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         mmap_perms: t[cur].as_ref().unwrap().mmap_perms.clone(),
         sig_linux,
         pgrp: t[cur].as_ref().unwrap().pgrp, // children share the group
+        uid: t[cur].as_ref().unwrap().uid,
+        euid: t[cur].as_ref().unwrap().euid,
+        gid: t[cur].as_ref().unwrap().gid,
+        egid: t[cur].as_ref().unwrap().egid,
+        // POSIX: a child's supplementary groups are its OWN until it calls
+        // setgroups, and a set-uid program drops them on exec -- not on
+        // fork. Copied here; sys_execve clears.
+        groups: t[cur].as_ref().unwrap().groups.clone(),
+        umask: t[cur].as_ref().unwrap().umask,
+        sess: t[cur].as_ref().unwrap().sess,
         wake_at: None,
         // Child shares the parent's live TLS (COW pages keep it valid).
         tpidr: read_tpidr(),
@@ -724,6 +872,13 @@ fn write_user_i32(addr: usize, val: i32) -> bool {
     }
     unsafe { (addr as *mut i32).write_volatile(val) };
     true
+}
+
+fn read_user_i32(addr: u64) -> Option<i32> {
+    if !user_range_ok(addr, 4) {
+        return None;
+    }
+    Some(unsafe { *((addr as usize) as *const i32) })
 }
 
 // ---------- user-memory helpers ----------
@@ -1345,8 +1500,9 @@ pub fn sys_getpgid(pid: i64) -> Result<usize, u8> {
         .ok_or(ESRCH)
 }
 
-/// Linux setsid(2): become session + group leader (v1: no session state,
-/// just take own pgrp). EPERM if already a group leader.
+/// setsid(2): become session + group leader. EPERM if already a group
+/// leader. The session id is recorded so `getlogin`-style state and any
+/// later job-control work have somewhere real to read.
 pub fn sys_setsid() -> Result<usize, u8> {
     let cur = CURRENT.load(Ordering::Relaxed);
     let t = table();
@@ -1355,6 +1511,7 @@ pub fn sys_setsid() -> Result<usize, u8> {
         return Err(EPERM_L);
     }
     p.pgrp = p.pid;
+    p.sess = p.pid;
     Ok(p.pid)
 }
 

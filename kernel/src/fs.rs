@@ -38,6 +38,10 @@ pub struct FsNode {
     /// Held on the node rather than in a global log so that a change made
     /// while no watcher exists is simply never observed.
     vnotes: u32,
+    /// Owner ids. Everything in this kernel is root-owned, but chown(2)
+    /// needs somewhere real to write or it is a silent success.
+    uid: u32,
+    gid: u32,
 }
 
 struct Nodes(UnsafeCell<Option<Vec<FsNode>>>);
@@ -68,6 +72,8 @@ pub fn mount(img: Vec<u8>) -> usize {
             mtime: e.mtime,
             vseq: 0,
             vnotes: 0,
+            uid: 0,
+            gid: 0,
         });
     }
     let n = v.len();
@@ -231,10 +237,16 @@ fn create_node(path: &str, as_dir: bool) -> Result<usize, u8> {
                 symlink: false,
                 dirty: true,
                 removed: false,
-                mode: if as_dir { 0o755 } else { 0o644 },
+                // New files and directories are created as 0666/0777 less
+                // the process umask, exactly as POSIX requires -- so umask
+                // is observable in the filesystem, not just read back.
+                mode: (if as_dir { 0o777 } else { 0o666 }
+                    & !crate::proc::current_umask()),
                 mtime: crate::arch::timer::unix_secs(),
                 vseq: 1,
                 vnotes: 0,
+                uid: 0,
+                gid: 0,
             });
             Ok(n.len() - 1)
         }
@@ -261,6 +273,34 @@ pub fn is_symlink(idx: usize) -> bool {
 }
 
 /// chmod(2): replace permission bits (type unchanged).
+/// chown(2): set the node's owner. `uid`/`gid` of `u32::MAX` (-1) leave
+/// that id alone. Single-user kernel, so no permission check -- but a
+/// missing node is ENOENT rather than a silent success.
+pub fn set_owner(idx: usize, uid: u32, gid: u32) -> Result<(), u8> {
+    // Borrow must end before `notify`, which takes `&mut nodes()` itself.
+    {
+        let n = &mut nodes()[idx];
+        if n.removed {
+            return Err(ENOENT);
+        }
+        if uid != u32::MAX {
+            n.uid = uid;
+        }
+        if gid != u32::MAX {
+            n.gid = gid;
+        }
+        n.dirty = true;
+    }
+    notify(idx, NOTE_ATTRIB);
+    Ok(())
+}
+
+/// Owner ids of a node, for stat(2)'s st_uid/st_gid.
+pub fn owner(idx: usize) -> (u32, u32) {
+    let n = &nodes()[idx];
+    (n.uid, n.gid)
+}
+
 pub fn set_mode(idx: usize, mode: u16) -> Result<(), u8> {
     let n = &mut nodes()[idx];
     if n.removed {
@@ -325,10 +365,12 @@ pub fn create_symlink(path: &str, target: &str) -> Result<usize, u8> {
                 symlink: true,
                 dirty: true,
                 removed: false,
-                mode: 0o777,
+                mode: 0o777, // symlinks are always 0777; umask does not apply
                 mtime: crate::arch::timer::unix_secs(),
                 vseq: 1,
                 vnotes: 0,
+                uid: 0,
+                gid: 0,
             });
             Ok(n.len() - 1)
         }

@@ -93,8 +93,12 @@ pub fn write_stat_node(addr: u64, idx: usize) -> Result<(), u8> {
         u32at(8, mode); // st_mode
         u64at(16, ino); // st_ino
         u32at(24, 1); // st_nlink
-        u32at(28, 0); // st_uid
-        u32at(32, 0); // st_gid
+        // st_uid/st_gid come from the node. Hardcoding 0 here made chown(2)
+        // invisible through stat: chown succeeded and the caller read back
+        // the old owner with no error anywhere.
+        let (uid, gid) = crate::fs::owner(idx);
+        u32at(28, uid); // st_uid
+        u32at(32, gid); // st_gid
         u64at(40, 0); // st_rdev
         // Four timestamps, 16 bytes each. Only tv_sec carries a value;
         // tv_nsec stays 0, matching what the Linux writer does.

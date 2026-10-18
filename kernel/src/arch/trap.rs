@@ -128,6 +128,51 @@ pub extern "C" fn rust_sync_handler(frame: &mut TrapFrame) {
 /// Split the two syscall ABIs sharing `svc`:
 ///   Linux   = svc #0 with the number in x8   → linux_abi::svc
 ///   NetBSD  = svc #NR (NR never 0)           → immediate dispatch below
+/// Shared body of chown(2)/lchown(2). `nofollow` selects the link itself
+/// over its target. uid/gid of -1 (u32::MAX) leave that id unchanged,
+/// which is what makes `chown(path, -1, -1)` a successful no-op.
+fn chown_path(path_ptr: u64, uid: u32, gid: u32, nofollow: bool) -> (i64, u8) {
+    let Some(path) = crate::proc::read_user_cstr(path_ptr, 256) else {
+        return (-1, 14); // EFAULT
+    };
+    let abs = crate::proc::abspath(&path);
+    let found = if nofollow {
+        crate::fs::lookup_nofollow(&abs)
+    } else {
+        crate::fs::lookup(&abs)
+    };
+    match found {
+        None => (-1, crate::file::ENOENT),
+        Some(idx) => match crate::fs::set_owner(idx, uid, gid) {
+            Ok(()) => (0, 0),
+            Err(e) => (-1, e),
+        },
+    }
+}
+
+/// getpgrp(0) / getpgid(pid): both report the caller's process group. A pid
+/// other than the caller is ESRCH -- only this process's group is
+/// modelled, and returning a plausible wrong id would be worse.
+fn get_pgrp(pid: usize) -> (i64, u8) {
+    let cur = crate::proc::current_pid();
+    if pid != 0 && pid != cur {
+        return (-1, 3); // ESRCH
+    }
+    (crate::proc::current_pgrp() as i64, 0)
+}
+
+/// setpgid(pid, pgrp): 0 means "the caller" for either argument. A pid
+/// that is not the caller is ESRCH rather than a silent success.
+fn set_pgid(pid: usize, pgrp: usize) -> (i64, u8) {
+    let cur = crate::proc::current_pid();
+    let pid = if pid == 0 { cur } else { pid };
+    if pid != cur {
+        return (-1, 3); // ESRCH
+    }
+    crate::proc::set_pgrp(if pgrp == 0 { cur } else { pgrp });
+    (0, 0)
+}
+
 fn svc_dispatch(frame: &mut TrapFrame) {
     let imm = frame.esr & 0xffff;
     if imm == 0 {
@@ -700,12 +745,93 @@ fn svc_dispatch(frame: &mut TrapFrame) {
         }
         // --- process / credential ---
         //
-        // NetBSD merges these into single numbered calls: getuid+geteuid
-        // share 24 and getgid+getegid share 47, exactly as getpid+getppid
-        // share 20. Single user, so both return 0.
-        nbsys::GETUID_WITH_EUID => (0, 0),
-        nbsys::GETGID_WITH_EGID => (0, 0),
-        nbsys::UMASK => (0, 0), // never changes
+        // getuid+geteuid share ONE number (24) and getgid+getegid share
+        // another (47), exactly as getpid+getppid share 20 -- but ONLY
+        // those pairs. `geteuid` (25) and `getegid` (43) are separate live
+        // calls, not merged; treating them as merged is what made an
+        // earlier note here claim they did not exist.
+        nbsys::GETUID_WITH_EUID => (crate::proc::get_credential(0) as i64, 0u8),
+        nbsys::GETGID_WITH_EGID => (crate::proc::get_credential(2) as i64, 0u8),
+        nbsys::GETEUID => (crate::proc::get_credential(1) as i64, 0u8),
+        nbsys::GETEGID => (crate::proc::get_credential(3) as i64, 0u8),
+        // umask returns the PREVIOUS mask. Answering a constant 0 was a
+        // silent success: a caller that set a mask and read it back got a
+        // lie with no error.
+        nbsys::UMASK => (crate::proc::sys_umask(frame.x[0] as u16) as i64, 0),
+        // setuid/setgid set real AND effective together; setreuid/setregid
+        // take both explicitly, with -1 meaning "leave this one alone".
+        nbsys::SETUID => {
+            crate::proc::set_credentials(frame.x[0] as u32, crate::proc::get_credential(2));
+            (0, 0)
+        }
+        nbsys::SETGID => {
+            crate::proc::set_credentials(crate::proc::get_credential(0), frame.x[0] as u32);
+            (0, 0)
+        }
+        nbsys::SETREUID => {
+            let (ruid, euid) = (frame.x[0] as u32, frame.x[1] as u32);
+            crate::proc::set_reuid(if ruid == u32::MAX { crate::proc::get_credential(0) } else { ruid },
+                                  if euid == u32::MAX { crate::proc::get_credential(1) } else { euid });
+            (0, 0)
+        }
+        nbsys::SETREGID => {
+            let (rgid, egid) = (frame.x[0] as u32, frame.x[1] as u32);
+            crate::proc::set_regid(if rgid == u32::MAX { crate::proc::get_credential(2) } else { rgid },
+                                  if egid == u32::MAX { crate::proc::get_credential(3) } else { egid });
+            (0, 0)
+        }
+        // --- supplementary groups ---
+        nbsys::GETGROUPS => match crate::proc::get_groups(frame.x[0], frame.x[1] as usize) {
+            Ok(n) => (n as i64, 0),
+            Err(e) => (-1, e),
+        },
+        nbsys::SETGROUPS => match crate::proc::set_groups(frame.x[0], frame.x[1] as usize) {
+            Ok(()) => (0, 0),
+            Err(e) => (-1, e),
+        },
+        // --- process groups / sessions ---
+        //
+        // getpgrp(0) is the current group; getpgid(0) is the same thing
+        // with a pid argument. Both report pgrp, which is inherited on
+        // fork and set by setsid.
+        nbsys::GETPGRP | nbsys::GETPGID => get_pgrp(frame.x[0] as usize),
+        nbsys::SETPGID => set_pgid(frame.x[0] as usize, frame.x[1] as usize),
+        // --- chown family ---
+        //
+        // uid/gid of -1 mean "leave this one alone"; a path that resolves to
+        // nothing is ENOENT and a live one is accepted.
+        // chown(path, uid, gid) follows symlinks; lchown(path, uid, gid)
+        // is a SEPARATE syscall (275) that changes the link itself. Both
+        // read exactly three arguments -- there is no trailing flag.
+        // __posix_* are the same calls for a POSIX-strict build, where
+        // chown does NOT follow.
+        nbsys::CHOWN | nbsys::__POSIX_CHOWN => {
+            chown_path(frame.x[0], frame.x[1] as u32, frame.x[2] as u32, false)
+        }
+        nbsys::LCHOWN | nbsys::__POSIX_LCHOWN => {
+            chown_path(frame.x[0], frame.x[1] as u32, frame.x[2] as u32, true)
+        }
+        nbsys::FCHOWN | nbsys::__POSIX_FCHOWN => {
+            match crate::file::node_of_fd(frame.x[0] as usize)
+                .and_then(|idx| {
+                    crate::fs::set_owner(idx, frame.x[1] as u32, frame.x[2] as u32)
+                }) {
+                Ok(()) => {
+                    crate::proc::set_fchown_credentials(frame.x[1] as u32, frame.x[2] as u32);
+                    (0, 0)
+                }
+                Err(e) => (-1, e),
+            }
+        }
+        // fchmod takes the mode in the low 12 bits; the file-type bits are
+        // not settable and are ignored rather than rejected, as POSIX says.
+        nbsys::FCHMOD => match crate::file::node_of_fd(frame.x[0] as usize) {
+            Err(e) => (-1, e),
+            Ok(idx) => match crate::fs::set_mode(idx, (frame.x[1] & 0o7777) as u16) {
+                Ok(()) => (0, 0),
+                Err(e) => (-1, e),
+            },
+        },
         // --- time ---
         //
         // NetBSD's timeval and timespec are both { long, long } on aarch64,

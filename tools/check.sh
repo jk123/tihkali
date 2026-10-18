@@ -976,6 +976,49 @@ gate_count "s29: no unknown syscall" "$S29" 'unknown syscall' 0
 gate_has   "s29: clean exit"      "$S29" 'proc: pid 0 exited \(0\)'
 gate_bad   "s29" "$S29"
 
+echo "== session 30: NetBSD credentials, groups and process groups"
+S30="$T/s30.log"
+# Every call here was a hardcoded 0 or absent before. A umask that returns
+# 0 without installing anything, or a chown that succeeds and writes
+# nothing, is a SILENT SUCCESS -- so the checks read the effect back
+# through stat rather than trusting the return code.
+( sleep 5
+  printf 'credtest\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 26 ./tools/run.sh >"$S30" 2>&1
+gate_has   "s30: umask prev"      "$S30" 'crd: ok    umask returns previous'
+gate_has   "s30: umask second"    "$S30" 'crd: ok    umask second read'
+gate_has   "s30: umask applied"   "$S30" 'crd: ok    umask applied to file'
+gate_has   "s30: getuid"          "$S30" 'crd: ok    getuid reached'
+gate_has   "s30: geteuid"         "$S30" 'crd: ok    geteuid reached'
+gate_has   "s30: getgid"          "$S30" 'crd: ok    getgid reached'
+gate_has   "s30: getegid"         "$S30" 'crd: ok    getegid reached'
+gate_has   "s30: setuid ok"       "$S30" 'crd: ok    setuid ok'
+gate_has   "s30: setuid visible"  "$S30" 'crd: ok    setuid observable'
+gate_has   "s30: chown ok"        "$S30" 'crd: ok    chown ok'
+gate_has   "s30: chown visible"   "$S30" 'crd: ok    chown observable'
+gate_has   "s30: chown -1 noop"   "$S30" 'crd: ok    chown -1 no-op'
+gate_has   "s30: chown ENOENT"    "$S30" 'crd: ok    chown ENOENT'
+gate_has   "s30: lchown"          "$S30" 'crd: ok    lchown reached'
+gate_has   "s30: fchmod ok"       "$S30" 'crd: ok    fchmod ok'
+gate_has   "s30: fchmod visible"  "$S30" 'crd: ok    fchmod observable'
+gate_has   "s30: setgroups"       "$S30" 'crd: ok    setgroups ok'
+gate_has   "s30: getgroups count" "$S30" 'crd: ok    getgroups count'
+gate_has   "s30: getgroups vals"  "$S30" 'crd: ok    getgroups values'
+gate_has   "s30: getgroups small" "$S30" 'crd: ok    getgroups too small'
+gate_has   "s30: setgroups clear" "$S30" 'crd: ok    setgroups clear'
+gate_has   "s30: getpgrp"         "$S30" 'crd: ok    getpgrp reached'
+gate_has   "s30: getpgid self"    "$S30" 'crd: ok    getpgid self'
+gate_has   "s30: getpgid explicit" "$S30" 'crd: ok    getpgid explicit'
+gate_has   "s30: getpgid ESRCH"   "$S30" 'crd: ok    getpgid foreign ESRCH'
+gate_has   "s30: setpgid self"    "$S30" 'crd: ok    setpgid self'
+gate_has   "s30: setpgid ESRCH"   "$S30" 'crd: ok    setpgid foreign ESRCH'
+gate_has   "s30: all ok"          "$S30" 'crd: all ok'
+gate_has   "s30: exit 0"          "$S30" 'sh: credtest exited 0'
+gate_count "s30: no panic"        "$S30" 'panic' 0
+gate_has   "s30: clean exit"      "$S30" 'proc: pid 0 exited \(0\)'
+gate_bad   "s30" "$S30"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: GREEN — all gates passed"
