@@ -13,6 +13,7 @@ use crate::kprintln;
 
 use crate::arch::trap::TrapFrame;
 use crate::file::{self, FdTarget, EACCES, EBADF, EFAULT, EINTR, ESRCH};
+use crate::fs;
 use crate::user;
 use crate::vm;
 
@@ -1433,6 +1434,38 @@ pub fn sys_open_mode(path: &str, flags: u64, mode: u16) -> Result<usize, u8> {
     install_fd(FdTarget::File(file_idx))
 }
 
+
+/// pread(2): read at an absolute offset WITHOUT moving the file position.
+/// Going through sys_read would move it, which silently breaks every
+/// caller that interleaves read and pread on one descriptor.
+pub fn read_at(fd: usize, buf: u64, len: usize, offset: u64) -> Result<usize, u8> {
+    let Some(FdTarget::File(i)) = current_target(fd) else { return Err(EBADF) };
+    if len == 0 {
+        return Ok(0);
+    }
+    if !user_range_ok(buf, len) {
+        return Err(EFAULT);
+    }
+    let node = file::node_of(i)?;
+    let pos = offset as usize;
+    Ok(fs::read_to_user(node, pos, buf, len))
+}
+
+/// pwrite(2): write at an absolute offset without moving the position.
+pub fn write_at(fd: usize, buf: u64, len: usize, offset: u64) -> Result<usize, u8> {
+    let Some(FdTarget::File(i)) = current_target(fd) else { return Err(EBADF) };
+    if len == 0 {
+        return Ok(0);
+    }
+    if !user_range_ok(buf, len) {
+        return Err(EFAULT);
+    }
+    // A read-only description must refuse, not silently discard the write.
+    file::fd_is_writable(fd)?;
+    let node = file::node_of(i)?;
+    Ok(fs::write_at(node, offset as usize, buf, len))
+}
+
 /// SYS___getdents30(fd, buf, len): directory enumeration.
 pub fn sys_getdents(fd: usize, buf: u64, len: usize) -> Result<usize, u8> {
     let Some(FdTarget::File(i)) = current_target(fd) else { return Err(EBADF) };
@@ -2214,6 +2247,29 @@ pub fn set_cwd(path: &str) {
 /// A relative path is joined onto `cwd`; `.` components are dropped and
 /// `..` pops one. Going above `/` clamps to `/` rather than escaping, so
 /// `../../..` from anywhere is `/`.
+
+/// True when this process is not already a session leader.
+pub fn can_setsid() -> bool {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let t = table();
+    match &t[cur] { Some(p) => p.sess != p.pid, None => false }
+}
+
+/// setsid(2): start a new session, becoming its leader. Returns the new
+/// session id, which is also the new process id.
+pub fn setsid() -> u32 {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let sid;
+    {
+        let t = table();
+        let p = t[cur].as_mut().unwrap();
+        p.sess = p.pid;
+        p.pgrp = p.pid;
+        sid = p.pid as u32;
+    }
+    sid
+}
+
 pub fn abspath(path: &str) -> String {
     let joined = if path.starts_with('/') {
         String::from(path)

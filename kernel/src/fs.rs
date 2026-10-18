@@ -180,12 +180,18 @@ pub fn read_to_user(idx: usize, pos: usize, addr: u64, len: usize) -> usize {
 
 /// Write `len` bytes from the (validated) user buffer into the node at
 /// `pos`, zero-filling any gap and growing the file. Marks the node dirty.
+///
+/// The file must GROW to fit the write, never shrink: a positional write
+/// inside an existing file left `data` shorter, so writing at offset 0 of a
+/// 13-byte file truncated it to 5 bytes and silently destroyed the tail.
+/// pwrite(2) is not truncate(2) -- a caller writing a header into an
+/// existing file expects the rest to survive.
 pub fn write_at(idx: usize, pos: usize, src: u64, len: usize) -> usize {
     let n = &mut nodes()[idx];
-    if pos > n.data.len() {
-        n.data.resize(pos, 0);
+    let end = pos.saturating_add(len);
+    if end > n.data.len() {
+        n.data.resize(end, 0);
     }
-    n.data.resize(pos + len, 0);
     unsafe {
         core::ptr::copy_nonoverlapping(src as *const u8, n.data.as_mut_ptr().add(pos), len);
     }
@@ -276,6 +282,49 @@ pub fn mtime_of(idx: usize) -> i64 {
 /// True when the node is a symlink (lstat/readlink).
 pub fn is_symlink(idx: usize) -> bool {
     nodes()[idx].symlink
+}
+
+
+/// pathconf(2) for node `idx`. Real per-node answers, not constants: the
+/// constants a caller sizes a buffer with must describe THIS filesystem.
+pub fn pathconf(idx: usize, name: u32) -> (i64, u8) {
+    // sys/sys/param.h: _PC_NAME_MAX=3, _PC_PATH_MAX=4, _PC_NO_TRUNC=7,
+    // _PC_CHOWN_RESTRICTED=14, _PC_SYMLINK_MAX=12.
+    match name {
+        3 => {
+            let mut m: u32 = 0;
+            for part in path_of(idx).split('/') {
+                if part.len() > m as usize {
+                    m = part.len() as u32;
+                }
+            }
+            if is_dir(idx) {
+                let list = listable(path_of(idx));
+                for i in list {
+                    for part in path_of(i).split('/') {
+                        if part.len() > m as usize {
+                            m = part.len() as u32;
+                        }
+                    }
+                }
+            }
+            // Longest existing NAME, never above NAME_MAX: a caller must be
+            // able to create the longest name this filesystem can hold.
+            if m > 255 {
+                m = 255;
+            }
+            (m as i64, 0)
+        }
+        4 => (1024, 0),                       // _PC_PATH_MAX
+        5 => (0, 0),                          // _PC_LINK_MAX: hard links absent
+        6 => (-1, 0),                         // _PC_CHOWN_MAX: uid_t, no limit
+        7 => (1, 0),                          // _PC_NO_TRUNC
+        12 => (1024, 0),                      // _PC_SYMLINK_MAX
+        14 => (1, 0),                         // _PC_CHOWN_RESTRICTED
+        15 => (4096, 0),                      // _PC_BLKSIZ
+        17 => (256, 0),                       // _PC_NAME_MAX ceiling
+        _ => (-1, 22),                        // EINVAL: unknown _PC_ request
+    }
 }
 
 /// chmod(2): replace permission bits (type unchanged).

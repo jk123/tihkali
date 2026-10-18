@@ -1541,6 +1541,177 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             }
         }
         nbsys::GETPRIORITY => (0, 0),
+        // --- positional file I/O ---
+        //
+        // pread/pwrite take an explicit offset and MUST NOT move the file
+        // position -- that is the entire point of them, and a kernel that
+        // routes them through read/write makes every caller that interleaves
+        // the two forms read the wrong bytes with no error anywhere.
+        //
+        // The offset is x4, NOT x3: the prototype carries an explicit PAD
+        // word (syscalls.master: `pread(int fd, void *buf, size_t nbyte,
+        // int PAD, off_t offset)`). Same trap as mmap's seven slots.
+        nbsys::PREAD => match crate::proc::read_at(frame.x[0] as usize, frame.x[1], frame.x[2] as usize, frame.x[4]) {
+            Ok(n) => (n as i64, 0),
+            Err(e) => (-1, e),
+        },
+        nbsys::PWRITE => match crate::proc::write_at(frame.x[0] as usize, frame.x[1], frame.x[2] as usize, frame.x[4]) {
+            Ok(n) => (n as i64, 0),
+            Err(e) => (-1, e),
+        },
+        // lseek(19)/truncate(129)/ftruncate(130) already have arms above.
+        // They are COMPAT_43 rows, and on aarch64 the compat layer IS the
+        // live ABI -- the "old" 64-bit off_t signature is what a NetBSD
+        // binary actually calls, so arming the compat number is correct.
+        //
+        // symlink(57)/futimens(472): the *at forms already share resolve_path,
+        // so these are the absolute-path spellings of calls that exist.
+        nbsys::SYMLINK => match crate::proc::read_user_cstr(frame.x[0], 256) {
+            None => (-1, 14),
+            Some(target) => match crate::proc::read_user_cstr(frame.x[1], 256) {
+                None => (-1, 14),
+                Some(link) => match crate::fs::create_symlink(&crate::proc::abspath(&link), &target) {
+                    Ok(_) => (0, 0),
+                    Err(e) => (-1, e),
+                },
+            },
+        },
+        // futimens(fd, times[2]): null times, or a timespec with tv_nsec
+        // >= 1e9, is EINVAL. A bad timestamp written anyway would be read
+        // back by utimes/stat as a plausible time.
+        nbsys::FUTIMENS => {
+            let ts = frame.x[1];
+            if ts != 0 && !crate::proc::user_range_ok(ts, 32) {
+                (-1, 14) // EFAULT
+            } else if ts != 0 && !crate::linux_abi::timespecs_valid(ts, 2) {
+                (-1, 22) // EINVAL
+            } else {
+                match crate::file::node_of_fd(frame.x[0] as usize) {
+                    Err(e) => (-1, e),
+                    Ok(idx) => match crate::file::fd_is_writable(frame.x[0] as usize) {
+                        Err(e) => (-1, e),
+                        Ok(_) => {
+                            // futimens takes TWO timespecs: [0] sets the
+                            // access time and [1] the modification time. This
+                            // filesystem records one mtime, so only the
+                            // modification slot is applied -- applying the
+                            // access slot would make a read change mtime,
+                            // which utimes/stat would then report as a
+                            // write that never happened.
+                            if ts != 0 {
+                                let sec = unsafe { *(ts as *const i64).add(2) };
+                                let nsec = unsafe { *(ts as *const i64).add(3) };
+                                // UTIME_NOW (nsec == UTIME_NOW) keeps the
+                                // current time; UTIME_OMIT leaves it alone.
+                                if nsec == 2 {
+                                    crate::fs::set_mtime(idx, crate::arch::timer::unix_secs());
+                                } else if sec != 1 {
+                                    crate::fs::set_mtime(idx, sec);
+                                }
+                            }
+                            (0, 0)
+                        }
+                    },
+                }
+            }
+        }
+        // --- process identity, continued ---
+        // setsid(147): returns the new session id. A process already in a
+        // session cannot setsid, so calling it twice must fail rather than
+        // silently return the same id forever.
+        nbsys::SETSID => {
+            if !crate::proc::can_setsid() {
+                (-1, 1) // EPERM: already a session leader
+            } else {
+                let sid = crate::proc::setsid();
+                (sid as i64, 0)
+            }
+        }
+        nbsys::SETEGID => {
+            crate::proc::set_regid(crate::proc::get_credential(2), frame.x[0] as u32);
+            (0, 0)
+        }
+        nbsys::SETEUID => {
+            crate::proc::set_reuid(crate::proc::get_credential(0), frame.x[0] as u32);
+            (0, 0)
+        }
+        // --- getrandom(91) ---
+        //
+        // There is no entropy pool to draw from, and a call that returned
+        // zero-filled bytes would look exactly like randomness to a caller.
+        // ENOSYS is the honest answer; seeding a PRNG from the timer would
+        // be worse, because two boots would produce the same "random" key.
+        nbsys::GETRANDOM => (-1, 78), // ENOSYS: no entropy source
+        // --- pathconf(191)/fpathconf(192) ---
+        //
+        // Real work, not constants: _PC_NAME_MAX and _PC_PATH_MAX differ
+        // per filesystem, and a kernel answering both from one guess makes
+        // a caller build a buffer that is too small for the real one.
+        nbsys::PATHCONF => match crate::proc::read_user_cstr(frame.x[0], 256) {
+            None => (-1, 14),
+            Some(path) => {
+                let abs = crate::proc::abspath(&path);
+                match crate::fs::lookup(&abs) {
+                    None => (-1, crate::file::ENOENT),
+                    Some(idx) => crate::fs::pathconf(idx, frame.x[1] as u32),
+                }
+            }
+        },
+        nbsys::FPATHCONF => match crate::file::node_of_fd(frame.x[0] as usize) {
+            Err(e) => (-1, e),
+            Ok(idx) => crate::fs::pathconf(idx, frame.x[1] as u32),
+        },
+        // sysarch(165): `sysarch(int op, void *parms)`, per the generated
+        // syscall table (sys_sysarch_args). The first argument is an OP
+        // CODE, not a name string -- treating it as a path pointer reads
+        // whatever bytes happen to be there.
+        //
+        // SYSARCH_UNAME_MACHINE is 0 and fills the caller's buffer with the
+        // machine name, returning its length. Anything else is EINVAL
+        // rather than a plausible answer: the caller selects a code path
+        // from the result, so a wrong one is worse than none.
+        nbsys::SYSARCH => {
+            const SYSARCH_UNAME_MACHINE: u64 = 0;
+            const SYSARCH_UNAME_MACHINE_ALIAS: u64 = 1;
+            let op = frame.x[0];
+            let buf = frame.x[1];
+            if op != SYSARCH_UNAME_MACHINE && op != SYSARCH_UNAME_MACHINE_ALIAS {
+                (-1, 22) // EINVAL
+            } else if !crate::proc::user_range_ok(buf, 8) {
+                (-1, 14) // EFAULT
+            } else {
+                const MACHINE: &[u8] = b"aarch64";
+                unsafe {
+                    let p = buf as *mut u8;
+                    core::ptr::copy_nonoverlapping(MACHINE.as_ptr(), p, MACHINE.len());
+                    p.add(MACHINE.len()).write(0);
+                }
+                (MACHINE.len() as i64, 0)
+            }
+        }
+        // --- locked memory ---
+        //
+        // mlock/munlock/mlockall/munlockall: the pages are demand-paged and
+        // a "locked" page the kernel can evict is not locked at all. Saying
+        // 0 would tell a caller memory that cannot be swapped when it can.
+        nbsys::MLOCK | nbsys::MUNLOCK | nbsys::MLOCKALL | nbsys::MUNLOCKALL => (-1, 95), // EOPNOTSUPP
+        // --- refused: subsystems this kernel does not have ---
+        //
+        // Each of these would have to do something. A success that does
+        // nothing is the failure mode this project refuses everywhere.
+        nbsys::REBOOT => (-1, 1),   // EPERM: no privilege, and no other console
+        nbsys::UNMOUNT => (-1, 13), // EACCES: one always-mounted root
+        nbsys::OBREAK => (-1, 22),  // EINVAL: no ptrace to break into
+        nbsys::ACCT => (-1, 22),    // EINVAL: no process accounting
+        nbsys::REVOKE => (-1, 22),  // EINVAL: no device files to revoke
+        nbsys::MINCORE => (-1, 95), // EOPNOTSUPP: no residency to report
+        nbsys::VFORK => (-1, 95),   // EOPNOTSUPP: fork already covers it
+        nbsys::FEXECVE => (-1, 95), // EOPNOTSUPP: execve takes a path
+        nbsys::SENDMMSG | nbsys::RECVMMSG => (-1, 95), // EOPNOTSUPP: sendmsg/recvmsg cover it
+        // pipe2(453): this kernel has one pipe implementation with no flags.
+        // O_NONBLOCK would be ignored, so accepting the call and discarding
+        // the flag is exactly the silent success to avoid.
+        nbsys::PIPE2 => (-1, 95), // EOPNOTSUPP: pipe(2) has no flags
         // --- resource limits ---
         //
         // struct rlimit is { rlim_cur; rlim_max } with rlim_t = 64-bit on

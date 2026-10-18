@@ -1134,6 +1134,85 @@ gate_count "s32: no panic"        "$S32" 'panic' 0
 gate_has   "s32: clean exit"      "$S32" 'proc: pid 0 exited \(0\)'
 gate_bad   "s32" "$S32"
 
+echo "== session 33: NetBSD positional I/O, pathconf, symlink, futimens"
+S33="$T/s33.log"
+# pread/pwrite take their offset in x4, NOT x3 -- the prototype carries an
+# explicit PAD word, the same trap as mmap's seven register slots. Neither
+# may move the file position, which the probe checks by interleaving them
+# with a positional read() on one descriptor.
+#
+# getrandom is refused rather than zero-filled: zero bytes look exactly like
+# randomness, and a timer-seeded PRNG would give two boots the same key.
+( sleep 5
+  printf 'iotest5\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 26 ./tools/run.sh >"$S33" 2>&1
+gate_has   "s33: created file                        " "$S33" 'io5: ok    created file'
+gate_has   "s33: pwrite at 8                         " "$S33" 'io5: ok    pwrite at 8'
+gate_has   "s33: pread read it back                  " "$S33" 'io5: ok    pread read it back'
+gate_has   "s33: gap zero filled                     " "$S33" 'io5: ok    gap zero filled'
+gate_has   "s33: lseek to 0                          " "$S33" 'io5: ok    lseek to 0'
+gate_has   "s33: pwrite at 0                         " "$S33" 'io5: ok    pwrite at 0'
+gate_has   "s33: read at 0 after pwrite              " "$S33" 'io5: ok    read at 0 after pwrite'
+gate_has   "s33: pread left the position             " "$S33" 'io5: ok    pread left the position'
+gate_has   "s33: pwrite at 10                        " "$S33" 'io5: ok    pwrite at 10'
+gate_has   "s33: pwrite patched in place             " "$S33" 'io5: ok    pwrite patched in place'
+gate_has   "s33: pwrite on O_RDONLY EACCES           " "$S33" 'io5: ok    pwrite on O_RDONLY EACCES'
+gate_has   "s33: pwrite EBADF                        " "$S33" 'io5: ok    pwrite EBADF'
+gate_has   "s33: symlink                             " "$S33" 'io5: ok    symlink[[:space:]]+ok'
+gate_has   "s33: symlink target readable             " "$S33" 'io5: ok    symlink target readable'
+gate_has   "s33: symlink EEXIST                      " "$S33" 'io5: ok    symlink EEXIST'
+gate_has   "s33: dangling symlink allowed            " "$S33" 'io5: ok    dangling symlink allowed'
+gate_has   "s33: reopened for rw                     " "$S33" 'io5: ok    reopened for rw'
+gate_has   "s33: futimens ok                         " "$S33" 'io5: ok    futimens ok'
+gate_has   "s33: futimens observable                 " "$S33" 'io5: ok    futimens observable'
+gate_has   "s33: futimens bad nsec EINVAL            " "$S33" 'io5: ok    futimens bad nsec EINVAL'
+gate_has   "s33: bad nsec changed nothing            " "$S33" 'io5: ok    bad nsec changed nothing'
+gate_has   "s33: futimens NULL                       " "$S33" 'io5: ok    futimens NULL'
+gate_has   "s33: futimens on O_RDONLY EACCES         " "$S33" 'io5: ok    futimens on O_RDONLY EACCES'
+gate_has   "s33: futimens EBADF                      " "$S33" 'io5: ok    futimens EBADF'
+gate_has   "s33: seteuid ok                          " "$S33" 'io5: ok    seteuid ok'
+gate_has   "s33: seteuid visible                     " "$S33" 'io5: ok    seteuid visible'
+gate_has   "s33: seteuid left ruid                   " "$S33" 'io5: ok    seteuid left ruid'
+gate_has   "s33: seteuid back                        " "$S33" 'io5: ok    seteuid back'
+gate_has   "s33: euid restored                       " "$S33" 'io5: ok    euid restored'
+gate_has   "s33: setegid ok                          " "$S33" 'io5: ok    setegid ok'
+gate_has   "s33: setegid visible                     " "$S33" 'io5: ok    setegid visible'
+gate_has   "s33: setegid left rgid                   " "$S33" 'io5: ok    setegid left rgid'
+gate_has   "s33: setegid back                        " "$S33" 'io5: ok    setegid back'
+gate_has   "s33: egid restored                       " "$S33" 'io5: ok    egid restored'
+gate_has   "s33: setsid id is self                   " "$S33" 'io5: ok    setsid id is self'
+gate_has   "s33: pathconf NAME_MAX >= 4              " "$S33" 'io5: ok    pathconf NAME_MAX >= 4'
+gate_has   "s33: pathconf PATH_MAX                   " "$S33" 'io5: ok    pathconf PATH_MAX'
+gate_has   "s33: pathconf LINK_MAX 0                 " "$S33" 'io5: ok    pathconf LINK_MAX 0'
+gate_has   "s33: pathconf NO_TRUNC                   " "$S33" 'io5: ok    pathconf NO_TRUNC'
+gate_has   "s33: pathconf unknown EINVAL             " "$S33" 'io5: ok    pathconf unknown EINVAL'
+gate_has   "s33: pathconf ENOENT                     " "$S33" 'io5: ok    pathconf ENOENT'
+gate_has   "s33: fpathconf PATH_MAX                  " "$S33" 'io5: ok    fpathconf PATH_MAX'
+gate_has   "s33: fpathconf EBADF                     " "$S33" 'io5: ok    fpathconf EBADF'
+gate_has   "s33: sysarch machine                     " "$S33" 'io5: ok    sysarch machine'
+gate_has   "s33: sysarch bad op EINVAL               " "$S33" 'io5: ok    sysarch bad op EINVAL'
+gate_has   "s33: sysarch EFAULT                      " "$S33" 'io5: ok    sysarch EFAULT'
+gate_has   "s33: getrandom ENOSYS                    " "$S33" 'io5: ok    getrandom ENOSYS'
+gate_has   "s33: mlock EOPNOTSUPP                    " "$S33" 'io5: ok    mlock EOPNOTSUPP'
+gate_has   "s33: munlock EOPNOTSUPP                  " "$S33" 'io5: ok    munlock EOPNOTSUPP'
+gate_has   "s33: mlockall EOPNOTSUPP                 " "$S33" 'io5: ok    mlockall EOPNOTSUPP'
+gate_has   "s33: munlockall EOPNOTSUPP               " "$S33" 'io5: ok    munlockall EOPNOTSUPP'
+gate_has   "s33: reboot EPERM                        " "$S33" 'io5: ok    reboot EPERM'
+gate_has   "s33: unmount EACCES                      " "$S33" 'io5: ok    unmount EACCES'
+gate_has   "s33: obreak EINVAL                       " "$S33" 'io5: ok    obreak EINVAL'
+gate_has   "s33: acct EINVAL                         " "$S33" 'io5: ok    acct EINVAL'
+gate_has   "s33: revoke EINVAL                       " "$S33" 'io5: ok    revoke EINVAL'
+gate_has   "s33: mincore EOPNOTSUPP                  " "$S33" 'io5: ok    mincore EOPNOTSUPP'
+gate_has   "s33: vfork EOPNOTSUPP                    " "$S33" 'io5: ok    vfork EOPNOTSUPP'
+gate_has   "s33: pipe2 EOPNOTSUPP                    " "$S33" 'io5: ok    pipe2 EOPNOTSUPP'
+gate_has   "s33: fexecve EOPNOTSUPP                  " "$S33" 'io5: ok    fexecve EOPNOTSUPP'
+gate_has   "s33: all ok"          "$S33" 'io5: all ok'
+gate_has   "s33: exit 0"          "$S33" 'sh: iotest5 exited 0'
+gate_count "s33: no panic"        "$S33" 'panic' 0
+gate_has   "s33: clean exit"      "$S33" 'proc: pid 0 exited \(0\)'
+gate_bad   "s33" "$S33"
+
 echo "== session 30: NetBSD credentials, groups and process groups"
 S30="$T/s30.log"
 # Every call here was a hardcoded 0 or absent before. A umask that returns

@@ -1519,7 +1519,23 @@ pub fn resolve_path(dirfd: i64, path: String) -> Result<String, u8> {
     }
 }
 
-pub fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64, flags: u64) -> (i64, u8) {
+/// Validate `count` consecutive NetBSD timespecs ({ long tv_sec; long
+/// tv_nsec }) at `addr`. tv_nsec must be in 0..1e9.
+pub fn timespecs_valid(addr: u64, count: usize) -> bool {
+    for i in 0..count {
+        let base = addr + (i * 16) as u64;
+        if !crate::proc::user_range_ok(base, 16) {
+            return false;
+        }
+        let nsec = unsafe { *((base + 8) as *const i64) };
+        if nsec < 0 || nsec >= 1_000_000_000 {
+            return false;
+        }
+    }
+    true
+}
+
+fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64, flags: u64) -> (i64, u8) {
     let Some(path) = proc::read_user_cstr(path_ptr, 128) else {
         return (0, 14);
     };
