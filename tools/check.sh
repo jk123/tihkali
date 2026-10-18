@@ -678,9 +678,9 @@ S27="$T/s27.log"
 # reader. `returned udata` is the one that proves the offsets, because it
 # reads a caller-supplied value back out of kernel-written memory.
 ( sleep 5
-  printf 'kqtest\n'; sleep 15
+  printf 'kqtest\n'; sleep 22
   printf 'exit\n'; sleep 3
-) | timeout 40 ./tools/run.sh >"$S27" 2>&1
+) | timeout 48 ./tools/run.sh >"$S27" 2>&1
 gate_has   "s27: offset ident"    "$S27" 'kq: ok    offset ident'
 gate_has   "s27: offset filter"   "$S27" 'kq: ok    offset filter'
 gate_has   "s27: offset flags"    "$S27" 'kq: ok    offset flags'
@@ -792,6 +792,42 @@ gate_has   "s27: knote saves USR1" "$S27" 'kq: ok    knote suppresses SIGUSR1 de
 gate_has   "s27: aio ENOSYS"    "$S27" 'kq: ok    aio ENOSYS'
 gate_has   "s27: signal delete" "$S27" 'kq: ok    signal delete'
 gate_has   "s27: signal del ENOENT" "$S27" 'kq: ok    signal delete ENOENT'
+# EVFILT_TIMER gates. The three that carry the weight:
+# `timer ends a long park` (an EVFILT_TIMER is a WAKEUP SOURCE -- kevent
+# must return when it expires rather than at the caller's timeout),
+# `slot reported` (a slot-keyed registration the caller cannot name is
+# unusable, so the kernel writes the assigned slot back into `data`), and
+# `nsec clamps to one tick` (a sub-resolution period is clamped, not
+# refused -- a timer that is under-ticked still has to be able to fire).
+gate_has   "s27: timer zero EINVAL" "$S27" 'kq: ok    timer zero EINVAL'
+gate_has   "s27: timer negative EINVAL" "$S27" 'kq: ok    timer negative EINVAL'
+gate_has   "s27: timer bad unit EINVAL" "$S27" 'kq: ok    timer bad unit EINVAL'
+gate_has   "s27: timer stray flag"    "$S27" 'kq: ok    timer stray flag EINVAL'
+gate_has   "s27: abstime refused"     "$S27" 'kq: ok    abstime refused'
+gate_has   "s27: timer add"           "$S27" 'kq: ok    timer add'
+gate_has   "s27: slot reported"       "$S27" 'kq: ok    slot reported'
+gate_has   "s27: timer not ready"     "$S27" 'kq: ok    timer not ready yet'
+gate_has   "s27: timer add fast"      "$S27" 'kq: ok    timer add fast'
+gate_has   "s27: timer add seconds"   "$S27" 'kq: ok    timer add seconds'
+gate_has   "s27: slots differ"        "$S27" 'kq: ok    slots differ'
+gate_has   "s27: timer ends a park"   "$S27" 'kq: ok    timer ends a long park'
+gate_has   "s27: timer filter"        "$S27" 'kq: ok    timer filter is TIMER'
+gate_has   "s27: fast timer delivered" "$S27" 'kq: ok    fast timer delivered'
+gate_has   "s27: timer data nonzero"  "$S27" 'kq: ok    timer data nonzero'
+gate_has   "s27: unfired withheld"    "$S27" 'kq: ok    unfired timers withheld'
+gate_has   "s27: oneshot consumed"    "$S27" 'kq: ok    oneshot timer consumed'
+gate_has   "s27: timer delete"        "$S27" 'kq: ok    timer delete'
+gate_has   "s27: timer del twice"     "$S27" 'kq: ok    timer double delete ENOENT'
+gate_has   "s27: timer del ENOENT"    "$S27" 'kq: ok    timer delete ENOENT'
+gate_has   "s27: nsec accepted"       "$S27" 'kq: ok    nsec accepted'
+gate_has   "s27: nsec clamps"         "$S27" 'kq: ok    nsec clamps to one tick'
+gate_has   "s27: timer add usec"      "$S27" 'kq: ok    timer add usec'
+gate_has   "s27: usec fires"          "$S27" 'kq: ok    usec fires fast'
+gate_has   "s27: timer add repeat"    "$S27" 'kq: ok    timer add repeat'
+gate_has   "s27: repeat not due"      "$S27" 'kq: ok    repeat not due yet'
+gate_has   "s27: repeating fires"     "$S27" 'kq: ok    repeating timer fires'
+gate_has   "s27: repeating EV_CLEAR"  "$S27" 'kq: ok    repeating timer is EV_CLEAR'
+gate_has   "s27: repeat delete"       "$S27" 'kq: ok    repeat delete'
 gate_has   "s27: all ok"          "$S27" 'kq: all ok'
 gate_has   "s27: exit 0"          "$S27" 'sh: kqtest exited 0'
 gate_count "s27: no panic"        "$S27" 'panic' 0

@@ -378,6 +378,17 @@ const EVFILT_AIO: u32 = 2;
 const EVFILT_VNODE: u32 = 3;
 const EVFILT_PROC: u32 = 4;
 const EVFILT_SIGNAL: u32 = 5;
+const EVFILT_TIMER: u32 = 6;
+
+// EVFILT_TIMER units live in fflags (sys/sys/event.h). NOTE_MSECONDS is the
+// HISTORICAL value 0, so fflags == 0 means MILLISECONDS, not "no unit" --
+// the only filter here where zero is a real selector.
+const NOTE_MSECONDS: u32 = 0x0;
+const NOTE_SECONDS: u32 = 0x1;
+const NOTE_USECONDS: u32 = 0x2;
+const NOTE_NSECONDS: u32 = 0x3;
+const NOTE_TIMER_UNITMASK: u32 = 0x3;
+const NOTE_ABSTIME: u32 = 0x10;
 
 // NOTE_* for EVFILT_PROC. These overlap the vnode NOTE_* space, so a
 // misdispatched filter is visible as a wrong fflags mask.
@@ -422,6 +433,13 @@ const POLL_ONLY: [i64; 2] = [0, 0];
 fn fillf(ident: u64, filter: u32, flags: u32, fflags: u32, udata: u64) -> Ke {
     let mut k = fill(ident, filter, flags, udata);
     k.fflags = fflags;
+    k
+}
+
+/// EVFILT_TIMER carries its timeout in `data`, not in `ident`.
+fn filld(ident: u64, filter: u32, flags: u32, fflags: u32, data: i64, udata: u64) -> Ke {
+    let mut k = fillf(ident, filter, flags, fflags, udata);
+    k.data = data;
     k
 }
 
@@ -1007,6 +1025,141 @@ pub extern "C" fn _start() -> ! {
         check("signal delete", kevent(kq, &sdel as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
         let sdel2 = fillf(10, EVFILT_SIGNAL, EV_DELETE, 0, 0);
         check("signal delete ENOENT", kevent(kq, &sdel2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(2));
+
+        // --- EVFILT_TIMER ------------------------------------------------
+        // Keyed by knote SLOT, and the kernel writes the assigned slot back
+        // into the changelist entry's `data`, because appends reuse
+        // tombstones: the slot a timer lands on is neither the caller's
+        // `ident` nor predictable. EVERY add below reads that slot back
+        // and every delete uses it -- a fixed slot number is a lie once
+        // more than one timer has been armed.
+        //
+        // The timeout is in `data`; units are in fflags, and NOTE_MSECONDS
+        // is the HISTORICAL value 0, so fflags == 0 means milliseconds.
+        let tzero = filld(0, EVFILT_TIMER, EV_ADD, NOTE_MSECONDS, 0, 0);
+        check("timer zero EINVAL", kevent(kq, &tzero as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
+        let tneg = filld(0, EVFILT_TIMER, EV_ADD, NOTE_MSECONDS, -5, 0);
+        check("timer negative EINVAL", kevent(kq, &tneg as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
+        let tbad = filld(0, EVFILT_TIMER, EV_ADD, NOTE_TIMER_UNITMASK + 1, 50, 0);
+        check("timer bad unit EINVAL", kevent(kq, &tbad as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
+        let tstray = filld(0, EVFILT_TIMER, EV_ADD, NOTE_MSECONDS | 0x40, 50, 0);
+        check("timer stray flag EINVAL", kevent(kq, &tstray as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
+        // NOTE_ABSTIME is a legal flag bit, accepted by the mask check, but
+        // resolving it needs a clock distinct from the tick counter this
+        // kernel times against. Refused rather than silently reinterpreted
+        // as relative, which would fire at the wrong moment.
+        let tabs = filld(0, EVFILT_TIMER, EV_ADD, NOTE_MSECONDS | NOTE_ABSTIME, 1, 0);
+        check("abstime refused", kevent(kq, &tabs as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
+
+        // 60ms out: not ready now.
+        let t1 = filld(0, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_SECONDS, 3600, 0x7171);
+        check("timer add", kevent(kq, &t1 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let s1 = t1.data;
+        check("slot reported", s1 >= 0 && (s1 as usize) < 64);
+        let mut pti = core::mem::zeroed::<Ke>();
+        let nti0 = kevent(kq, core::ptr::null(), 0, &mut pti as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("timer not ready yet", nti0 == Ok(0));
+
+        // 1ms out, plus a far-future one that must be withheld.
+        let t2 = filld(0, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_SECONDS, 1, 0x7272);
+        check("timer add fast", kevent(kq, &t2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let s2 = t2.data;
+        let t3 = filld(0, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_SECONDS, 3600, 0x7373);
+        check("timer add seconds", kevent(kq, &t3 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let s3 = t3.data;
+        check("slots differ", s2 != s3);
+
+        // Park with a LONG caller timeout: the timer must end the park, or
+        // a caller told about a timer would have to busy-poll for it.
+        let mut got: [Ke; 8] = core::mem::zeroed();
+        let nti = kevent(kq, core::ptr::null(), 0, got.as_mut_ptr() as *mut u8, 8,
+            [3i64, 0i64].as_ptr() as i64);
+        check("timer ends a long park", nti.unwrap_or(0) >= 1);
+        let mut found_fast = false;
+        let mut found_slow = false;
+        for g in got.iter().take(nti.unwrap_or(0).max(0) as usize) {
+            check("timer filter is TIMER", g.filter == EVFILT_TIMER);
+            if g.udata == 0x7272 { found_fast = true; check("timer data nonzero", g.data != 0); }
+            if g.udata == 0x7373 || g.udata == 0x7171 { found_slow = true; }
+        }
+        check("fast timer delivered", found_fast);
+        check("unfired timers withheld", !found_slow);
+
+        // One-shot is consumed: a second harvest must not repeat it.
+        let mut pti3 = core::mem::zeroed::<Ke>();
+        check("oneshot timer consumed", kevent(kq, core::ptr::null(), 0, &mut pti3 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64) == Ok(0));
+
+        // Delete by the slot the kernel reported. Both timers are still
+        // live (60ms and 3600s), so this exercises a real delete.
+        let d1 = filld(s1 as u64, EVFILT_TIMER, EV_DELETE, NOTE_MSECONDS, 0, 0);
+        check("timer delete", kevent(kq, &d1 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let d1b = filld(s1 as u64, EVFILT_TIMER, EV_DELETE, NOTE_MSECONDS, 0, 0);
+        check("timer double delete ENOENT", kevent(kq, &d1b as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(2));
+        let d9 = filld(9999, EVFILT_TIMER, EV_DELETE, NOTE_MSECONDS, 0, 0);
+        check("timer delete ENOENT", kevent(kq, &d9 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(2));
+
+        // NOTE_NSECONDS is the last valid unit (the mask is 0..3) and 1ns
+        // is far below the timer IRQ's 10ms granularity, so it must be
+        // CLAMPED to the minimum rather than refused -- a timer that is
+        // under-ticked still has to be able to fire. It therefore arrives
+        // on the next IRQ, not immediately.
+        let tns = filld(0, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, 1, 0x7979);
+        check("nsec accepted", kevent(kq, &tns as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let mut pn = core::mem::zeroed::<Ke>();
+        let ntn = kevent(kq, core::ptr::null(), 0, &mut pn as *mut Ke as *mut u8, 1,
+            [3i64, 0i64].as_ptr() as i64);
+        check("nsec clamps to one tick", ntn == Ok(1));
+
+        // Units must differ: 1000 microseconds is ~1ms, so it is due within
+        // this call's park; 1000 milliseconds would not be.
+        // 1 second expressed in MICROSECONDS must behave like the 1s
+        // millisecond-free case above: the unit selector is not decorative,
+        // it is applied. 1_000_000us == 1s, so this is due by the time a
+        // 3s park ends.
+        let t4 = filld(0, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_USECONDS, 1_000_000, 0x7474);
+        check("timer add usec", kevent(kq, &t4 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let s4 = t4.data;
+        let mut gu: [Ke; 8] = core::mem::zeroed();
+        let ntu = kevent(kq, core::ptr::null(), 0, gu.as_mut_ptr() as *mut u8, 8,
+            [3i64, 0i64].as_ptr() as i64);
+        // Earlier timers from earlier blocks are still armed, so the count
+        // is "however many are due", not 1. Assert on WHICH arrived.
+        let got_u = gu.iter().take(ntu.unwrap_or(0).max(0) as usize)
+            .filter(|g| g.udata == 0x7474).count();
+        check("usec fires fast", got_u == 1);
+
+        // NetBSD forces EV_CLEAR on a RELATIVE repeating timer: the re-arm
+        // happens when the event is DELIVERED, so an immediate re-poll
+        // finds nothing rather than re-reporting the same expiry. The
+        // period is 500ms so "not yet due again" is observable: the
+        // tick counter advances once per 10ms IRQ, so a one-tick period
+        // would legitimately be due again on the very next poll and the
+        // check would be testing the clock, not EV_CLEAR.
+        let t5 = filld(0, EVFILT_TIMER, EV_ADD, NOTE_MSECONDS, 1000, 0x7575);
+        check("timer add repeat", kevent(kq, &t5 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let s5 = t5.data;
+        // Poll with a SHORT timeout so this does not wait the full 500ms.
+        let mut pr: [Ke; 8] = core::mem::zeroed();
+        let ntr1 = kevent(kq, core::ptr::null(), 0, pr.as_mut_ptr() as *mut u8, 8,
+            POLL_ONLY.as_ptr() as i64);
+        // A pure poll, immediately after registration: nothing is due yet,
+        // whatever the period.
+        check("repeat not due yet", !pr.iter().take(ntr1.unwrap_or(0).max(0) as usize)
+            .any(|g| g.udata == 0x7575));
+        // Now let the full period elapse: the timer fires exactly once and
+        // the immediate re-poll is silent, which is EV_CLEAR's property.
+        let mut pw: [Ke; 8] = core::mem::zeroed();
+        let ntr2 = kevent(kq, core::ptr::null(), 0, pw.as_mut_ptr() as *mut u8, 8,
+            [3i64, 0i64].as_ptr() as i64);
+        check("repeating timer fires", pw.iter().take(ntr2.unwrap_or(0).max(0) as usize)
+            .any(|g| g.udata == 0x7575));
+        let mut gr: [Ke; 8] = core::mem::zeroed();
+        let ntr3 = kevent(kq, core::ptr::null(), 0, gr.as_mut_ptr() as *mut u8, 8, POLL_ONLY.as_ptr() as i64);
+        check("repeating timer is EV_CLEAR", !gr.iter().take(ntr3.unwrap_or(0).max(0) as usize)
+            .any(|g| g.udata == 0x7575));
+        let d5 = filld(s5 as u64, EVFILT_TIMER, EV_DELETE, NOTE_MSECONDS, 0, 0);
+        check("repeat delete", kevent(kq, &d5 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let _ = (s2, s3, s4);
 
         close(fd);
         close(kq);

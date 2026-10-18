@@ -253,7 +253,11 @@ pub fn schedule_ex(frame: &mut TrapFrame, save: bool) -> bool {
             continue;
         }
         if idx == cur && save {
-            return true; // same context already in `frame`
+            // `cur` was found RUNNABLE, so this really is the same context
+            // already in `frame` and nothing was switched. `sleep_inner`
+            // has already set State::Sleeping, so this branch only runs
+            // when the caller is NOT sleeping -- a genuine no-op yield.
+            return true;
         }
         CURRENT.store(idx, Ordering::Relaxed);
         let p = t[idx].as_mut().unwrap();
@@ -380,6 +384,39 @@ pub fn deadline() -> Option<u64> {
     table()[CURRENT.load(Ordering::Relaxed)]
         .as_ref()
         .and_then(|p| p.wake_at)
+}
+
+/// Re-arm the timer in `slot` after its event was DELIVERED. Called from
+/// the harvest loop, never from the readiness test: re-arming inside
+/// `kq_timer_ready` would reset the deadline before the event was ever
+/// reported, so a caller that parks would be woken by a timer that had
+/// already been accounted for and would never see it. Re-armed from NOW,
+/// not from the old deadline, so a caller that slept for many periods gets
+/// one event rather than a burst of catch-ups.
+pub fn kq_timer_fired(slot: usize) {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let now = arch_timer_now();
+    if let Some(p) = table()[cur].as_mut() {
+        if let Some(k) = p.kregs.get_mut(slot) {
+            if k.filter == EVFILT_TIMER {
+                k.timer_at = now;
+            }
+        }
+    }
+}
+
+/// Earliest pending EVFILT_TIMER deadline for the current process, as an
+/// absolute tick. Used to cap how long kevent parks: a timer that is due
+/// sooner than the caller's timeout must be able to wake it.
+pub fn kq_next_timer() -> Option<u64> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let p = table()[cur].as_ref()?;
+    let now = arch_timer_now();
+    p.kregs
+        .iter()
+        .filter(|k| k.filter == EVFILT_TIMER && k.flags & EV_DISABLE == 0)
+        .map(|k| k.timer_at.saturating_add(k.timer_period).max(now))
+        .min()
 }
 
 /// Wake sleepers whose deadline expired (timer IRQ path).
@@ -1829,6 +1866,14 @@ pub struct Kevent {
     pub flags: u32,
     pub fflags: u32,
     pub udata: u64,
+    /// For EVFILT_TIMER: the absolute tick at which this timer last
+    /// delivered. Zero when never delivered. Kept apart from `vseq`,
+    /// which is the generation counter for the vnode/proc/signal filters
+    /// -- overloading one field for two different clocks is how a timer
+    /// ends up comparing against a note sequence.
+    pub timer_at: u64,
+    /// For EVFILT_TIMER: period in ticks. 0 means one-shot already fired.
+    pub timer_period: u64,
 }
 
 /// EVFILT_READ / EVFILT_WRITE (sys/sys/event.h).
@@ -1838,6 +1883,14 @@ pub const EVFILT_AIO: u32 = 2;
 pub const EVFILT_VNODE: u32 = 3;
 pub const EVFILT_PROC: u32 = 4;
 pub const EVFILT_SIGNAL: u32 = 5;
+pub const EVFILT_TIMER: u32 = 6;
+
+/// A `Kevent` with this filter is a DEAD slot left behind by a one-shot
+/// timer or a removed registration. Slots must keep their index: a timer
+/// is addressed by position, so compacting the list would silently
+/// re-point every later timer at the wrong entry. Dead entries are
+/// skipped at harvest and cannot be re-added to.
+pub const EVFILT_DEAD: u32 = 0xffff_ffff;
 
 // NOTE_* for EVFILT_PROC (sys/sys/event.h). These are distinct values from
 // the vnode notes -- NOTE_EXEC is 0x20000000 here and there is no vnode
@@ -2131,6 +2184,72 @@ pub fn sig_clear(sig: u64) {
     if let Some(e) = sigevents().get_mut(sig as usize) {
         e.pending = false;
     }
+}
+
+/// Units for EVFILT_TIMER, carried in fflags, not in data
+/// (sys/sys/event.h). NOTE_MSECONDS is the HISTORICAL value 0, so a
+/// caller that passes fflags == 0 gets MILLISECONDS, not "no unit" --
+/// this is the one filter where zero is a real selector.
+pub const NOTE_MSECONDS: u32 = 0x0000_0000;
+pub const NOTE_SECONDS: u32 = 0x0000_0001;
+pub const NOTE_USECONDS: u32 = 0x0000_0002;
+pub const NOTE_NSECONDS: u32 = 0x0000_0003;
+pub const NOTE_TIMER_UNITMASK: u32 = 0x0000_0003;
+pub const NOTE_ABSTIME: u32 = 0x0000_0010;
+
+/// One EVFILT_TIMER registration. NetBSD keys timers on a knote slot, not
+/// on an ident, because `data` is the timeout -- the caller may register
+/// any number of them and each is independent. A registration here is
+/// therefore identified by its index in `kregs`, which `slot` carries.
+/// Convert nanoseconds to `arch_timer_now()` units.
+///
+/// `arch_timer_now()` is a SOFTWARE tick counter incremented once per
+/// timer IRQ (`arch::timer::on_tick` does `TICKS.fetch_add(1)`), so it
+/// runs at `arch_timer_hz()` -- 100 Hz -- and NOT at the 62.5 MHz
+/// CNTFRQ. Reading CNTFRQ here instead made every period ~625000x too
+/// long: a 20 ms timer was scheduled 1.25 million ticks out, which at
+/// 100 ticks/s is three and a half hours, so it could never fire.
+///
+/// Every other deadline in this kernel (sleep, ppoll, setitimer) is
+/// already in these units, so EVFILT_TIMER must be too.
+pub fn ticks_for_nanos(nanos: u64) -> u64 {
+    let hz = arch_timer_hz().max(1) as u128;
+    let ticks = (nanos as u128 * hz / 1_000_000_000) as u64;
+    // A sub-tick timeout still has to be able to fire, so clamp UP to one
+    // tick rather than refusing it.
+    ticks.max(1)
+}
+
+pub fn timer_period_ticks(data: u64, units: u32) -> Option<u64> {
+    let nanos = match units & NOTE_TIMER_UNITMASK {
+        NOTE_SECONDS => data.checked_mul(1_000_000_000)?,
+        NOTE_MSECONDS => data.checked_mul(1_000_000)?,
+        NOTE_USECONDS => data.checked_mul(1_000)?,
+        NOTE_NSECONDS => data,
+        _ => return None,
+    };
+    // `arch_timer_now()` counts CNTFRQ ticks -- 62.5 MHz on this board --
+    // NOT IRQ ticks. `arch_timer_hz()` is the 100 Hz IRQ rate, so dividing
+    // by it produced a period ~625000x too long: a 30 ms timer came out
+    // as nearly 5 seconds. Convert through the counter frequency.
+    // NetBSD refuses a zero period but clamps a sub-resolution one to a
+    // single tick -- a timer must always be able to fire.
+    Some(ticks_for_nanos(nanos))
+}
+
+
+/// Is the EVFILT_TIMER registration at `slot` ready?
+pub fn kq_timer_ready(slot: usize) -> Option<u64> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let regs = table()[cur].as_ref()?.kregs.get(slot)?;
+    if regs.filter != EVFILT_TIMER || regs.flags & EV_DISABLE != 0 {
+        return None;
+    }
+    let now = arch_timer_now();
+    if now.saturating_sub(regs.timer_at) < regs.timer_period {
+        return None;
+    }
+    Some(now)
 }
 
 /// Is the current process holding an enabled EVFILT_SIGNAL knote for

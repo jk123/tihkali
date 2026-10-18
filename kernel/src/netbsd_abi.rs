@@ -262,6 +262,116 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         let Some(k) = ke_read(addr) else {
             return Io::Err(14);
         };
+        if k.filter == crate::proc::EVFILT_TIMER {
+            let _ = addr;
+            // EVFILT_TIMER is keyed on a knote SLOT, not on ident/data:
+            // the timeout is carried in `data`, so a caller may register
+            // any number of independent timers. Each EV_ADD appends a new
+            // one; EV_DELETE names the slot in `ident`.
+            let slot = k.ident as usize;
+            match k.flags & (crate::proc::EV_ADD | crate::proc::EV_ENABLE) {
+                _ if k.flags & crate::proc::EV_DELETE != 0 => {
+                    let regs = crate::proc::kq_regs();
+                    // ENOENT covers both "no such slot" and "that slot is
+                    // not a live timer" (a tombstone from a fired one-shot,
+                    // or another filter's registration). A tombstone is
+                    // already deleted, so deleting it again is ENOENT --
+                    // there is nothing there to remove.
+                    if slot >= regs.len() || regs[slot].filter != crate::proc::EVFILT_TIMER {
+                        return Io::Err(2); // ENOENT
+                    }
+                    regs[slot].filter = crate::proc::EVFILT_DEAD;
+                    continue;
+                }
+                0 if k.flags & crate::proc::EV_DISABLE != 0 => {
+                    let regs = crate::proc::kq_regs();
+                    if slot >= regs.len() || regs[slot].filter != crate::proc::EVFILT_TIMER {
+                        return Io::Err(2);
+                    }
+                    regs[slot].flags |= crate::proc::EV_DISABLE;
+                    continue;
+                }
+                0 => return Io::Err(22), // EINVAL: no action flag
+                _ => {}
+            }
+            // Units live in fflags, and the UNITMASK is validated against
+            // the whole allowed set: a stray bit is EINVAL, not silently
+            // reinterpreted as milliseconds.
+            if k.fflags & !(crate::proc::NOTE_TIMER_UNITMASK | crate::proc::NOTE_ABSTIME) != 0 {
+                return Io::Err(22);
+            }
+            // NOTE_ABSTIME is a legal flag bit and is accepted as such
+            // above, but resolving it needs a clock distinct from the tick
+            // counter this kernel times everything against. Refuse it
+            // rather than quietly treating an absolute deadline as a
+            // relative one, which would fire at the wrong moment.
+            if k.fflags & crate::proc::NOTE_ABSTIME != 0 {
+                return Io::Err(22);
+            }
+            match k.fflags & crate::proc::NOTE_TIMER_UNITMASK {
+                crate::proc::NOTE_SECONDS
+                | crate::proc::NOTE_MSECONDS
+                | crate::proc::NOTE_USECONDS
+                | crate::proc::NOTE_NSECONDS => {}
+                _ => return Io::Err(22),
+            }
+            // `ident` is the SLOT, and a fresh append is legitimately slot
+            // 0 -- refusing ident 0 refused every registration. It is
+            // `data` (the timeout) that must be non-zero: NetBSD returns
+            // EINVAL when the value under-ticks to zero, because a timer
+            // that can never fire is not a timer.
+            if k.data <= 0 {
+                return Io::Err(22);
+            }
+            let Some(period) = crate::proc::timer_period_ticks(k.data.unsigned_abs(), k.fflags) else {
+                return Io::Err(22);
+            };
+            // A relative timer cannot repeat with EV_CLEAR cleared -- NetBSD
+            // forces EV_CLEAR on for them, and a level-triggered repeating
+            // timer would make kevent spin.
+            let mut flags = k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_DISABLE);
+            if k.flags & crate::proc::EV_ONESHOT == 0 {
+                flags |= crate::proc::EV_CLEAR;
+            }
+            let r = crate::proc::Kevent {
+                ident: 0,
+                vseq: 0,
+                filter: crate::proc::EVFILT_TIMER,
+                flags,
+                fflags: k.fflags,
+                udata: k.udata,
+                timer_at: crate::proc::arch_timer_now(),
+                timer_period: period,
+            };
+            let regs = crate::proc::kq_regs();
+            if regs.len() >= crate::proc::KQUEUE_MAX {
+                return Io::Err(24); // EMFILE
+            }
+            if k.flags & crate::proc::EV_ENABLE != 0 && slot < regs.len() {
+                // Re-arm an existing timer in place.
+                regs[slot] = r;
+                continue;
+            }
+            // Reuse a tombstone if there is one, so the slot space does not
+            // grow without bound in a long poll loop that keeps arming
+            // one-shot timers.
+            let at = match regs.iter().position(|x| x.filter == crate::proc::EVFILT_DEAD) {
+                Some(i) => { regs[i] = r; i }
+                None => { regs.push(r); regs.len() - 1 }
+            };
+            // Hand the slot number back to the caller in `data`. A
+            // slot-keyed registration the caller cannot name is unusable:
+            // appends reuse tombstones, so the slot a timer lands on is
+            // NOT the caller's `ident` and is not predictable.
+            // `data` is (u32-index) 3, the same expression ke_read and
+            // ke_write already use -- hand-counting the byte offset put
+            // this at 20, which is fflags, and the caller then read back
+            // its own unslotted value.
+            unsafe {
+                (addr as *mut i64).add(3).write_unaligned(at as i64);
+            }
+            continue;
+        }
         if k.filter == crate::proc::EVFILT_SIGNAL {
             // EVFILT_SIGNAL watches a SIGNAL NUMBER on the calling process.
             // fflags carries no note bits: the note IS the signal, and it
@@ -313,6 +423,8 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                 flags: 0,
                 fflags: k.fflags,
                 udata: k.udata,
+                timer_at: 0,
+                timer_period: 0,
             };
             if k.flags & crate::proc::EV_DISABLE != 0 {
                 r.flags |= crate::proc::EV_DISABLE;
@@ -382,6 +494,8 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                 },
                 fflags: k.fflags,
                 udata: k.udata,
+                timer_at: 0,
+                timer_period: 0,
             };
             r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
             if let Err(e) = crate::proc::kq_add(r) {
@@ -400,6 +514,7 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
             && !is_vnode
             && k.filter != crate::proc::EVFILT_PROC
             && k.filter != crate::proc::EVFILT_SIGNAL
+            && k.filter != crate::proc::EVFILT_TIMER
         {
             if k.filter == crate::proc::EVFILT_AIO {
                 return Io::Err(38); // ENOSYS: no aio subsystem to attach to
@@ -474,6 +589,8 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                         },
                         fflags: k.fflags,
                         udata: k.udata,
+                        timer_at: 0,
+                        timer_period: 0,
                     };
                     r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
                     if let Err(e) = crate::proc::kq_add(r) {
@@ -510,6 +627,8 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                 },
                 fflags: k.fflags,
                 udata: k.udata,
+                timer_at: 0,
+                timer_period: 0,
             };
             r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
             if let Err(e) = crate::proc::kq_add(r) {
@@ -530,15 +649,25 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
     #[cfg(feature = "net")]
     crate::net::poll_tick();
 
+
+    // If a previous park already expired, the timer IRQ woke us and `svc`
+    // re-executed this call. Consume the stale deadline BEFORE the harvest
+    // so the re-entry is reported by the harvest rather than re-parked --
+    // re-parking on an expired deadline is an infinite sleep/wake loop.
+    let woke = crate::proc::deadline_passed();
+
     let mut n = 0u64;
     let regs = crate::proc::kq_regs();
     let mut keep: alloc::vec::Vec<crate::proc::Kevent> = alloc::vec::Vec::new();
-    for r in regs.iter() {
+    // Enumerated because EVFILT_TIMER is keyed by knote SLOT: its `data`
+    // is the timeout, so a caller cannot be told which timer fired by
+    // matching on `ident`.
+    for (slot, r) in regs.iter().enumerate() {
         if n >= nevents {
             keep.push(*r);
             continue;
         }
-        if r.flags & crate::proc::EV_DISABLE != 0 {
+        if r.filter == crate::proc::EVFILT_DEAD || r.flags & crate::proc::EV_DISABLE != 0 {
             keep.push(*r);
             continue;
         }
@@ -551,6 +680,10 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
             crate::proc::kq_proc_ready(r).map(|(notes, child)| (notes, child as i64))
         } else if r.filter == crate::proc::EVFILT_SIGNAL {
             crate::proc::kq_sig_ready(r).map(|sig| (0u32, sig as i64))
+        } else if r.filter == crate::proc::EVFILT_TIMER {
+            // Slot-keyed: the caller needs `data` to count firings, so the
+            // slot index is resolved by position, not by `ident`.
+            crate::proc::kq_timer_ready(slot).map(|fired| (0u32, fired as i64))
         } else {
             ke_ready(r).map(|nbytes| (0u32, nbytes))
         };
@@ -575,7 +708,29 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                     if is_vn || is_pp { notes } else { r.fflags },
                 );
                 n += 1;
+                if r.filter == crate::proc::EVFILT_TIMER {
+                    // Re-arm only AFTER the event is written out.
+                    if r.flags & crate::proc::EV_ONESHOT == 0 {
+                        crate::proc::kq_timer_fired(slot);
+                    }
+                }
                 let is_sig = r.filter == crate::proc::EVFILT_SIGNAL;
+                if r.filter == crate::proc::EVFILT_TIMER {
+                    // Handled entirely above; a timer has no generation to
+                    // re-base. A fired one-shot leaves a TOMBSTONE rather
+                    // than being removed: slots are addressed by index, so
+                    // compacting the list would re-point every later timer
+                    // at the wrong registration.
+                    if r.flags & crate::proc::EV_ONESHOT != 0 {
+                        keep.push(crate::proc::Kevent {
+                            filter: crate::proc::EVFILT_DEAD,
+                            ..*r
+                        });
+                    } else {
+                        keep.push(*r);
+                    }
+                    continue;
+                }
                 if is_vn || is_pp || is_sig {
                     // Re-base the registration's generation so the next
                     // call reports only what happens after this one, then
@@ -609,6 +764,11 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         crate::proc::deadline_clear();
         return Io::Val(n as i64);
     }
+    if woke {
+        // The park expired with nothing ready. Report the timeout, which
+        // is what kevent(2) is required to do.
+        return Io::Val(0);
+    }
     if crate::proc::has_deliverable() {
         crate::proc::deadline_clear();
         return Io::Err(4); // EINTR
@@ -637,13 +797,40 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         if sec == 0 && nsec == 0 {
             return Io::Val(0); // pure poll
         }
-        let ms = (sec as u64).saturating_mul(1000) + (nsec as u64) / 1_000_000;
-        let at = crate::arch::timer::now().saturating_add(ms);
+        // `now()` counts CNTFRQ ticks (62.5 MHz), NOT milliseconds. The
+        // old `now + ms` therefore turned a 2s timeout into 2000 ticks --
+        // 32 microseconds -- and made every comparison against an
+        // EVFILT_TIMER deadline meaningless, because the two were in
+        // different units. Convert the timespec through the counter
+        // frequency, exactly as `timer_period_ticks` does.
+        let nanos = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((nsec as u64) / 1_000);
+        let at = crate::arch::timer::now()
+            .saturating_add(crate::proc::ticks_for_nanos(nanos));
+        // An EVFILT_TIMER is a WAKEUP SOURCE, not something the caller has
+        // to poll for: kevent must return when the timer expires even if
+        // the caller's own timeout is far longer. Sleeping the full
+        // timespec would make a 20ms timer invisible to a 1s poll -- and a
+        // caller that asked to be told about a timer cannot be expected to
+        // busy-poll for it.
+        // Park until whichever comes first: the caller's own deadline or
+        // the next EVFILT_TIMER. The timer cap is what makes a timer a
+        // WAKEUP SOURCE rather than something the caller must poll for.
+        let at = match crate::proc::kq_next_timer() {
+            Some(t) if t < at => t,
+            _ => at,
+        };
         crate::proc::sleep_timed(frame, at);
         return Io::Slept;
     }
+    // An indefinite park still has to end when a timer expires.
+    let at = crate::proc::kq_next_timer();
     crate::proc::deadline_clear();
-    crate::proc::sleep_current(frame);
+    match at {
+        Some(t) => crate::proc::sleep_timed(frame, t),
+        None => crate::proc::sleep_current(frame),
+    }
     Io::Slept
 }
 
