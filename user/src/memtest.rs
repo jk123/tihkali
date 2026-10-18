@@ -289,6 +289,41 @@ pub extern "C" fn _start() -> ! {
             let pbad = unsafe { mmap(0, PAGE, PROT_READ | 0x40, MAP_ANON, -1, 0) };
             check("bad prot EINVAL", pbad.is_err());
 
+            // 3b. mprotect must not be a silent no-op on a range nobody
+            // mapped. It walks present PTEs, finds none, and would
+            // return success -- a change that never happened, reported
+            // as one that did. ENOMEM is the answer a caller can act on.
+            let bogus = unsafe { mprotect(0x1000_1000, PAGE, PROT_READ | PROT_WRITE) };
+            check("mprotect unmapped ENOMEM", bogus.is_err());
+
+            // 3c. mprotect spanning TWO adjacent mappings must protect
+            // both. The bookkeeping splits each recorded range, and a
+            // mapping starting above `addr` is the case a naive
+            // range-overlap test gets wrong.
+            let m1 = unsafe { mmap(0, PAGE * 2, PROT_READ | PROT_WRITE, MAP_ANON, -1, 0) };
+            let m2 = unsafe { mmap(0, PAGE * 2, PROT_READ | PROT_WRITE, MAP_ANON, -1, 0) };
+            if let (Ok(x), Ok(y)) = (m1, m2) {
+                check("two maps", x != y);
+                // Drop the SECOND mapping's first page, not the first's.
+                check("mprotect across two", unsafe {
+                    mprotect(y, PAGE, PROT_NONE)
+                }.is_ok());
+                let child = unsafe { fork() };
+                if child == 0 {
+                    // Each child proves one page. Written as two
+                    // children because a fault kills the process.
+                    unsafe { (y as *mut u64).write(1) };
+                    unsafe { exit(0) }
+                }
+                let mut st: i32 = 0;
+                let _ = unsafe { wait4(child, &mut st) };
+                check("second map protected", st != 0);
+                let _ = unsafe { munmap(x, PAGE * 2) };
+                let _ = unsafe { munmap(y, PAGE * 2) };
+            } else {
+                check("two maps", false);
+            }
+
             // 4. Advice-only calls must succeed.
             check("madvise", unsafe { madvise(base, PAGE, 0) }.is_ok());
             check("msync", unsafe { msync(base, PAGE) }.is_ok());

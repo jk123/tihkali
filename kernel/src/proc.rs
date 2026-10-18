@@ -1709,33 +1709,55 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> Result<(), u8> {
     if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) as u64 != prot {
         return Err(EINVAL);
     }
+    let start = addr & !0xfff;
+    let end = (addr + len + 0xfff) & !0xfff;
     // `vm::set_perms` only rewrites PTEs that are already present, and
     // this kernel demand-pages -- so a page mprotect has not yet
     // materialised would come back with the prot mmap recorded for it.
     // Overwrite the recorded range so a later fault agrees with mprotect.
     let cur = CURRENT.load(Ordering::Relaxed);
     if let Some(p) = table()[cur].as_mut() {
-        let start = addr & !0xfff;
-        let end = (addr + len + 0xfff) & !0xfff;
         let mut merged: Vec<(u64, u64, u32)> = Vec::new();
         for (base, rng, old) in p.mmap_perms.drain(..) {
-            // Keep the part below the range and above it untouched; only
-            // the intersection takes the new prot.
-            if rng <= start || base >= end {
+            let hi = base + rng;
+            // Disjoint: keep the whole mapping as it was. Comparing the
+            // mapping's END ADDRESS against `start` matters -- comparing
+            // its LENGTH silently skipped any mapping that happened to
+            // start above `addr`, leaving it unprotected.
+            if hi <= start || base >= end {
                 merged.push((base, rng, old));
                 continue;
             }
             if base < start {
                 merged.push((base, start - base, old));
             }
-            merged.push((start.max(base), end.min(base + rng) - start.max(base), prot as u32));
-            if base + rng > end {
-                merged.push((end, base + rng - end, old));
+            merged.push((base.max(start), hi.min(end) - base.max(start), prot as u32));
+            if hi > end {
+                merged.push((end, hi - end, old));
             }
         }
         p.mmap_perms = merged;
     }
+    // Every page in the range must belong to a mapping we hold a record
+    // of. Without this, mprotect on an address nobody mapped walks no
+    // present PTE, changes nothing, and returns success -- a silent
+    // no-op the caller cannot detect.
+    if !covers_range(start, end) {
+        return Err(ENOMEM);
+    }
     vm::set_perms(ttbr, addr, len, prot as u32).map_err(|_| EINVAL)
+}
+
+/// Whether `mmap_perms` covers every page of [start, end).
+fn covers_range(start: u64, end: u64) -> bool {
+    let mut va = start;
+    while va < end {
+        if arena_prot(va).is_none() {
+            return false;
+        }
+        va += 0x1000;
+    }
+    true
 }
 
 // ---------- pipes / dup3 / misc (Linux personality entry points) ----------

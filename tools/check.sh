@@ -521,6 +521,14 @@ gate_has   "s21: prot_read enforced" "$S21" 'memtest: ok   prot_read enforced'
 gate_has   "s21: prot_read munmap" "$S21" 'memtest: ok   prot_read munmap'
 gate_has   "s21: prot_none refused" "$S21" 'memtest: ok   prot_none refused'
 gate_has   "s21: bad prot EINVAL"  "$S21" 'memtest: ok   bad prot EINVAL'
+# mprotect on a range nobody mapped walks no present PTE and would
+# return success -- a change that never happened. ENOMEM is actionable.
+gate_has   "s21: mprotect unmapped" "$S21" 'memtest: ok   mprotect unmapped ENOMEM'
+# The record is split per mapping; a mapping starting ABOVE addr is the
+# case a naive range-overlap test skips, leaving it unprotected.
+gate_has   "s21: two maps"         "$S21" 'memtest: ok   two maps'
+gate_has   "s21: mprotect across"  "$S21" 'memtest: ok   mprotect across two'
+gate_has   "s21: second protected" "$S21" 'memtest: ok   second map protected'
 gate_has   "s21: munmap region"    "$S21" 'memtest: ok   munmap region'
 gate_has   "s21: second mmap"      "$S21" 'memtest: ok   second mmap'
 gate_has   "s21: munmap"           "$S21" 'memtest: ok   munmap'
