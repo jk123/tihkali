@@ -214,7 +214,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             } else if frame.x[0] != 0 {
                 (-1, 22) // EINVAL: MAP_FIXED-style hint requests unsupported
             } else {
-                match crate::proc::sys_mmap(frame.x[1]) {
+                match crate::proc::sys_mmap(frame.x[1], frame.x[2] as u32) {
                     Ok(base) => (base as i64, 0),
                     Err(e) => (-1, e),
                 }

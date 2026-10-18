@@ -138,6 +138,46 @@ unsafe fn msync(addr: i64, len: i64) -> Result<(), i64> {
     }
 }
 
+/// NetBSD `fork()` = 2. A child continues in the same address space, so
+/// it must exit before reaching any further assertion -- see the
+/// forked-child trap in the kqueue phases.
+unsafe fn fork() -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "svc #2",
+            inlateout("x0") 0i64 => ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// NetBSD `wait4` = **449** (`WAIT4__2`), blocking -- not 7, which is the
+/// obsolete compat entry the kernel does not dispatch. Blocking is what
+/// yields the CPU on a single core; a WNOHANG spin would starve the very
+/// child being waited for.
+unsafe fn wait4(pid: i64, status: &mut i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "svc #449",
+            inlateout("x0") pid => ret,
+            in("x1") status as *mut i32 as i64,
+            in("x2") 0i64,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// NetBSD `exit(code)` = 1. Does not return.
+unsafe fn exit(code: i64) -> ! {
+    unsafe {
+        asm!("svc #1", in("x0") code, options(nostack, noreturn));
+    }
+}
+
 unsafe fn write(fd: i64, buf: &[u8]) {
     let ret: i64;
     unsafe {
@@ -204,6 +244,50 @@ pub extern "C" fn _start() -> ! {
                 let p = base as *mut u64;
                 check("still writable", p.read() == 0x5a5a_5a5a_5a5a_5a5a);
             }
+
+            // 3a. PROT_* must be REAL, not advisory. The pages are
+            // demand-paged, so a kernel that ignored `prot` would hand
+            // back a fully read-write mapping and `mprotect`'s read-only
+            // flag would have nothing to protect. mmap'ing PROT_READ and
+            // writing to it must fault; the same page after mprotect to
+            // read-write must not.
+            let ro = unsafe { mmap(0, PAGE, PROT_READ, MAP_ANON, -1, 0) };
+            if let Ok(robase) = ro {
+                // Reading is always allowed.
+                check("prot_read readable", unsafe { (robase as *const u64).read() } == 0);
+                // Writing must NOT be allowed. A fault here kills the
+                // probe, so the check is done from a child process and
+                // the parent infers the outcome from its exit status.
+                let child = unsafe { fork() };
+                if child == 0 {
+                    unsafe {
+                        (robase as *mut u64).write(1);
+                    }
+                    // Reaching here means the kernel let the write
+                    // through. Exit 0; the parent asserts the opposite.
+                    unsafe { exit(0) }
+                } else {
+                    let mut st: i32 = 0;
+                    let _ = unsafe { wait4(child, &mut st) };
+                    // A clean exit (status 0) proves PROT_READ was
+                    // advisory. A fault puts the signal number in the
+                    // low 7 bits instead.
+                    check("prot_read enforced", st != 0);
+                }
+                check("prot_read munmap", unsafe { munmap(robase, PAGE) }.is_ok());
+            } else {
+                check("prot_read mapped", false);
+            }
+
+            // PROT_NONE is refused rather than silently upgraded: an
+            // unmapped VA is indistinguishable from one nobody asked for,
+            // so honouring it would consume address space invisibly.
+            let pn = unsafe { mmap(0, PAGE, PROT_NONE, MAP_ANON, -1, 0) };
+            check("prot_none refused", pn.is_err());
+            // A prot with bits outside PROT_* is EINVAL, not "the bits
+            // we understand".
+            let pbad = unsafe { mmap(0, PAGE, PROT_READ | 0x40, MAP_ANON, -1, 0) };
+            check("bad prot EINVAL", pbad.is_err());
 
             // 4. Advice-only calls must succeed.
             check("madvise", unsafe { madvise(base, PAGE, 0) }.is_ok());

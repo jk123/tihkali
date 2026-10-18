@@ -134,7 +134,7 @@ pub fn svc(frame: &mut TrapFrame) {
             if frame.x[3] & MAP_ANONYMOUS == 0 {
                 (0, 78) // ENOSYS (internal code; translated below)
             } else {
-                match proc::sys_mmap(frame.x[1]) {
+                match proc::sys_mmap(frame.x[1], frame.x[2] as u32) {
                     Ok(base) => (base as i64, 0),
                     Err(e) => (0, e),
                 }

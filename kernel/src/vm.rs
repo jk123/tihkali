@@ -72,8 +72,13 @@ pub fn map_page(ttbr: usize, va: usize) -> Result<(), ()> {
     }
     let frame = pmm::alloc().ok_or(())?;
     unsafe { core::ptr::write_bytes(frame as *mut u8, 0, 4096) };
-    let exec_el0 = in_text(va);
-    unsafe { *pte = page_desc(frame, true, exec_el0) };
+    // Apply the PROT_* the caller asked for. A demand-paged page that is
+    // always read-write makes PROT_READ meaningless and gives
+    // mprotect nothing to protect -- the permission has to be baked in at
+    // the moment the page is created.
+    let writable = crate::proc::arena_prot(va as u64).map_or(true, |prot| prot & 2 != 0);
+    let exec_el0 = in_text(va) && crate::proc::arena_prot(va as u64).is_none_or(|prot| prot & 4 != 0);
+    unsafe { *pte = page_desc(frame, writable, exec_el0) };
     mmu::flush_tlb();
     Ok(())
 }
@@ -119,13 +124,28 @@ pub fn handle_fault(ttbr: usize, far: usize, is_write: bool) -> Result<(), &'sta
         return Err("read fault on present page");
     }
 
-    // Write to a read-only page: copy-on-write.
+    // Write to a read-only page. A present RO page is either fork-shared
+    // (refcount > 1 — `share_user_pages` protects BOTH sides) or was
+    // mapped PROT_READ and must stay read-only forever.
     let frame = pte_frame(pte_val);
     if pmm::refcount(frame) == 1 {
-        // Last sharer: just re-enable write.
-        unsafe { *pte = (pte_val & !(AP_RW | AP_RO)) | AP_RW };
-        mmu::flush_tlb();
-        return Ok(());
+        // Last sharer of a fork-shared page: re-enable write in place.
+        // A PROT_READ page also has refcount 1, so refcount alone cannot
+        // tell them apart — ask the recorded mapping. Without this,
+        // PROT_READ is advisory: the first write silently succeeds.
+        if crate::proc::arena_prot(va as u64).is_none_or(|prot| prot & 2 != 0) {
+            unsafe { *pte = (pte_val & !(AP_RW | AP_RO)) | AP_RW };
+            mmu::flush_tlb();
+            return Ok(());
+        }
+        return Err("write to a PROT_READ page");
+    }
+    // Shared with another address space, so the prot recorded for it
+    // decides: a fork-shared PROT_READ page must not become writable just
+    // because a copy is being made.
+    let prot = crate::proc::arena_prot(va as u64);
+    if prot.is_some_and(|p| p & 2 == 0) {
+        return Err("write to a PROT_READ page");
     }
     let new = pmm::alloc().ok_or("out of frames")?;
     unsafe {

@@ -82,6 +82,11 @@ pub struct Process {
     pub brk: u64,
     /// mmap bump pointer (0 = unused); arena = [MMAP_FLOOR, mmap_next).
     pub mmap_next: u64,
+    /// PROT_* requested for each mmap'd range. The pages themselves are
+    /// demand-paged, so the permissions cannot live in the PTEs until the
+    /// first touch -- they are recorded here and applied by
+    /// `vm::map_page` when the page is built.
+    pub mmap_perms: Vec<(u64, u64, u32)>,
     /// Dispositions were installed via the Linux ABI (signal numbers seen
     /// by the handler must be converted back from canonical/NetBSD).
     pub sig_linux: bool,
@@ -196,6 +201,7 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         brk_start: brk,
         brk,
         mmap_next: 0,
+        mmap_perms: Vec::new(),
         sig_linux: false,
         pgrp: 0,
         wake_at: None,
@@ -548,6 +554,12 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         brk_start,
         brk,
         mmap_next,
+        // COPIED, not cleared: these describe the address space the child
+        // just inherited, and `arena_prot` is consulted on the child's
+        // own page-table entries. Clearing them makes a PROT_READ page
+        // look unmapped, and the COW path then hands the child a writable
+        // copy — silently defeating the protection.
+        mmap_perms: t[cur].as_ref().unwrap().mmap_perms.clone(),
         sig_linux,
         pgrp: t[cur].as_ref().unwrap().pgrp, // children share the group
         wake_at: None,
@@ -1590,6 +1602,21 @@ fn install_handler_frame(frame: &mut TrapFrame, sig: usize, handler: usize) {
 
 /// (brk, mmap_next) of the running process — consulted by the page-fault
 /// handler to demand-map arena growth in the text window.
+/// PROT_* recorded for the arena page at `va`, or None if it is outside
+/// every mapping. Consulted by `vm::map_page` when it builds a
+/// demand-paged page.
+pub fn arena_prot(va: u64) -> Option<u32> {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    // `table()` is empty until `init` builds pid 0, and `map_page` also
+    // runs for kernel pages before that — indexing would panic. Same
+    // guard as `current_pgrp`.
+    let p = table().get(cur)?.as_ref()?;
+    p.mmap_perms
+        .iter()
+        .find(|(base, len, _)| va >= *base && va < base + len)
+        .map(|(_, _, prot)| *prot)
+}
+
 pub fn current_arenas() -> (u64, u64) {
     let cur = CURRENT.load(Ordering::Relaxed);
     let p = table()[cur].as_ref().expect("no current process");
@@ -1614,9 +1641,29 @@ pub fn sys_brk(addr: u64) -> u64 {
 
 /// Linux mmap(222): anonymous bumps only (v1) — returns the arena base;
 /// pages materialize on first touch via the fault handler.
-pub fn sys_mmap(len: u64) -> Result<u64, u8> {
+/// PROT_* (sys/mman.h). Identical on NetBSD and Linux, which is the rare
+/// case where the two ABIs agree on an encoding.
+pub const PROT_NONE: u32 = 0x0;
+pub const PROT_READ: u32 = 0x1;
+pub const PROT_WRITE: u32 = 0x2;
+pub const PROT_EXEC: u32 = 0x4;
+
+/// Anonymous mapping. `prot` is applied to the new pages, which matters
+/// immediately: demand-paged pages are created on first TOUCH, so without
+/// this a `PROT_READ` mapping is writable from the moment it is returned
+/// and `mprotect`'s read-only flag has nothing to protect.
+pub fn sys_mmap(len: u64, prot: u32) -> Result<u64, u8> {
     let pages = len.checked_add(0xfff).map(|v| v & !0xfff).ok_or(EINVAL)?;
     if pages == 0 {
+        return Err(EINVAL);
+    }
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return Err(EINVAL);
+    }
+    if prot == PROT_NONE {
+        // PROT_NONE is legal but useless to reserve here: an unmapped
+        // VA is not distinguishable from one that was never asked for,
+        // so reserving it would silently consume address space.
         return Err(EINVAL);
     }
     let cur = CURRENT.load(Ordering::Relaxed);
@@ -1631,6 +1678,9 @@ pub fn sys_mmap(len: u64) -> Result<u64, u8> {
         return Err(ENOMEM);
     }
     p.mmap_next = end;
+    // No PTEs yet -- these are demand-paged. Mark the whole range so the
+    // first touch builds the page with the right access permissions.
+    p.mmap_perms.push((base, pages, prot));
     Ok(base)
 }
 
@@ -1655,6 +1705,35 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> Result<(), u8> {
     let ttbr: usize;
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
+    }
+    if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) as u64 != prot {
+        return Err(EINVAL);
+    }
+    // `vm::set_perms` only rewrites PTEs that are already present, and
+    // this kernel demand-pages -- so a page mprotect has not yet
+    // materialised would come back with the prot mmap recorded for it.
+    // Overwrite the recorded range so a later fault agrees with mprotect.
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if let Some(p) = table()[cur].as_mut() {
+        let start = addr & !0xfff;
+        let end = (addr + len + 0xfff) & !0xfff;
+        let mut merged: Vec<(u64, u64, u32)> = Vec::new();
+        for (base, rng, old) in p.mmap_perms.drain(..) {
+            // Keep the part below the range and above it untouched; only
+            // the intersection takes the new prot.
+            if rng <= start || base >= end {
+                merged.push((base, rng, old));
+                continue;
+            }
+            if base < start {
+                merged.push((base, start - base, old));
+            }
+            merged.push((start.max(base), end.min(base + rng) - start.max(base), prot as u32));
+            if base + rng > end {
+                merged.push((end, base + rng - end, old));
+            }
+        }
+        p.mmap_perms = merged;
     }
     vm::set_perms(ttbr, addr, len, prot as u32).map_err(|_| EINVAL)
 }

@@ -512,6 +512,16 @@ gate_has   "s21: mprotect restore" "$S21" 'memtest: ok   mprotect restore'
 gate_has   "s21: madvise"          "$S21" 'memtest: ok   madvise'
 gate_has   "s21: msync"            "$S21" 'memtest: ok   msync'
 gate_has   "s21: still writable"   "$S21" 'memtest: ok   still writable'
+# PROT_* must be REAL, not advisory: the pages are demand-paged, so a
+# prot discarded at mmap time yields a writable mapping. The enforcement
+# check runs in a forked child because a successful write kills nothing --
+# it proves the kernel simply allowed it, so the parent asserts the fault.
+gate_has   "s21: prot_read read"   "$S21" 'memtest: ok   prot_read readable'
+gate_has   "s21: prot_read enforced" "$S21" 'memtest: ok   prot_read enforced'
+gate_has   "s21: prot_read munmap" "$S21" 'memtest: ok   prot_read munmap'
+gate_has   "s21: prot_none refused" "$S21" 'memtest: ok   prot_none refused'
+gate_has   "s21: bad prot EINVAL"  "$S21" 'memtest: ok   bad prot EINVAL'
+gate_has   "s21: munmap region"    "$S21" 'memtest: ok   munmap region'
 gate_has   "s21: second mmap"      "$S21" 'memtest: ok   second mmap'
 gate_has   "s21: munmap"           "$S21" 'memtest: ok   munmap'
 gate_has   "s21: munmap unaligned" "$S21" 'memtest: ok   munmap rejects unaligned'
