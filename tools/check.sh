@@ -976,6 +976,55 @@ gate_count "s29: no unknown syscall" "$S29" 'unknown syscall' 0
 gate_has   "s29: clean exit"      "$S29" 'proc: pid 0 exited \(0\)'
 gate_bad   "s29" "$S29"
 
+echo "== session 31: NetBSD poll/select, sync, itimer, rusage"
+S31="$T/s31.log"
+# poll returning 0 for a caller that asked to WAIT looks like a timeout;
+# select returning a count without rewriting the caller's fd_set leaves it
+# reading its own input bits back as results. Both are silent successes,
+# so the checks read revents and the rewritten sets.
+( sleep 5
+  printf 'synctest\n'; sleep 5
+  printf 'exit\n'; sleep 3
+) | timeout 28 ./tools/run.sh >"$S31" 2>&1
+gate_has   "s31: pipe"            "$S31" 'p2: ok     pipe created'
+gate_has   "s31: poll zero"       "$S31" 'p2: ok     poll zero timeout'
+gate_has   "s31: poll wr ready"   "$S31" 'p2: ok     poll write ready'
+gate_has   "s31: poll rd not"     "$S31" 'p2: ok     poll read not ready'
+gate_has   "s31: poll counted"    "$S31" 'p2: ok     poll counted one'
+gate_has   "s31: poll negfd"      "$S31" 'p2: ok     poll ignores negfd'
+gate_has   "s31: poll negfd noNVAL" "$S31" 'p2: ok     poll negfd no NVAL'
+gate_has   "s31: fd_set size"     "$S31" 'p2: ok     fd_set size'
+gate_has   "s31: select zero"     "$S31" 'p2: ok     select zero timeout'
+gate_has   "s31: select rewrote"  "$S31" 'p2: ok     select rewrote wr'
+gate_has   "s31: select rd empty" "$S31" 'p2: ok     select rd empty'
+gate_has   "s31: select ex empty" "$S31" 'p2: ok     select ex empty'
+gate_has   "s31: select none"     "$S31" 'p2: ok     select none ready'
+gate_has   "s31: fsync"           "$S31" 'p2: ok     fsync on file'
+gate_has   "s31: fdatasync"       "$S31" 'p2: ok     fdatasync on file'
+gate_has   "s31: fsync badfd"     "$S31" 'p2: ok     fsync badfd'
+gate_has   "s31: fdatasync badfd" "$S31" 'p2: ok     fdatasync badfd'
+gate_has   "s31: flock refused"   "$S31" 'p2: ok     flock refused'
+gate_has   "s31: flock unlock"    "$S31" 'p2: ok     flock unlock refused'
+gate_has   "s31: getitimer ok"    "$S31" 'p2: ok     getitimer ok'
+gate_has   "s31: getitimer off"   "$S31" 'p2: ok     getitimer disarmed'
+gate_has   "s31: setitimer arm"   "$S31" 'p2: ok     setitimer armed'
+gate_has   "s31: getitimer arm"   "$S31" 'p2: ok     getitimer armed ok'
+gate_has   "s31: getitimer value" "$S31" 'p2: ok     getitimer armed value'
+gate_has   "s31: getrusage ok"    "$S31" 'p2: ok     getrusage ok'
+gate_has   "s31: getrusage count" "$S31" 'p2: ok     getrusage counted'
+gate_has   "s31: getrusage EINVAL" "$S31" 'p2: ok     getrusage null EINVAL'
+gate_has   "s31: getsid"          "$S31" 'p2: ok     getsid reached'
+gate_has   "s31: getlogin ok"     "$S31" 'p2: ok     getlogin ok'
+gate_has   "s31: getlogin wrote"  "$S31" 'p2: ok     getlogin wrote'
+gate_has   "s31: getlogin small"  "$S31" 'p2: ok     getlogin small EINVAL'
+gate_has   "s31: sigaltstack ref" "$S31" 'p2: ok     sigaltstack refused'
+gate_has   "s31: statfs refused"  "$S31" 'p2: ok     statfs refused'
+gate_has   "s31: all ok"          "$S31" 'p2: all ok'
+gate_has   "s31: exit 0"          "$S31" 'sh: synctest exited 0'
+gate_count "s31: no panic"        "$S31" 'panic' 0
+gate_has   "s31: clean exit"      "$S31" 'proc: pid 0 exited \(0\)'
+gate_bad   "s31" "$S31"
+
 echo "== session 30: NetBSD credentials, groups and process groups"
 S30="$T/s30.log"
 # Every call here was a hardcoded 0 or absent before. A umask that returns

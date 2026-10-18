@@ -173,6 +173,324 @@ fn set_pgid(pid: usize, pgrp: usize) -> (i64, u8) {
     (0, 0)
 }
 
+/// NetBSD poll(209): poll(fds, nfds, timeout_ms). `timeout` is MILLISECONDS
+/// here, not the timespec ppoll takes -- another place the two ABIs differ,
+/// and mixing them up turns a 2-second wait into 2 ticks.
+///
+/// Returns `Io::Slept` when it parks, so the syscall RE-EXECUTES on wake
+/// and the whole loop is re-sampled. A poll that returned "nothing ready"
+/// for a timeout it was asked to honour would be a silent failure: the
+/// caller would treat it as a real answer.
+fn netbsd_poll(frame: &mut TrapFrame, fds: u64, nfds: usize, timeout_ms: i64) -> crate::proc::Io {
+    if nfds > 64 {
+        return crate::proc::Io::Err(22); // EINVAL
+    }
+    let bytes = nfds * 8;
+    if bytes != 0 && !crate::proc::user_range_ok(fds, bytes) {
+        return crate::proc::Io::Err(14); // EFAULT
+    }
+    // Service the NIC once before sampling: a datagram that has landed but
+    // not yet been queued reads as "not ready" and the caller sleeps
+    // straight through its arrival.
+    #[cfg(feature = "net")]
+    crate::net::poll_tick();
+    let mut nready = 0usize;
+    for i in 0..nfds {
+        let base = (fds + (i as u64) * 8) as usize;
+        let fd = unsafe { *((base) as *const i32) };
+        let events = unsafe { *((base + 4) as *const u16) };
+        let revents = crate::linux_abi::poll_revents(fd, events);
+        unsafe { *((base + 6) as *mut u16) = revents };
+        if revents != 0 {
+            nready += 1;
+        }
+    }
+    if nready > 0 {
+        crate::proc::deadline_clear();
+        return crate::proc::Io::Val(nready as i64);
+    }
+    if crate::proc::has_deliverable() {
+        crate::proc::deadline_clear();
+        return crate::proc::Io::Err(crate::file::EINTR);
+    }
+    if timeout_ms == 0 {
+        crate::proc::deadline_clear();
+        return crate::proc::Io::Val(0);
+    }
+    if timeout_ms < 0 {
+        crate::proc::deadline_clear();
+        crate::proc::sleep_current(frame);
+        return crate::proc::Io::Slept;
+    }
+    // Arm an absolute deadline ONCE and keep it across re-entries, so the
+    // many spurious wakes an event-driven poll receives cannot push the
+    // timeout out indefinitely.
+    if !crate::proc::deadline_passed() {
+        if !crate::proc::deadline_pending() {
+            let ticks = crate::proc::ticks_for_nanos((timeout_ms as u64) * 1_000_000);
+            crate::proc::sleep_timed(frame, crate::arch::timer::now() + ticks);
+            return crate::proc::Io::Slept;
+        }
+    }
+    // Deadline reached with nothing ready: a real, timed-out answer.
+    crate::proc::deadline_clear();
+    crate::proc::Io::Val(0)
+}
+
+/// NetBSD select(417)/pselect(436).
+///
+/// `fd_set` is FD_SETSIZE=256 bits with NFDBITS=32, i.e. an array of EIGHT
+/// 32-bit words (32 bytes), indexed `fds_bits[n >> 5]` with bit `n & 31`
+/// -- read from sys/fd_set.h, not assumed from Linux, which uses NFDBITS=64.
+/// `nd` is the HIGHEST fd + 1, and may exceed 256, in which case the extra
+/// bits simply cannot be represented.
+///
+/// select's contract is to REWRITE the three sets in the caller's memory
+/// with only the ready fds. Returning a count without doing that would be a
+/// silent failure: the caller then reads garbage out of its own buffers.
+fn netbsd_select(
+    frame: &mut TrapFrame,
+    nd: i64,
+    in_set: u64,
+    out_set: u64,
+    ex_set: u64,
+    timeout: u64,
+) -> crate::proc::Io {
+    use crate::linux_abi::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
+    // FD_SETSIZE is 256, so the set is exactly eight 32-bit words and the
+    // per-set access below is the whole struct -- there is no tail to miss.
+    const NFDBITS: u64 = 32;
+    if nd < 0 {
+        return crate::proc::Io::Err(22); // EINVAL
+    }
+    if nd > 1024 {
+        // Beyond any representable set; EINVAL is what upstream does for a
+        // negative or absurdly large nfds.
+        return crate::proc::Io::Err(22);
+    }
+    // The whole set is read and written, so all 8 words must be in range.
+    for set in [in_set, out_set, ex_set] {
+        if set != 0 && !crate::proc::user_range_ok(set, 32) {
+            return crate::proc::Io::Err(14); // EFAULT
+        }
+    }
+    #[cfg(feature = "net")]
+    crate::net::poll_tick();
+
+    // Snapshot the three masks and compute readiness before mutating the
+    // caller's buffers, so an input set is not clobbered while still being
+    // read for the later sets.
+    let mut snapshot = [0u32; 8];
+    for k in 0..8usize {
+        let mut w = 0u32;
+        if in_set != 0 {
+            unsafe { w |= *((in_set as usize + k * 4) as *const u32) };
+        }
+        snapshot[k] = w;
+    }
+    let mut rmask = [0u32; 8];
+    let mut wmask = [0u32; 8];
+    let mut emask = [0u32; 8];
+    let mut nready = 0i64;
+    for fd in 0..nd {
+        let word = (fd as u64 / NFDBITS) as usize;
+        let bit = 1u32 << (fd as u64 % NFDBITS);
+        if word >= 8 {
+            break;
+        }
+        let want_in = snapshot[word] & bit != 0;
+        let want_out = if out_set != 0 {
+            unsafe { *((out_set as usize + word * 4) as *const u32) & bit != 0 }
+        } else {
+            false
+        };
+        let want_ex = if ex_set != 0 {
+            unsafe { *((ex_set as usize + word * 4) as *const u32) & bit != 0 }
+        } else {
+            false
+        };
+        if !want_in && !want_out && !want_ex {
+            continue;
+        }
+        let mut events = 0u16;
+        if want_in {
+            events |= POLLIN;
+        }
+        if want_out {
+            events |= POLLOUT;
+        }
+        let revents = crate::linux_abi::poll_revents(fd as i32, events);
+        let ready_in = (revents & (POLLIN | POLLHUP | POLLERR)) as u32;
+        let ready_out = (revents & (POLLOUT | POLLERR)) as u32;
+        // An exceptional condition is reported in BOTH the exceptional set
+        // and the exceptional bits of read/write, per POSIX.
+        let ready_ex = (revents & (POLLERR | POLLNVAL | POLLHUP)) as u32;
+        if ready_in != 0 {
+            rmask[word] |= bit;
+        }
+        if ready_out != 0 {
+            wmask[word] |= bit;
+        }
+        if ready_ex != 0 {
+            emask[word] |= bit;
+        }
+        if ready_in != 0 || ready_out != 0 || ready_ex != 0 {
+            nready += 1;
+        }
+    }
+
+    // A set pointer of NULL means "do not report this set" -- leave it
+    // alone rather than writing to address 0.
+    if in_set != 0 {
+        for k in 0..8usize {
+            unsafe { *((in_set as usize + k * 4) as *mut u32) = rmask[k] };
+        }
+    }
+    if out_set != 0 {
+        for k in 0..8usize {
+            unsafe { *((out_set as usize + k * 4) as *mut u32) = wmask[k] };
+        }
+    }
+    if ex_set != 0 {
+        for k in 0..8usize {
+            unsafe { *((ex_set as usize + k * 4) as *mut u32) = emask[k] };
+        }
+    }
+
+    if nready > 0 {
+        crate::proc::deadline_clear();
+        return crate::proc::Io::Val(nready);
+    }
+    if crate::proc::has_deliverable() {
+        crate::proc::deadline_clear();
+        return crate::proc::Io::Err(crate::file::EINTR);
+    }
+    if timeout == 0 {
+        crate::proc::deadline_clear();
+        return crate::proc::Io::Val(0);
+    }
+    if !crate::proc::deadline_pending() {
+        // {seconds, fraction}: timeval's fraction is MICROseconds,
+        // timespec's is NANOSECONDS. pselect passes timespec, so scale by
+        // 1000 -- reading a timespec's nanoseconds as microseconds would
+        // make every pselect timeout 1000x too short.
+        let (sec, frac) = unsafe {
+            (
+                *((timeout) as *const i64),
+                *((timeout + 8) as *const i64),
+            )
+        };
+        if sec < 0 || frac < 0 {
+            crate::proc::deadline_clear();
+            return crate::proc::Io::Err(22);
+        }
+        let nanos = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((frac as u64).saturating_mul(1_000));
+        let ticks = crate::proc::ticks_for_nanos(nanos);
+        crate::proc::sleep_timed(frame, crate::arch::timer::now() + ticks);
+        return crate::proc::Io::Slept;
+    }
+    if crate::proc::deadline_passed() {
+        crate::proc::deadline_clear();
+        return crate::proc::Io::Val(0);
+    }
+    crate::proc::sleep_current(frame);
+    crate::proc::Io::Slept
+}
+
+/// getitimer(426): mirror of setitimer, same 32-byte struct itimerval.
+/// Reporting a disarmed timer as zeros is what makes "is my interval
+/// timer still armed?" answerable; reporting a constant would not.
+fn netbsd_getitimer(which: i32, out: u64) -> (i64, u8) {
+    if out == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(out, 32) {
+        return (-1, 14); // EFAULT
+    }
+    let (at, iv) = crate::proc::proc_get_itimer(crate::proc::current_slot());
+    let hz = crate::proc::arch_timer_hz() as u64;
+    let now = crate::proc::arch_timer_now();
+    // which != ITIMER_REAL has never been armed here, so it reads back as
+    // disarmed rather than reporting someone else's timer.
+    let (at, iv) = if which == 0 { (at, iv) } else { (None, None) };
+    // it_value is the REMAINING time; once the deadline has passed that is
+    // zero, not a huge wrapped u64.
+    let rem = |opt: Option<u64>| -> (u64, u64) {
+        match opt {
+            Some(t) if t > now => {
+                let us = (t - now).saturating_mul(1_000_000) / hz;
+                (us / 1_000_000, us % 1_000_000)
+            }
+            _ => (0, 0),
+        }
+    };
+    let (isec, iusec) = rem(iv);
+    let (vsec, vusec) = rem(at);
+    unsafe {
+        let p = out as *mut u64;
+        p.add(0).write_unaligned(isec);
+        p.add(1).write_unaligned(iusec);
+        p.add(2).write_unaligned(vsec);
+        p.add(3).write_unaligned(vusec);
+    }
+    (0, 0)
+}
+
+/// __getlogin(49): write the login name. A buffer too small is an error,
+/// not a silently truncated name -- a truncated one is indistinguishable
+/// from a complete short one.
+fn netbsd_getlogin(buf: u64, len: usize) -> (i64, u8) {
+    const NAME: &[u8] = b"root\0";
+    if buf == 0 || len == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(buf, len) {
+        return (-1, 14); // EFAULT
+    }
+    if len < NAME.len() {
+        return (-1, 34); // EINVAL
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(NAME.as_ptr(), buf as *mut u8, NAME.len());
+    }
+    (0, 0)
+}
+
+/// getrusage(445): struct rusage is two timevals (32 bytes) then four
+/// fourteen longs (112 bytes) = 144 total, per sys/resource.h. The
+/// timevals are zero -- this kernel has no per-process CPU clock -- but
+/// the five counters the kernel genuinely maintains are reported, so the
+/// struct is measured rather than uniformly blank.
+fn netbsd_getrusage(who: i64, out: u64) -> (i64, u8) {
+    const RUSAGE: i64 = 144;
+    if out == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(out, RUSAGE as usize) {
+        return (-1, 14); // EFAULT
+    }
+    // RUSAGE_SELF = 0, RUSAGE_CHILDREN = -1. Children are not accounted
+    // separately, so asking for them reports this process's own counters
+    // rather than fabricating an aggregate.
+    let _ = who;
+    let cur = crate::proc::current_pid();
+    let (nvcsw, nivcsw, nsignals, inblock, oublock) = crate::proc::usage_of(cur);
+    unsafe {
+        let p = out as *mut u8;
+        core::ptr::write_bytes(p, 0, RUSAGE as usize);
+        // ru_maxrss at +16, then the small counters from +24.
+        let longs = p.add(16) as *mut i64;
+        longs.add(1).write_unaligned(nvcsw as i64); // ru_nvcsw
+        longs.add(2).write_unaligned(nivcsw as i64); // ru_nivcsw
+        longs.add(3).write_unaligned(nsignals as i64); // ru_nsignals
+        longs.add(10).write_unaligned(inblock as i64); // ru_inblock
+        longs.add(11).write_unaligned(oublock as i64); // ru_oublock
+    }
+    (0, 0)
+}
+
 fn svc_dispatch(frame: &mut TrapFrame) {
     let imm = frame.esr & 0xffff;
     if imm == 0 {
@@ -789,6 +1107,94 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             Ok(()) => (0, 0),
             Err(e) => (-1, e),
         },
+        // --- sync / locking ---
+        //
+        // fsync(95) and fdatasync(241) both flush the whole filesystem
+        // image: there is one disk, and the ram-backed fs is rebuilt into
+        // it wholesale. fdatasync does not promise to skip metadata
+        // (that is a permission to be lazy, not a requirement), so both
+        // do the same real work rather than fdatasync returning 0.
+        // pipe(42): writes both descriptors through the caller's int[2].
+        // Identical to pipe2 here because pipe2's extra flags have no
+        // meaning without O_CLOEXEC semantics this kernel does not track.
+        nbsys::PIPE => match crate::proc::sys_pipe2(frame.x[0]) {
+            Ok(()) => (0, 0),
+            Err(e) => (-1, e),
+        },
+        nbsys::FSYNC | nbsys::FDATASYNC => {
+            match crate::file::node_of_fd(frame.x[0] as usize) {
+                Err(e) => (-1, e),
+                Ok(_) => match crate::fs::sync_to_disk() {
+                    Ok(_) => (0, 0),
+                    Err(e) => (-1, e),
+                },
+            }
+        }
+        // flock(131): no locking is implemented, so LOCK_EX/LOCK_UN must
+        // not pretend to succeed -- that would let two processes believe
+        // they hold a lock. EOPNOTSUPP is the honest answer.
+        nbsys::FLOCK => (-1, 95), // EOPNOTSUPP
+        // getrusage(445): struct rusage is two timevals then FOURTEEN
+        // longs -- 32 + 112 = 144 bytes, read from sys/resource.h. 117 is
+        // the compat __getrusage50 entry, which upstream renames this to,
+        // so only __2 carries the modern struct.
+        //
+        // The counters that CAN be known are real: signals delivered and
+        // voluntary context switches are counted by the kernel. The rest
+        // are zero, which is truthful for a kernel with no page accounting
+        // -- what must never happen is reporting zeros for the ones we do
+        // track, since that is indistinguishable from "not measured".
+        nbsys::GETRUSAGE__2 => netbsd_getrusage(frame.x[0] as i64, frame.x[1]),
+        // getsid(286): the session recorded by setsid, inherited on fork.
+        nbsys::GETSID => {
+            let pid = frame.x[0] as usize;
+            let cur = crate::proc::current_pid();
+            (crate::proc::session_of(if pid == 0 { cur } else { pid }) as i64, 0)
+        }
+        // __getlogin(49): writes the login name. Single-user kernel with no
+        // login records, so it reports the one account that exists rather
+        // than leaving the caller's buffer untouched.
+        nbsys::__GETLOGIN => netbsd_getlogin(frame.x[0], frame.x[1] as usize),
+        // sigaltstack(281) and statfs(157)/fstatfs(158) take
+        // VERSION-SPECIFIC structs (sigaltstack13, statfs12) that are lib-
+        // compat era and absent from current headers. Guessing a layout
+        // would write a plausible-looking struct at the wrong offsets, so
+        // each is refused with its own errno instead.
+        nbsys::SIGALTSTACK__2 => (-1, 134), // ENOSYS: layout not knowable here
+        nbsys::STATFS | nbsys::FSTATFS => (-1, 134),
+        // poll(209): struct pollfd is byte-identical to Linux's, so the
+        // revents walker is shared. timeout < 0 blocks indefinitely, 0
+        // polls, >0 is milliseconds.
+        nbsys::POLL => {
+            match netbsd_poll(frame, frame.x[0], frame.x[1] as usize, frame.x[2] as i64) {
+                crate::proc::Io::Val(v) => (v, 0),
+                crate::proc::Io::Err(e) => (-1, e),
+                crate::proc::Io::Slept => return, // blocked: skip the epilogue
+            }
+        }
+        // select(417) / pselect(436): the __2 variants, which take plain
+        // `timeval`/`timespec` rather than the `50`-suffixed ones. 93 and
+        // 373 are the compat entries -- upstream literally renames select
+        // to __select50 -- so arming 93 would accept a DIFFERENT timeout
+        // struct than the caller passed.
+        nbsys::SELECT__2 => {
+            // SELECT__2 passes `struct timeval *` (may be NULL = block);
+            // PSELECT__2 passes `struct timespec *` (NULL = block). Both
+            // are {i64, i64}, just scaled differently.
+            let tsp = frame.x[4];
+            match netbsd_select(frame, frame.x[0] as i64, frame.x[1], frame.x[2], frame.x[3], tsp) {
+                crate::proc::Io::Val(v) => (v, 0),
+                crate::proc::Io::Err(e) => (-1, e),
+                crate::proc::Io::Slept => return,
+            }
+        }
+        nbsys::PSELECT__2 => {
+            match netbsd_select(frame, frame.x[0] as i64, frame.x[1], frame.x[2], frame.x[3], frame.x[4]) {
+                crate::proc::Io::Val(v) => (v, 0),
+                crate::proc::Io::Err(e) => (-1, e),
+                crate::proc::Io::Slept => return,
+            }
+        }
         // --- process groups / sessions ---
         //
         // getpgrp(0) is the current group; getpgid(0) is the same thing
@@ -910,6 +1316,7 @@ fn svc_dispatch(frame: &mut TrapFrame) {
                 Err(e) => (-1, e),
             }
         }
+        nbsys::GETITIMER__2 => netbsd_getitimer(frame.x[0] as i32, frame.x[1]),
         nbsys::SETITIMER => {
             // SYS_compat_50_setitimer(which, new, old): ITIMER_REAL only.
             // NetBSD aarch64 struct itimerval = { it_interval, it_value },

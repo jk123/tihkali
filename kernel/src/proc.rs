@@ -107,6 +107,14 @@ pub struct Process {
     pub umask: u16,
     /// Session id; set by setsid, otherwise the pid at exec time.
     pub sess: usize,
+    /// Real counters getrusage(2) can report. Counting these means the
+    /// struct carries measured values rather than a row of plausible
+    /// zeros -- which is indistinguishable from "not measured".
+    pub nvcsw: u64,
+    pub nivcsw: u64,
+    pub nsignals: u64,
+    pub inblock: u64,
+    pub oublock: u64,
     /// Absolute tick deadline while sleeping in a timed syscall
     /// (ppoll/nanosleep); None for untimed sleeps.
     pub wake_at: Option<u64>,
@@ -269,6 +277,33 @@ pub fn current_pgrp() -> usize {
         .unwrap_or(0)
 }
 
+pub fn session_of(pid: usize) -> usize {
+    table().get(pid).and_then(|s| s.as_ref()).map_or(0, |p| p.sess)
+}
+
+/// Count a voluntary context switch for the process being switched out.
+fn count_nvcsw(pid: usize) {
+    if let Some(p) = table().get_mut(pid).and_then(|s| s.as_mut()) {
+        p.nvcsw += 1;
+    }
+}
+
+/// Count a signal delivery against the process receiving it.
+pub fn count_signal(pid: usize) {
+    if let Some(p) = table().get_mut(pid).and_then(|s| s.as_mut()) {
+        p.nsignals += 1;
+    }
+}
+
+/// Snapshot of the counters getrusage reports, as (nvcsw, nivcsw,
+/// nsignals, inblock, oublock).
+pub fn usage_of(pid: usize) -> (u64, u64, u64, u64, u64) {
+    match table().get(pid).and_then(|s| s.as_ref()) {
+        Some(p) => (p.nvcsw, p.nivcsw, p.nsignals, p.inblock, p.oublock),
+        None => (0, 0, 0, 0, 0),
+    }
+}
+
 pub fn current_pid() -> usize {
     table()[CURRENT.load(Ordering::Relaxed)].as_ref().map_or(0, |p| p.pid)
 }
@@ -342,6 +377,11 @@ pub fn init(entry: usize, image_end: usize, tables: Vec<usize>) {
         groups: Vec::new(),
         umask: 0o022,
         sess: 0,
+        nvcsw: 0,
+        nivcsw: 0,
+        nsignals: 0,
+        inblock: 0,
+        oublock: 0,
         wake_at: None,
         tpidr: crate::user::TPIDR_VAL,
         itimer_at: None,
@@ -403,6 +443,11 @@ pub fn schedule_ex(frame: &mut TrapFrame, save: bool) -> bool {
             // when the caller is NOT sleeping -- a genuine no-op yield.
             return true;
         }
+        // A real switch: this process gave up the CPU and will be woken
+        // by someone else. That is exactly what ru_nvcsw counts, and
+        // without this getrusage reports a structurally plausible row of
+        // zeros.
+        count_nvcsw(cur);
         CURRENT.store(idx, Ordering::Relaxed);
         let p = t[idx].as_mut().unwrap();
         write_sp_el0(p.sp_el0);
@@ -457,6 +502,14 @@ pub fn self_raise(sig: u8) {
 /// disarms. `iv` is the repeat period in ticks: `Some(0)` one-shots,
 /// `Some(n)` re-arms n ticks after each SIGALRM. Returns the previous
 /// deadline (for the setitimer out-param).
+/// The armed itimer as (deadline_ticks, interval_ticks), for getitimer(2).
+pub fn proc_get_itimer(pid: usize) -> (Option<u64>, Option<u64>) {
+    match table().get(pid).and_then(|slot| slot.as_ref()) {
+        Some(p) => (p.itimer_at, p.itimer_iv),
+        None => (None, None),
+    }
+}
+
 pub fn proc_set_itimer(pid: usize, at: Option<u64>, iv: Option<u64>) -> Option<u64> {
     let t = table();
     let p = t.get_mut(pid).and_then(|slot| slot.as_mut()).expect("process exists");
@@ -514,6 +567,16 @@ pub fn deadline_passed() -> bool {
         }
         _ => false,
     }
+}
+
+/// True when a sleep deadline is armed and has not yet expired. A poll-like
+/// caller uses this to arm ONCE and keep the deadline across the many
+/// re-entries an event-driven sleep produces, instead of re-arming to
+/// `now + timeout` on every wake -- which would postpone the timeout
+/// indefinitely under a steady event rate.
+pub fn deadline_pending() -> bool {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    table()[cur].as_ref().map(|p| p.wake_at.is_some()).unwrap_or(false)
 }
 
 /// Clear a stale deadline (syscall completed without timing out).
@@ -710,6 +773,12 @@ pub fn sys_fork(frame: &mut TrapFrame) -> Result<usize, ForkError> {
         groups: t[cur].as_ref().unwrap().groups.clone(),
         umask: t[cur].as_ref().unwrap().umask,
         sess: t[cur].as_ref().unwrap().sess,
+        // Usage counters belong to the process itself, not inherited.
+        nvcsw: 0,
+        nivcsw: 0,
+        nsignals: 0,
+        inblock: 0,
+        oublock: 0,
         wake_at: None,
         // Child shares the parent's live TLS (COW pages keep it valid).
         tpidr: read_tpidr(),
@@ -1609,6 +1678,9 @@ pub fn deliver_signals(frame: &mut TrapFrame) {
             return;
         }
         let action = p.handlers[sig];
+        // Counted here, at the moment delivery is decided, so ru_nsignals
+        // tracks signals actually acted on.
+        count_signal(cur);
 
         // A signal with an ACTIVE EVFILT_SIGNAL knote belongs to the
         // knote list, not to the handler: it is delivered by kevent, and

@@ -61,6 +61,10 @@ name = "tihkali-kqtest"
 path = "src/kqtest.rs"
 
 [[bin]]
+name = "tihkali-synctest"
+path = "src/synctest.rs"
+
+[[bin]]
 name = "tihkali-credtest"
 path = "src/credtest.rs"
 

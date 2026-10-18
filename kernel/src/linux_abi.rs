@@ -897,14 +897,18 @@ pub fn svc(frame: &mut TrapFrame) {
 
 // ---------- ppoll / nanosleep (deadline-based sleeps) ----------
 
-const POLLIN: u16 = 0x001;
-const POLLOUT: u16 = 0x004;
-const POLLERR: u16 = 0x008;
-const POLLHUP: u16 = 0x010;
-const POLLNVAL: u16 = 0x020;
+pub const POLLIN: u16 = 0x001;
+pub const POLLOUT: u16 = 0x004;
+pub const POLLERR: u16 = 0x008;
+pub const POLLHUP: u16 = 0x010;
+pub const POLLNVAL: u16 = 0x020;
 
 /// Readiness of one fd for the events requested in `events`.
-fn poll_revents(fd: i32, events: u16) -> u16 {
+/// NetBSD's `struct pollfd` is byte-identical to Linux's -- { int fd;
+/// short events; short revents } -- so one revents walker serves both
+/// ABIs. Verified from sys/poll.h rather than assumed, since NetBSD and
+/// Linux differ on almost everything else here.
+pub fn poll_revents(fd: i32, events: u16) -> u16 {
     if fd < 0 {
         return 0; // negative fds are ignored per POSIX
     }
