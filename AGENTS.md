@@ -265,21 +265,14 @@ only L1[4] (user) + L3s are private per process.
 - Rust edition 2024: `#[unsafe(no_mangle)]`, explicit `unsafe` blocks in
   `unsafe fn` bodies, `static mut` access needs `unsafe`.
 
-## Parallel agent sessions
+## Session layout
 
-Two MiMoCode instances run against this repo at once, each in its own git
-worktree. Sessions are independent: separate `target/`, separate branch,
-separate cron lock. Verify with `tmux ls` and
-`git worktree list` before assuming which instance is which.
-
-| | worktree | branch | tmux session | launch |
-|---|---|---|---|---|
-| A | `~/projects/tihkali` | `master` | `mimoa` | `mimoa` |
-| B | `~/projects/tihkali-b` | `side-b` | `mimob` | `tmux attach -t mimob` |
+**One instance, one worktree.** The second agent session and its `side-b`
+worktree/branch were removed on purpose (2026-10-17) — do not recreate
+them, and do not push to `side-b`. `master` is the only branch.
 
 ```sh
-mimoa                      # create-or-attach session A (~/projects/tihkali)
-tmux attach -t mimob       # attach session B (~/projects/tihkali-b)
+mimoa                      # create-or-attach the session (~/projects/tihkali)
 tmux ls                    # list live sessions
 ```
 
@@ -291,13 +284,5 @@ Re-running it is always safe and never double-launches.
 
 Detach without killing: `Ctrl-b` then `d`.
 
-B was created with `git worktree add ../tihkali-b -b side-b`; its `.toolchain`
-is a symlink to A's so the musl cross gcc isn't downloaded twice. Recreate with:
-
-```sh
-git worktree add ../tihkali-b -b side-b
-cd ~/projects/tihkali-b && ln -s ../tihkali/.toolchain .toolchain
-```
-
-Concurrent `check.sh` runs are still forbidden — sessions must stay
-sequential (see above).
+The `target/`-lock and orphaned-helper hazards above still apply, but they
+are now only self-inflicted: there is no second instance to blame.
