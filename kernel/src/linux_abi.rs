@@ -14,7 +14,15 @@ use crate::file::{self, FdTarget};
 use crate::fs;
 use crate::proc::{self, Io};
 
-const AT_FDCWD: i64 = -100;
+pub const AT_FDCWD: i64 = -100;
+
+// NetBSD's AT_* values, verified in sys/sys/fcntl.h. They do NOT match
+// Linux's: 0x100 is AT_EACCESS here (Linux's AT_SYMLINK_NOFOLLOW) and
+// AT_REMOVEDIR only exists on NetBSD, where it replaces rmdirat.
+pub const AT_EACCESS: u64 = 0x100;
+pub const AT_SYMLINK_NOFOLLOW: u64 = 0x200;
+pub const AT_SYMLINK_FOLLOW: u64 = 0x400;
+pub const AT_REMOVEDIR: u64 = 0x800;
 const MAP_ANONYMOUS: u64 = 0x20;
 
 // --- netbsd-backed operations shared with the other personality ---
@@ -1478,12 +1486,18 @@ fn readlinkat_arm(dirfd: i64, path_ptr: u64, buf: u64, bufsiz: u64) -> (i64, u8)
     }
 }
 
-/// Resolve (dirfd, path) to an absolute path. Absolute paths and
-/// AT_FDCWD resolve as given (root-relative — no cwd tracking v1);
-/// dirfd-relative paths are prefixed with the fd's directory.
-fn resolve_path(dirfd: i64, path: String) -> Result<String, u8> {
-    if path.starts_with('/') || dirfd == AT_FDCWD {
-        return Ok(path);
+/// Resolve (dirfd, path) to an absolute path.
+///
+/// AT_FDCWD resolves against the process's CURRENT WORKING DIRECTORY, not
+/// against the root: this comment used to say "root-relative, no cwd
+/// tracking v1", which stopped being true when `chdir` shipped a real cwd.
+/// A relative `openat`/`mkdirat` was silently resolving against `/`.
+pub fn resolve_path(dirfd: i64, path: String) -> Result<String, u8> {
+    if path.starts_with('/') {
+        return Ok(proc::abspath(&path));
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(proc::abspath(&path));
     }
     if dirfd >= 0 {
         match proc::current_target(dirfd as usize) {
@@ -1505,7 +1519,7 @@ fn resolve_path(dirfd: i64, path: String) -> Result<String, u8> {
     }
 }
 
-fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64, flags: u64) -> (i64, u8) {
+pub fn newfstatat(dirfd: i64, path_ptr: u64, buf: u64, flags: u64) -> (i64, u8) {
     let Some(path) = proc::read_user_cstr(path_ptr, 128) else {
         return (0, 14);
     };

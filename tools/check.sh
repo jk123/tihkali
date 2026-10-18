@@ -1049,6 +1049,91 @@ gate_count "s31: no panic"        "$S31" 'panic' 0
 gate_has   "s31: clean exit"      "$S31" 'proc: pid 0 exited \(0\)'
 gate_bad   "s31" "$S31"
 
+echo "== session 32: NetBSD *at() family, fchdir and path refusals"
+S32="$T/s32.log"
+# NetBSD's AT_* flag VALUES are not Linux's: AT_EACCESS=0x100,
+# AT_SYMLINK_NOFOLLOW=0x200, AT_REMOVEDIR=0x800, and there is no rmdirat
+# at all -- unlinkat with AT_REMOVEDIR is the rmdir. A kernel wired to
+# Linux's constants reads NetBSD's AT_EACCESS as "do not follow".
+# The refusals are the point too: link/linkat/mkfifo succeeding without
+# creating the thing would be silent successes.
+( sleep 5
+  printf 'attest\n'; sleep 4
+  printf 'exit\n'; sleep 3
+) | timeout 26 ./tools/run.sh >"$S32" 2>&1
+gate_has   "s32: chdir /etc                          " "$S32" 'at: ok     chdir /etc'
+gate_has   "s32: openat AT_FDCWD create              " "$S32" 'at: ok     openat AT_FDCWD create'
+gate_has   "s32: openat made the file                " "$S32" 'at: ok     openat made the file'
+gate_has   "s32: open /                              " "$S32" 'at: ok     open /[[:space:]]+ok'
+gate_has   "s32: openat dirfd creates                " "$S32" 'at: ok     openat dirfd creates'
+gate_has   "s32: openat bad dirfd EBADF              " "$S32" 'at: ok     openat bad dirfd EBADF'
+gate_has   "s32: mkdirat                             " "$S32" 'at: ok     mkdirat[[:space:]]+ok'
+gate_has   "s32: mkdirat made dir                    " "$S32" 'at: ok     mkdirat made dir'
+gate_has   "s32: mkdirat made a DIRECTORY            " "$S32" 'at: ok     mkdirat made a DIRECTORY'
+gate_has   "s32: mkdirat EEXIST                      " "$S32" 'at: ok     mkdirat EEXIST'
+gate_has   "s32: openat dirfd-relative               " "$S32" 'at: ok     openat dirfd-relative'
+gate_has   "s32: file landed in dirfd dir            " "$S32" 'at: ok     file landed in dirfd dir'
+gate_has   "s32: rmdirat ENOTEMPTY                   " "$S32" 'at: ok     rmdirat ENOTEMPTY'
+gate_has   "s32: dir still there                     " "$S32" 'at: ok     dir still there'
+gate_has   "s32: unlinkat removes the file           " "$S32" 'at: ok     unlinkat removes the file'
+gate_has   "s32: file gone                           " "$S32" 'at: ok     file gone'
+gate_has   "s32: dir survived file unlink            " "$S32" 'at: ok     dir survived file unlink'
+gate_has   "s32: unlinkat bad flag EINVAL            " "$S32" 'at: ok     unlinkat bad flag EINVAL'
+gate_has   "s32: dir survived bad flag               " "$S32" 'at: ok     dir survived bad flag'
+gate_has   "s32: rmdirat on a file ENOTDIR           " "$S32" 'at: ok     rmdirat on a file ENOTDIR'
+gate_has   "s32: file survived ENOTDIR               " "$S32" 'at: ok     file survived ENOTDIR'
+gate_has   "s32: rmdirat removes empty dir           " "$S32" 'at: ok     rmdirat removes empty dir'
+gate_has   "s32: dir gone                            " "$S32" 'at: ok     dir gone'
+gate_has   "s32: symlinkat                           " "$S32" 'at: ok     symlinkat'
+gate_has   "s32: readlinkat target                   " "$S32" 'at: ok     readlinkat target'
+gate_has   "s32: readlinkat ENOSPC                   " "$S32" 'at: ok     readlinkat ENOSPC'
+gate_has   "s32: readlinkat zero buf EINVAL          " "$S32" 'at: ok     readlinkat zero buf EINVAL'
+gate_has   "s32: readlinkat on a file EINVAL         " "$S32" 'at: ok     readlinkat on a file EINVAL'
+gate_has   "s32: fstatat follows by default          " "$S32" 'at: ok     fstatat follows by default'
+gate_has   "s32: fstatat NOFOLLOW                    " "$S32" 'at: ok     fstatat NOFOLLOW'
+gate_has   "s32: fstatat FOLLOW follows              " "$S32" 'at: ok     fstatat FOLLOW follows'
+gate_has   "s32: mode argument honoured              " "$S32" 'at: ok     mode argument honoured'
+gate_has   "s32: faccessat F_OK                      " "$S32" 'at: ok     faccessat F_OK'
+gate_has   "s32: faccessat R_OK on 444               " "$S32" 'at: ok     faccessat R_OK on 444'
+gate_has   "s32: faccessat W_OK on 444               " "$S32" 'at: ok     faccessat W_OK on 444'
+gate_has   "s32: faccessat RW on 444                 " "$S32" 'at: ok     faccessat RW on 444'
+gate_has   "s32: mkdirat for X_OK                    " "$S32" 'at: ok     mkdirat for X_OK'
+gate_has   "s32: faccessat X_OK on a dir             " "$S32" 'at: ok     faccessat X_OK on a dir'
+gate_has   "s32: faccessat AT_EACCESS ok             " "$S32" 'at: ok     faccessat AT_EACCESS ok'
+gate_has   "s32: faccessat bad flag EINVAL           " "$S32" 'at: ok     faccessat bad flag EINVAL'
+gate_has   "s32: faccessat bad amode EINVAL          " "$S32" 'at: ok     faccessat bad amode EINVAL'
+gate_has   "s32: faccessat ENOENT                    " "$S32" 'at: ok     faccessat ENOENT'
+gate_has   "s32: faccessat NOFOLLOW ok               " "$S32" 'at: ok     faccessat NOFOLLOW ok'
+gate_has   "s32: open /etc                           " "$S32" 'at: ok     open /etc'
+gate_has   "s32: fchdir ok                           " "$S32" 'at: ok     fchdir ok'
+gate_has   "s32: fchdir moved the cwd                " "$S32" 'at: ok     fchdir moved the cwd'
+gate_has   "s32: cwd change is real                  " "$S32" 'at: ok     cwd change is real'
+gate_has   "s32: file is in /etc                     " "$S32" 'at: ok     file is in /etc'
+gate_has   "s32: fchdir on a file ENOTDIR            " "$S32" 'at: ok     fchdir on a file ENOTDIR'
+gate_has   "s32: fchdir EBADF                        " "$S32" 'at: ok     fchdir EBADF'
+gate_has   "s32: chdir / restores cwd                " "$S32" 'at: ok     chdir / restores cwd'
+gate_has   "s32: renameat                            " "$S32" 'at: ok     renameat[[:space:]]+ok'
+gate_has   "s32: renameat moved it                   " "$S32" 'at: ok     renameat moved it'
+gate_has   "s32: renameat back                       " "$S32" 'at: ok     renameat back'
+gate_has   "s32: renameat ENOENT                     " "$S32" 'at: ok     renameat ENOENT'
+gate_has   "s32: linkat EOPNOTSUPP                   " "$S32" 'at: ok     linkat EOPNOTSUPP'
+gate_has   "s32: linkat made no file                 " "$S32" 'at: ok     linkat made no file'
+gate_has   "s32: mkfifo EOPNOTSUPP                   " "$S32" 'at: ok     mkfifo EOPNOTSUPP'
+gate_has   "s32: mkfifo made no node                 " "$S32" 'at: ok     mkfifo made no node'
+gate_has   "s32: chroot EPERM                        " "$S32" 'at: ok     chroot EPERM'
+gate_has   "s32: root unmoved                        " "$S32" 'at: ok     root unmoved'
+gate_has   "s32: setpriority 0 ok                    " "$S32" 'at: ok     setpriority 0 ok'
+gate_has   "s32: setpriority 255 ok                  " "$S32" 'at: ok     setpriority 255 ok'
+gate_has   "s32: setpriority 256 EINVAL              " "$S32" 'at: ok     setpriority 256 EINVAL'
+gate_has   "s32: setpriority -1 EINVAL               " "$S32" 'at: ok     setpriority -1 EINVAL'
+gate_has   "s32: getpriority ok                      " "$S32" 'at: ok     getpriority ok'
+gate_has   "s32: getpriority nonnegative             " "$S32" 'at: ok     getpriority nonnegative'
+gate_has   "s32: all ok"          "$S32" 'at: all ok'
+gate_has   "s32: exit 0"          "$S32" 'sh: attest exited 0'
+gate_count "s32: no panic"        "$S32" 'panic' 0
+gate_has   "s32: clean exit"      "$S32" 'proc: pid 0 exited \(0\)'
+gate_bad   "s32" "$S32"
+
 echo "== session 30: NetBSD credentials, groups and process groups"
 S30="$T/s30.log"
 # Every call here was a hardcoded 0 or absent before. A umask that returns

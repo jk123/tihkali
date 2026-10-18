@@ -147,32 +147,42 @@ fn table() -> &'static mut Vec<Option<OpenFile>> {
     unsafe { &mut *FILES.0.get() }
 }
 
-/// open(2): read-only opens never create; write opens honor O_CREAT/O_TRUNC/
-/// O_APPEND/O_EXCL. Directories open fine for getdents, but not for writing.
+/// open(2): O_CREAT/O_TRUNC/O_APPEND/O_EXCL are honoured independently of
+/// the access mode, as POSIX requires.
+///
+/// This used to honour O_CREAT only inside the `acc != 0` (write) branch,
+/// so `O_RDONLY|O_CREAT` on a missing file fell through to the plain
+/// ENOENT path and refused to create. That is not "read-only opens never
+/// create" -- a caller passing O_RDONLY|O_CREAT gets a readable descriptor
+/// either way, and the create is what it asked for. Directories open fine
+/// for getdents, but not for writing.
 pub fn open(path: &str, flags: u64) -> Result<usize, u8> {
+    open_with_mode(path, flags, 0)
+}
+
+/// open(2) with the caller's mode argument (open/openat's variadic third
+/// word). A mode of 0 means the caller passed none.
+pub fn open_with_mode(path: &str, flags: u64, mode: u16) -> Result<usize, u8> {
     let acc = flags & 3;
     if acc == 3 {
         return Err(EINVAL); // O_ACCMODE = 3 is invalid
     }
-    let idx = if acc == 0 {
-        // O_RDONLY
-        fs::lookup(path).ok_or(ENOENT)?
-    } else if flags & O_CREAT != 0 {
+    let idx = if flags & O_CREAT != 0 {
         match fs::lookup(path) {
             Some(i) => {
                 if flags & O_EXCL != 0 {
                     return Err(EEXIST);
                 }
-                if fs::is_dir(i) {
+                if acc != 0 && fs::is_dir(i) {
                     return Err(EISDIR);
                 }
                 i
             }
-            None => fs::create_file(path)?,
+            None => fs::create_file(path, mode)?,
         }
     } else {
         let i = fs::lookup(path).ok_or(ENOENT)?;
-        if fs::is_dir(i) {
+        if acc != 0 && fs::is_dir(i) {
             return Err(EISDIR);
         }
         i

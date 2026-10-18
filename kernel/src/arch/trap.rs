@@ -5,6 +5,7 @@ use crate::netbsd_abi::nr as nbsys;
 use crate::{kprint, kprintln};
 
 use crate::arch::timer;
+use alloc::string::ToString;
 
 /// Saved exception context. Layout is coupled to `SAVE_FRAME`/`RESTORE_FRAME`
 /// in trap.S — keep the two in sync.
@@ -634,6 +635,202 @@ fn netbsd_dup3(from: i64, to: i64) -> (i64, u8) {
     }
 }
 
+/// mkdirat(fd, path, mode) and unlinkat(fd, path, flag). `is_mkdir`
+/// selects which; for unlinkat, `flag` carries NetBSD's AT_REMOVEDIR,
+/// which is how NetBSD asks for rmdir -- there is no rmdirat syscall.
+fn netbsd_at_path(dirfd: i64, path_ptr: u64, is_mkdir: bool, flag: u64) -> (i64, u8) {
+    let Some(path) = crate::proc::read_user_cstr(path_ptr, 256) else {
+        return (-1, 14); // EFAULT
+    };
+    if !is_mkdir && flag != 0 && flag != crate::linux_abi::AT_REMOVEDIR {
+        return (-1, 22); // EINVAL: the only unlinkat flag is AT_REMOVEDIR
+    }
+    let abs = match crate::linux_abi::resolve_path(dirfd, path) {
+        Ok(p) => p,
+        Err(e) => return (-1, e),
+    };
+    let r = if is_mkdir {
+        crate::fs::create_dir(&abs).map(|_| ())
+    } else if flag & crate::linux_abi::AT_REMOVEDIR != 0 {
+        crate::fs::remove_dir(&abs)
+    } else {
+        crate::fs::remove_file(&abs)
+    };
+    match r {
+        Ok(_) => (0, 0),
+        Err(e) => (-1, e),
+    }
+}
+
+/// readlinkat(dirfd, path, buf, bufsize): writes the target. A buffer that
+/// cannot hold the result is ENOSPC rather than a truncated target that
+/// looks like a complete one.
+fn netbsd_readlinkat(dirfd: i64, path_ptr: u64, buf: u64, bufsize: usize) -> (i64, u8) {
+    let Some(path) = crate::proc::read_user_cstr(path_ptr, 256) else {
+        return (-1, 14); // EFAULT
+    };
+    if bufsize == 0 {
+        return (-1, 22); // EINVAL
+    }
+    if !crate::proc::user_range_ok(buf, bufsize) {
+        return (-1, 14); // EFAULT
+    }
+    let abs = match crate::linux_abi::resolve_path(dirfd, path) {
+        Ok(p) => p,
+        Err(e) => return (-1, e),
+    };
+    let Some(idx) = crate::fs::lookup_nofollow(&abs) else {
+        return (-1, crate::file::ENOENT);
+    };
+    if !crate::fs::is_symlink(idx) {
+        return (-1, 22); // EINVAL: not a symlink
+    }
+    let target = crate::fs::with_bytes(idx, |b| {
+        core::str::from_utf8(b).unwrap_or("").to_string()
+    });
+    if target.len() > bufsize {
+        return (-1, 28); // ENOSPC
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(target.as_ptr(), buf as *mut u8, target.len());
+    }
+    (target.len() as i64, 0)
+}
+
+/// symlinkat(target, dirfd, linkpath).
+fn netbsd_symlinkat(target_ptr: u64, dirfd: i64, link_ptr: u64) -> (i64, u8) {
+    let Some(target) = crate::proc::read_user_cstr(target_ptr, 256) else {
+        return (-1, 14); // EFAULT
+    };
+    let Some(linkpath) = crate::proc::read_user_cstr(link_ptr, 256) else {
+        return (-1, 14); // EFAULT
+    };
+    let abs = match crate::linux_abi::resolve_path(dirfd, linkpath) {
+        Ok(p) => p,
+        Err(e) => return (-1, e),
+    };
+    if target.is_empty() {
+        return (-1, 22); // EINVAL
+    }
+    match crate::fs::create_symlink(&abs, &target) {
+        Ok(_) => (0, 0),
+        Err(e) => (-1, e),
+    }
+}
+
+/// linkat(dirfd1, path1, dirfd2, path2, flags). Hard links need a link
+/// count this filesystem does not keep, so the underlying call is
+/// EOPNOTSUPP; resolution still happens first so a bad dirfd reports
+/// EBADF rather than EOPNOTSUPP.
+fn netbsd_linkat(fd1: i64, p1: u64, fd2: i64, p2: u64) -> (i64, u8) {
+    for (fd, ptr) in [(fd1, p1), (fd2, p2)] {
+        let Some(p) = crate::proc::read_user_cstr(ptr, 256) else {
+            return (-1, 14);
+        };
+        if crate::linux_abi::resolve_path(fd, p).is_err() {
+            return (-1, crate::file::EBADF);
+        }
+    }
+    (-1, 95) // EOPNOTSUPP
+}
+
+/// faccessat(dirfd, path, amode, flag): check permission bits against the
+/// node's stored mode. This is real work, not a constant: a file created
+/// 0600 must not report W_OK.
+///
+/// `flag` carries AT_EACCESS (0x100) and the symlink-follow bits. Both
+/// are accepted and neither changes the answer here, and saying so is
+/// better than refusing a flag a real caller passes: there is one uid, so
+/// there is no difference between "check against the real uid" and
+/// "check against the effective uid", and lookup() follows symlinks,
+/// which is the default.
+fn netbsd_faccessat(dirfd: i64, path_ptr: u64, amode: u32, flag: u64) -> (i64, u8) {
+    const F_OK: u32 = 0;
+    const X_OK: u32 = 1;
+    const W_OK: u32 = 2;
+    const R_OK: u32 = 4;
+    if amode & !(X_OK | W_OK | R_OK) != 0 {
+        return (-1, 22); // EINVAL
+    }
+    let known = crate::linux_abi::AT_EACCESS
+        | crate::linux_abi::AT_SYMLINK_NOFOLLOW
+        | crate::linux_abi::AT_SYMLINK_FOLLOW;
+    if flag & !known != 0 {
+        return (-1, 22); // EINVAL: unknown faccessat flag
+    }
+    let Some(path) = crate::proc::read_user_cstr(path_ptr, 256) else {
+        return (-1, 14); // EFAULT
+    };
+    let abs = match crate::linux_abi::resolve_path(dirfd, path) {
+        Ok(p) => p,
+        Err(e) => return (-1, e),
+    };
+    let found = if flag & crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+        crate::fs::lookup_nofollow(&abs)
+    } else {
+        crate::fs::lookup(&abs)
+    };
+    let Some(idx) = found else {
+        return (-1, crate::file::ENOENT);
+    };
+    if amode == F_OK {
+        return (0, 0);
+    }
+    // Single user: uid 0 matches every node, but the MODE still governs,
+    // so a 0600 file genuinely refuses W_OK to everyone here.
+    let mode = crate::fs::perms(idx);
+    if amode & R_OK != 0 && mode & 0o444 == 0 {
+        return (-1, 13); // EACCES
+    }
+    if amode & W_OK != 0 && mode & 0o222 == 0 {
+        return (-1, 13); // EACCES
+    }
+    if amode & X_OK != 0 && mode & 0o111 == 0 {
+        return (-1, 13); // EACCES
+    }
+    (0, 0)
+}
+
+/// fstatat(dirfd, path, buf, flags): NetBSD's 152-byte stat, with the
+/// shared (dirfd, path) resolution.
+fn netbsd_fstatat(dirfd: i64, path: &str, buf: u64, flags: u64) -> (i64, u8) {
+    if !crate::proc::user_range_ok(buf, crate::netbsd_abi::STAT_SIZE) {
+        return (-1, 14); // EFAULT
+    }
+    let abs = match crate::linux_abi::resolve_path(dirfd, path.to_string()) {
+        Ok(p) => p,
+        Err(e) => return (-1, e),
+    };
+    let found = if flags & crate::linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+        crate::fs::lookup_nofollow(&abs)
+    } else {
+        crate::fs::lookup(&abs)
+    };
+    let Some(idx) = found else {
+        return (-1, crate::file::ENOENT);
+    };
+    match crate::netbsd_abi::write_stat_node(buf, idx) {
+        Ok(()) => (0, 0),
+        Err(e) => (-1, e),
+    }
+}
+
+/// fchdir(fd): change the working directory through a descriptor. A
+/// descriptor that is not open is EBADF and one that is not a directory
+/// is ENOTDIR -- a wrong-directory here silently corrupts every later
+/// relative path.
+fn netbsd_fchdir(fd: i64) -> (i64, u8) {
+    let Ok(idx) = crate::file::node_of_fd(fd as usize) else {
+        return (-1, crate::file::EBADF);
+    };
+    if !crate::fs::is_dir(idx) {
+        return (-1, crate::file::ENOTDIR);
+    }
+    let s = crate::fs::path_of(idx).to_string();
+    crate::proc::set_cwd(&s);
+    (0, 0)
+}
+
 fn svc_dispatch(frame: &mut TrapFrame) {
     let imm = frame.esr & 0xffff;
     if imm == 0 {
@@ -1255,6 +1452,95 @@ fn svc_dispatch(frame: &mut TrapFrame) {
             Ok(()) => (0, 0),
             Err(e) => (-1, e),
         },
+        // --- the *at() family ---
+        //
+        // NetBSD's openat/mkdirat/unlinkat/... take the same
+        // (dirfd, path) pair as Linux's, with AT_FDCWD = -100, so the
+        // resolution is shared rather than reimplemented.
+        //
+        // The AT_* flag VALUES do NOT match Linux's, which is exactly
+        // the trap this project's standing rule warns about:
+        // NetBSD has AT_EACCESS=0x100, AT_SYMLINK_NOFOLLOW=0x200,
+        // AT_SYMLINK_FOLLOW=0x400 and AT_REMOVEDIR=0x800, where Linux's
+        // AT_SYMLINK_NOFOLLOW is 0x100 and it has no AT_REMOVEDIR at all
+        // (Linux uses a separate rmdirat). Verified in sys/sys/fcntl.h.
+        //
+        // There is also no rmdirat in NetBSD: unlinkat with AT_REMOVEDIR
+        // is the rmdir.
+        nbsys::OPENAT => match crate::proc::read_user_cstr(frame.x[1], 256) {
+            None => (-1, 14),
+            Some(path) => match crate::linux_abi::resolve_path(frame.x[0] as i64, path) {
+                Ok(abs) => match crate::proc::sys_open_mode(&abs, frame.x[2], frame.x[3] as u16) {
+                    Ok(fd) => (fd as i64, 0),
+                    Err(e) => (-1, e),
+                },
+                Err(e) => (-1, e),
+            },
+        },
+        nbsys::MKDIRAT => netbsd_at_path(frame.x[0] as i64, frame.x[1], true, 0),
+        nbsys::UNLINKAT => netbsd_at_path(frame.x[0] as i64, frame.x[1], false, frame.x[2]),
+        nbsys::READLINKAT => netbsd_readlinkat(frame.x[0] as i64, frame.x[1], frame.x[2], frame.x[3] as usize),
+        nbsys::SYMLINKAT => netbsd_symlinkat(frame.x[0], frame.x[1] as i64, frame.x[2]),
+        nbsys::LINKAT => netbsd_linkat(frame.x[0] as i64, frame.x[1], frame.x[2] as i64, frame.x[3]),
+        nbsys::FSTATAT => {
+            // fstatat(fd, path, buf, flag): the Linux writer produces the
+            // wrong struct for NetBSD, so this shares the resolution but
+            // writes NetBSD's 152-byte stat. AT_SYMLINK_NOFOLLOW is 0x200
+            // here, so the no-follow test is not Linux's 0x100.
+            match crate::proc::read_user_cstr(frame.x[1], 256) {
+                None => (-1, 14),
+                Some(path) => netbsd_fstatat(frame.x[0] as i64, &path, frame.x[2], frame.x[3] as u64),
+            }
+        }
+        nbsys::FACCESSAT => netbsd_faccessat(frame.x[0] as i64, frame.x[1], frame.x[2] as u32, frame.x[3]),
+        // renameat(458): the same resolve-then-rename shape as rename,
+        // and rename already writes NetBSD's vnode notes.
+        nbsys::RENAMEAT => match crate::proc::read_user_cstr(frame.x[1], 256) {
+            None => (-1, 14),
+            Some(from) => match crate::proc::read_user_cstr(frame.x[3], 256) {
+                None => (-1, 14),
+                Some(to) => {
+                    match crate::linux_abi::resolve_path(frame.x[0] as i64, from) {
+                        Ok(a) => match crate::linux_abi::resolve_path(frame.x[2] as i64, to) {
+                            Ok(b) => match crate::fs::rename(&a, &b) {
+                                Ok(()) => (0, 0),
+                                Err(e) => (-1, e),
+                            },
+                            Err(e) => (-1, e),
+                        },
+                        Err(e) => (-1, e),
+                    }
+                }
+            },
+        },
+        // fchdir(13): change directory through a descriptor.
+        nbsys::FCHDIR => netbsd_fchdir(frame.x[0] as i64),
+        // link(9): a hard link. This filesystem has no link count, so the
+        // honest answer is EOPNOTSUPP -- a "success" would create no
+        // second name and the caller's file would appear to have one.
+        nbsys::LINK => (-1, 95), // EOPNOTSUPP
+        // mkfifo(132)/mknod(450) and their *at forms: this fs has
+        // directories, files and symlinks only. Refused rather than
+        // creating a regular file that is not a fifo.
+        nbsys::MKFIFO | nbsys::MKNOD__2 => (-1, 95), // EOPNOTSUPP
+        nbsys::MKFIFOAT | nbsys::MKNODAT => (-1, 95),
+        // chroot(61)/fchroot(297): one always-mounted root and no way to
+        // change it. EPERM says "denied", which is what a caller gets on
+        // a real system without CAP_SYS_CHROOT.
+        nbsys::CHROOT | nbsys::FCHROOT => (-1, 1), // EPERM
+        // setpriority/getpriority: single priority, so getpriority is a
+        // constant but setpriority validates its argument rather than
+        // accepting anything. NetBSD's own man page says the priority
+        // range is 0..MAXPRIORITY (255), not the Linux -20..20 -- the
+        // x[2] cast below would turn a negative into a huge positive.
+        nbsys::SETPRIORITY => {
+            if frame.x[2] > 255 {
+                (-1, 22) // EINVAL
+            } else {
+                (0, 0)
+            }
+        }
+        nbsys::GETPRIORITY => (0, 0),
         // --- resource limits ---
         //
         // struct rlimit is { rlim_cur; rlim_max } with rlim_t = 64-bit on

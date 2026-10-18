@@ -205,16 +205,22 @@ pub fn truncate(idx: usize) {
 }
 
 /// Create a regular file; parent must exist and be a directory.
-pub fn create_file(path: &str) -> Result<usize, u8> {
-    create_node(path, false)
+/// Create a regular file with the caller's mode.
+///
+/// open(path, O_CREAT, mode) and mkdir(path, mode) both pass a mode, and
+/// silently substituting a default means a caller asking for 0600 gets 0644
+/// with no error anywhere. The umask still applies, as POSIX requires.
+/// A mode of 0 means "no mode was passed", which gets the POSIX default.
+pub fn create_file(path: &str, mode: u16) -> Result<usize, u8> {
+    create_node(path, false, mode)
 }
 
 /// Create a directory node.
 pub fn create_dir(path: &str) -> Result<usize, u8> {
-    create_node(path, true)
+    create_node(path, true, 0)
 }
 
-fn create_node(path: &str, as_dir: bool) -> Result<usize, u8> {
+fn create_node(path: &str, as_dir: bool, mode: u16) -> Result<usize, u8> {
     let p = normalize(path);
     if p == "/" {
         return Err(EEXIST);
@@ -237,11 +243,11 @@ fn create_node(path: &str, as_dir: bool) -> Result<usize, u8> {
                 symlink: false,
                 dirty: true,
                 removed: false,
-                // New files and directories are created as 0666/0777 less
-                // the process umask, exactly as POSIX requires -- so umask
-                // is observable in the filesystem, not just read back.
-                mode: (if as_dir { 0o777 } else { 0o666 }
-                    & !crate::proc::current_umask()),
+                // The caller's mode when one was passed, else 0777/0666,
+                // always less the process umask -- POSIX requires both, so
+                // umask stays observable in the filesystem.
+                mode: (if mode == 0 { if as_dir { 0o777 } else { 0o666 } } else { mode })
+                    & !crate::proc::current_umask(),
                 mtime: crate::arch::timer::unix_secs(),
                 vseq: 1,
                 vnotes: 0,

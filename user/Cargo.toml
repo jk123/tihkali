@@ -83,3 +83,7 @@ path = "src/pathtest.rs"
 [[bin]]
 name = "tihkali-sockidtest"
 path = "src/sockidtest.rs"
+
+[[bin]]
+name = "tihkali-attest"
+path = "src/attest.rs"

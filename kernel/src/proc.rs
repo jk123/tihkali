@@ -1427,6 +1427,12 @@ pub fn sys_open(path: &str, flags: u64) -> Result<usize, u8> {
     install_fd(FdTarget::File(file_idx))
 }
 
+/// open(2) with the caller's mode argument, for the *at variants.
+pub fn sys_open_mode(path: &str, flags: u64, mode: u16) -> Result<usize, u8> {
+    let file_idx = file::open_with_mode(path, flags, mode)?;
+    install_fd(FdTarget::File(file_idx))
+}
+
 /// SYS___getdents30(fd, buf, len): directory enumeration.
 pub fn sys_getdents(fd: usize, buf: u64, len: usize) -> Result<usize, u8> {
     let Some(FdTarget::File(i)) = current_target(fd) else { return Err(EBADF) };
