@@ -262,6 +262,105 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
         let Some(k) = ke_read(addr) else {
             return Io::Err(14);
         };
+        if k.filter == crate::proc::EVFILT_USER {
+            // EVFILT_USER is attached to nothing in the kernel: it fires
+            // when the caller sets NOTE_TRIGGER. `data` carries the stored
+            // fflags value on output, with the top two bits NOTE_FFNOP.
+            if k.flags & crate::proc::EV_DELETE != 0 {
+                match crate::proc::kq_delete(k.ident, k.filter) {
+                    Ok(()) => {}
+                    Err(e) => return Io::Err(e),
+                }
+                continue;
+            }
+            if k.flags & (crate::proc::EV_ADD | crate::proc::EV_ENABLE) == 0 {
+                if k.flags & crate::proc::EV_DISABLE != 0 {
+                    let regs = crate::proc::kq_regs();
+                    match regs.iter_mut().find(|e| e.ident == k.ident && e.filter == k.filter) {
+                        Some(e) => e.flags |= crate::proc::EV_DISABLE,
+                        None => return Io::Err(2),
+                    }
+                    continue;
+                }
+                return Io::Err(22);
+            }
+            // The top two bits are the MODIFIER, not part of the value, so
+            // a caller that sends NOTE_TRIGGER|NOTE_FFCOPY is asking for
+            // "replace with these low bits", not "store 0x01000000".
+            let prior = crate::proc::kq_regs()
+                .iter()
+                .find(|e| e.ident == k.ident && e.filter == k.filter)
+                .map(|e| e.vseq);
+            let stored = match prior {
+                Some(v) => crate::proc::user_fflags_apply(v, k.fflags),
+                None => crate::proc::user_fflags_apply(0, k.fflags),
+            };
+            let mut r = crate::proc::Kevent {
+                ident: k.ident,
+                vseq: stored,
+                filter: k.filter,
+                flags: 0,
+                fflags: k.fflags,
+                udata: k.udata,
+                timer_at: 0,
+                timer_period: 0,
+            };
+            r.flags |= k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_CLEAR);
+            if k.flags & crate::proc::EV_DISABLE != 0 {
+                r.flags |= crate::proc::EV_DISABLE;
+            }
+            if let Err(e) = crate::proc::kq_add(r) {
+                return Io::Err(e);
+            }
+            continue;
+        }
+        if k.filter == crate::proc::EVFILT_EMPTY {
+            // EVFILT_EMPTY carries no object at all: it is always
+            // "ready", which is what makes it a portable way to block
+            // until someone pokes the queue. Upstream routes it through
+            // file_filtops, whose READ/WRITE event methods report ready
+            // unconditionally -- the ident is never dereferenced.
+            if k.flags & crate::proc::EV_DELETE != 0 {
+                match crate::proc::kq_delete(k.ident, k.filter) {
+                    Ok(()) => {}
+                    Err(e) => return Io::Err(e),
+                }
+                continue;
+            }
+            if k.flags & (crate::proc::EV_ADD | crate::proc::EV_ENABLE) == 0 {
+                if k.flags & crate::proc::EV_DISABLE != 0 {
+                    let regs = crate::proc::kq_regs();
+                    match regs.iter_mut().find(|e| e.ident == k.ident && e.filter == k.filter) {
+                        Some(e) => e.flags |= crate::proc::EV_DISABLE,
+                        None => return Io::Err(2),
+                    }
+                    continue;
+                }
+                return Io::Err(22);
+            }
+            let r = crate::proc::Kevent {
+                ident: k.ident,
+                vseq: 0,
+                filter: k.filter,
+                flags: k.flags & (crate::proc::EV_ONESHOT | crate::proc::EV_DISABLE),
+                fflags: k.fflags,
+                udata: k.udata,
+                timer_at: 0,
+                timer_period: 0,
+            };
+            if let Err(e) = crate::proc::kq_add(r) {
+                return Io::Err(e);
+            }
+            continue;
+        }
+        if k.filter == crate::proc::EVFILT_FS {
+            // EVFILT_FS reports mounts and unmounts (fflags carries
+            // NOTE_MOUNT / NOTE_UNMOUNT). This kernel has exactly one
+            // always-mounted root and no unmount, so no event can be
+            // generated -- refusing with ENOSYS is honest, where EINVAL
+            // would claim the filter number itself was unknown.
+            return Io::Err(38); // ENOSYS
+        }
         if k.filter == crate::proc::EVFILT_TIMER {
             let _ = addr;
             // EVFILT_TIMER is keyed on a knote SLOT, not on ident/data:
@@ -515,6 +614,8 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
             && k.filter != crate::proc::EVFILT_PROC
             && k.filter != crate::proc::EVFILT_SIGNAL
             && k.filter != crate::proc::EVFILT_TIMER
+            && k.filter != crate::proc::EVFILT_USER
+            && k.filter != crate::proc::EVFILT_EMPTY
         {
             if k.filter == crate::proc::EVFILT_AIO {
                 return Io::Err(38); // ENOSYS: no aio subsystem to attach to
@@ -680,6 +781,19 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
             crate::proc::kq_proc_ready(r).map(|(notes, child)| (notes, child as i64))
         } else if r.filter == crate::proc::EVFILT_SIGNAL {
             crate::proc::kq_sig_ready(r).map(|sig| (0u32, sig as i64))
+        } else if r.filter == crate::proc::EVFILT_USER {
+            // Report the STORED fflags with NOTE_FFNOP on top, not the
+            // request: a caller that asked to trigger must not read its
+            // own NOTE_TRIGGER bit back as though it were state.
+            // On output the top two bits are always NOTE_FFNOP and the low
+            // 24 are the stored value; masking with NOTE_FFCTRLMASK makes
+            // that explicit rather than relying on `stored` happening to
+            // have clear top bits.
+            crate::proc::kq_user_ready(r)
+                .map(|stored| (stored & !crate::proc::NOTE_FFCTRLMASK, 0i64))
+        } else if r.filter == crate::proc::EVFILT_EMPTY {
+            // Always ready unless disabled; ident is not dereferenced.
+            (r.flags & crate::proc::EV_DISABLE == 0).then_some((0u32, 0i64))
         } else if r.filter == crate::proc::EVFILT_TIMER {
             // Slot-keyed: the caller needs `data` to count firings, so the
             // slot index is resolved by position, not by `ident`.
@@ -705,7 +819,13 @@ pub fn kevent_arm(frame: &mut crate::arch::trap::TrapFrame) -> crate::proc::Io {
                     r.filter,
                     0,
                     val,
-                    if is_vn || is_pp { notes } else { r.fflags },
+                    if is_vn || is_pp { notes }
+                    else if r.filter == crate::proc::EVFILT_USER {
+                    // NOTE_FFNOP is already the top two bits of the
+                    // stored value, which is exactly the output contract.
+                    notes
+                }
+                    else { r.fflags },
                 );
                 n += 1;
                 if r.filter == crate::proc::EVFILT_TIMER {

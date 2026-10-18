@@ -1884,6 +1884,9 @@ pub const EVFILT_VNODE: u32 = 3;
 pub const EVFILT_PROC: u32 = 4;
 pub const EVFILT_SIGNAL: u32 = 5;
 pub const EVFILT_TIMER: u32 = 6;
+pub const EVFILT_FS: u32 = 7;
+pub const EVFILT_USER: u32 = 8;
+pub const EVFILT_EMPTY: u32 = 9;
 
 /// A `Kevent` with this filter is a DEAD slot left behind by a one-shot
 /// timer or a removed registration. Slots must keep their index: a timer
@@ -2009,12 +2012,68 @@ pub fn proc_events_drop(pid: usize) {
     pevents().retain(|e| e.pid != pid || e.notes != 0);
 }
 
-/// NOTE_FF* modifiers on an EVFILT_VNODE registration (sys/sys/event.h).
-/// A watcher with fflags 0 wants every note; with NOTE_FFAND it wants only
-/// the notes it named, and NOTE_FFOR widens to any-of.
+/// NOTE_FF* modifiers, shared by EVFILT_USER and EVFILT_VNODE
+/// (sys/sys/event.h). The top two bits of fflags say how the low 24 bits
+/// should be applied to -- or compared against -- the STORED value.
+// NOTE_FFNOP is 0 -- it is what the top two bits are on OUTPUT, and it is
+// the `_` arm of every match below, so it needs no constant of its own.
 pub const NOTE_FFAND: u32 = 0x4000_0000;
 pub const NOTE_FFOR: u32 = 0x8000_0000;
+pub const NOTE_FFCOPY: u32 = 0xc000_0000;
 pub const NOTE_FFCTRLMASK: u32 = 0xc000_0000;
+pub const NOTE_FFLAGSMASK: u32 = 0x00ff_ffff;
+
+// EVFILT_USER (sys/sys/event.h). The filter is not attached to any kernel
+// object -- it fires when the caller SETS NOTE_TRIGGER in fflags, so a
+// userspace thread can wake another one. On output the top two fflags
+// bits are always NOTE_FFNOP and the low 24 bits are the STORED value.
+pub const NOTE_TRIGGER: u32 = 0x0100_0000;
+
+/// Apply an EVFILT_USER fflags update to the STORED value, per the
+/// NOTE_FF* modifier in the top two bits (sys/sys/event.h).
+pub fn user_fflags_apply(stored: u32, fflags: u32) -> u32 {
+    let low = fflags & NOTE_FFLAGSMASK;
+    match fflags & NOTE_FFCTRLMASK {
+        NOTE_FFAND => stored & low,
+        NOTE_FFOR => stored | low,
+        NOTE_FFCOPY => low,
+        // NOTE_FFNOP (0) and every reserved value: keep what is stored.
+        _ => stored,
+    }
+}
+
+/// Is an EVFILT_USER registration ready? It fires when the caller set
+/// NOTE_TRIGGER and the stored value still satisfies the filter's own
+/// fflags under the same NOTE_FF* modifier -- the trigger is a request,
+/// not a guarantee that something is ready.
+pub fn kq_user_ready(k: &Kevent) -> Option<u32> {
+    if k.flags & EV_DISABLE != 0 {
+        return None;
+    }
+    if k.fflags & NOTE_TRIGGER == 0 {
+        return None;
+    }
+    let stored = k.vseq;
+    let want = k.udata as u32;
+    // The filter's own NOTE_FF* modifier decides how `want` is compared
+    // against the stored value; NOTE_FFNOP means "any stored value".
+    let ok = match want & NOTE_FFCTRLMASK {
+        NOTE_FFAND => stored & (want & NOTE_FFLAGSMASK) != 0,
+        NOTE_FFOR => stored & (want & NOTE_FFLAGSMASK) != 0,
+        NOTE_FFCOPY => stored & NOTE_FFLAGSMASK == want & NOTE_FFLAGSMASK,
+        // NOTE_FFNOP (0): no filter, so anything matches.
+        _ => true,
+    };
+    if !ok {
+        return None;
+    }
+    // Report the STORED value, not the request.
+    Some(stored)
+}
+
+/// A watcher with fflags 0 wants every note; with NOTE_FFAND it wants only
+/// the notes it named, and NOTE_FFOR widens to any-of. (NOTE_FF* are
+/// shared with EVFILT_USER -- see the definitions above.)
 
 /// Registration flags (sys/sys/event.h).
 pub const EV_ADD: u32 = 0x0001;

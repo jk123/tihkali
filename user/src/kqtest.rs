@@ -29,22 +29,32 @@ macro_rules! p {
 }
 
 fn check(name: &str, ok: bool) {
-    let pad = b"\n                                 " as &[u8];
-    // Saturating and clamped: an over-long name must not panic the probe.
-    let n = (25usize).saturating_sub(name.len()).min(pad.len() - 1);
-    unsafe {
-        write(1, b"kq: ok    ");
-        write(1, name.as_bytes());
-        write(1, &pad[..n]);
-        if ok {
-            write(1, b"ok\n");
-        } else {
-            write(1, b"FAILED <<");
-            write(1, name.as_bytes());
-            write(1, b">>\n");
+    // ONE write() for the whole line. The probe forks children, and a
+    // child's kernel output ("proc: pid N exited") can interleave between
+    // separate write() calls -- which split the "kq: ok   " prefix off the
+    // name and made a gate_regex miss a check that had passed. Building
+    // the line in a buffer and writing it once removes the interleaving
+    // window entirely.
+    let mut line = [0u8; 128];
+    let mut n = 0usize;
+    let put = |buf: &mut [u8; 128], n: &mut usize, bytes: &[u8]| {
+        let end = (*n + bytes.len()).min(buf.len() - 1);
+        buf[*n..end].copy_from_slice(&bytes[..end - *n]);
+        *n = end;
+    };
+    put(&mut line, &mut n, b"kq: ok    ");
+    put(&mut line, &mut n, name.as_bytes());
+    if ok {
+        put(&mut line, &mut n, b"ok\n");
+    } else {
+        put(&mut line, &mut n, b"FAILED <<");
+        put(&mut line, &mut n, name.as_bytes());
+        put(&mut line, &mut n, b">>\n");
+        unsafe {
             FAILURES += 1;
         }
     }
+    unsafe { write(1, &line[..n]) };
 }
 
 /// Print a value in hex, which is how NOTE_* masks are read.
@@ -379,6 +389,20 @@ const EVFILT_VNODE: u32 = 3;
 const EVFILT_PROC: u32 = 4;
 const EVFILT_SIGNAL: u32 = 5;
 const EVFILT_TIMER: u32 = 6;
+const EVFILT_FS: u32 = 7;
+const EVFILT_USER: u32 = 8;
+const EVFILT_EMPTY: u32 = 9;
+
+// NOTE_FF* are shared between EVFILT_USER and EVFILT_VNODE: the top two
+// bits of fflags say how the low 24 bits apply, and NOTE_FFNOP (0) is
+// "no modifier". On OUTPUT the top two bits are always NOTE_FFNOP and the
+// low 24 bits are the stored value.
+const NOTE_FFNOP: u32 = 0x0;
+const NOTE_FFAND: u32 = 0x4000_0000;
+const NOTE_FFOR: u32 = 0x8000_0000;
+const NOTE_FFCOPY: u32 = 0xc000_0000;
+const NOTE_TRIGGER: u32 = 0x0100_0000;
+const NOTE_FFLAGSMASK: u32 = 0x00ff_ffff;
 
 // EVFILT_TIMER units live in fflags (sys/sys/event.h). NOTE_MSECONDS is the
 // HISTORICAL value 0, so fflags == 0 means MILLISECONDS, not "no unit" --
@@ -409,8 +433,6 @@ const NOTE_WRITE: u32 = 0x0002;
 const NOTE_EXTEND: u32 = 0x0004;
 const NOTE_ATTRIB: u32 = 0x0008;
 const NOTE_RENAME: u32 = 0x0020;
-const NOTE_FFAND: u32 = 0x4000_0000;
-const NOTE_FFOR: u32 = 0x8000_0000;
 
 /// Offsets asserted against the kernel's own writer. If these drift the
 /// probe is reading the wrong bytes and every check below is meaningless.
@@ -1160,6 +1182,88 @@ pub extern "C" fn _start() -> ! {
         let d5 = filld(s5 as u64, EVFILT_TIMER, EV_DELETE, NOTE_MSECONDS, 0, 0);
         check("repeat delete", kevent(kq, &d5 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
         let _ = (s2, s3, s4);
+
+        // --- EVFILT_EMPTY / EVFILT_USER / the two unimplemented ------
+        // EVFILT_EMPTY is attached to nothing and is ALWAYS ready, which
+        // is what makes it a portable way to block until someone pokes the
+        // queue. `ident` is never dereferenced, so any value is legal.
+        let emp = fillf(0, EVFILT_EMPTY, EV_ADD, 0, 0xE001);
+        check("empty add", kevent(kq, &emp as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let mut pempty = core::mem::zeroed::<Ke>();
+        let nemp = kevent(kq, core::ptr::null(), 0, &mut pempty as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("empty always ready", nemp >= Ok(1));
+        if nemp.is_ok() {
+            let g = core::ptr::read_volatile(&pempty);
+            check("empty filter is EMPTY", g.filter == EVFILT_EMPTY);
+            check("empty udata", g.udata == 0xE001);
+        }
+        let empd = fillf(0, EVFILT_EMPTY, EV_DELETE, 0, 0);
+        check("empty delete", kevent(kq, &empd as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let empd2 = fillf(0, EVFILT_EMPTY, EV_DELETE, 0, 0);
+        check("empty del ENOENT", kevent(kq, &empd2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(2));
+
+        // EVFILT_USER fires when the CALLER sets NOTE_TRIGGER -- it is a
+        // wakeup another userspace thread pokes, attached to no kernel
+        // object. The top two fflags bits are the MODIFIER, so the stored
+        // value is the low 24 bits, never the NOTE_TRIGGER bit itself.
+        let usr = fillf(7, EVFILT_USER, EV_ADD, NOTE_FFCOPY | 0x5A, 0xF001);
+        check("user add", kevent(kq, &usr as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let mut pus = core::mem::zeroed::<Ke>();
+        let nus = kevent(kq, core::ptr::null(), 0, &mut pus as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("user silent without trigger", nus == Ok(0));
+
+        // Re-send with NOTE_TRIGGER: the stored value must be unchanged,
+        // because NOTE_TRIGGER lives above NOTE_FFLAGSMASK and is not
+        // part of the value.
+        let usrt = fillf(7, EVFILT_USER, EV_ENABLE, NOTE_FFNOP | NOTE_TRIGGER, 0xF001);
+        check("user trigger", kevent(kq, &usrt as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let mut pus2 = core::mem::zeroed::<Ke>();
+        let nus2 = kevent(kq, core::ptr::null(), 0, &mut pus2 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("user fires on trigger", nus2.is_ok() && nus2.unwrap() >= 1);
+        if nus2.is_ok() && nus2.unwrap() >= 1 {
+            let g = core::ptr::read_volatile(&pus2);
+            check("user filter is USER", g.filter == EVFILT_USER);
+            check("user reports stored", g.fflags & NOTE_FFLAGSMASK == 0x5A);
+            check("user masks trigger bit", g.fflags & NOTE_TRIGGER == 0);
+            check("user top bits are FFNOP", g.fflags & 0xc000_0000 == 0);
+            check("user udata", g.udata == 0xF001);
+        }
+
+        // NOTE_FFOR widens the stored value; the trigger then reports the
+        // UNION, not the request.
+        let usro = fillf(7, EVFILT_USER, EV_ENABLE, NOTE_FFOR | NOTE_TRIGGER | 0x01, 0xF001);
+        check("user ffor", kevent(kq, &usro as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let mut pus3 = core::mem::zeroed::<Ke>();
+        let _ = kevent(kq, core::ptr::null(), 0, &mut pus3 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("user ffor widened", {
+            let g = core::ptr::read_volatile(&pus3);
+            g.fflags & NOTE_FFLAGSMASK == 0x5B
+        });
+
+        // NOTE_FFAND narrows it instead.
+        let usra = fillf(7, EVFILT_USER, EV_ENABLE, NOTE_FFAND | NOTE_TRIGGER | 0x01, 0xF001);
+        check("user ffand", kevent(kq, &usra as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+        let mut pus4 = core::mem::zeroed::<Ke>();
+        let nus4 = kevent(kq, core::ptr::null(), 0, &mut pus4 as *mut Ke as *mut u8, 1, POLL_ONLY.as_ptr() as i64);
+        check("user ffand narrowed", nus4 == Ok(1) && {
+            let g = core::ptr::read_volatile(&pus4);
+            g.fflags & NOTE_FFLAGSMASK == 0x01
+        });
+
+        let usrd = fillf(7, EVFILT_USER, EV_DELETE, 0, 0);
+        check("user delete", kevent(kq, &usrd as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Ok(0));
+
+        // EVFILT_AIO and EVFILT_FS are ENOSYS, not EINVAL: the filter
+        // NUMBERS are valid (AIO has NULL filter ops even upstream), it is
+        // the kernel objects behind them that this OS does not have.
+        // EINVAL would wrongly claim the number itself was unknown.
+        let aio2 = fillf(0, 2, EV_ADD, 0, 0);
+        check("aio ENOSYS again", kevent(kq, &aio2 as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(38));
+        let fsr = fillf(0, EVFILT_FS, EV_ADD, 0, 0);
+        check("fs ENOSYS", kevent(kq, &fsr as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(38));
+        // A filter number past the end IS EINVAL, so the two are distinct.
+        let nope = fillf(0, 40, EV_ADD, 0, 0);
+        check("unknown filter EINVAL", kevent(kq, &nope as *const Ke as *const u8, 1, core::ptr::null_mut(), 0, 0) == Err(22));
 
         close(fd);
         close(kq);

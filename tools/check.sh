@@ -678,9 +678,9 @@ S27="$T/s27.log"
 # reader. `returned udata` is the one that proves the offsets, because it
 # reads a caller-supplied value back out of kernel-written memory.
 ( sleep 5
-  printf 'kqtest\n'; sleep 22
+  printf 'kqtest\n'; sleep 28
   printf 'exit\n'; sleep 3
-) | timeout 48 ./tools/run.sh >"$S27" 2>&1
+) | timeout 55 ./tools/run.sh >"$S27" 2>&1
 gate_has   "s27: offset ident"    "$S27" 'kq: ok    offset ident'
 gate_has   "s27: offset filter"   "$S27" 'kq: ok    offset filter'
 gate_has   "s27: offset flags"    "$S27" 'kq: ok    offset flags'
@@ -828,6 +828,37 @@ gate_has   "s27: repeat not due"      "$S27" 'kq: ok    repeat not due yet'
 gate_has   "s27: repeating fires"     "$S27" 'kq: ok    repeating timer fires'
 gate_has   "s27: repeating EV_CLEAR"  "$S27" 'kq: ok    repeating timer is EV_CLEAR'
 gate_has   "s27: repeat delete"       "$S27" 'kq: ok    repeat delete'
+# The last four filters. EVFILT_EMPTY is attached to nothing and is always
+# ready. EVFILT_USER fires when the CALLER sets NOTE_TRIGGER -- a userspace
+# wakeup with no kernel object behind it -- and `user masks trigger bit` is
+# the one that matters: NOTE_TRIGGER lives above NOTE_FFLAGSMASK, so a
+# kernel that stored the request verbatim would echo it back as state.
+# AIO and FS are ENOSYS, not EINVAL: the filter NUMBERS are valid (AIO has
+# NULL filter ops even upstream), it is the objects behind them this OS
+# lacks. `unknown filter EINVAL` proves the two are distinguishable.
+gate_has   "s27: empty add"       "$S27" 'kq: ok    empty add'
+gate_has   "s27: empty always ready" "$S27" 'kq: ok    empty always ready'
+gate_has   "s27: empty filter"     "$S27" 'kq: ok    empty filter is EMPTY'
+gate_has   "s27: empty udata"      "$S27" 'kq: ok    empty udata'
+gate_has   "s27: empty delete"     "$S27" 'kq: ok    empty delete'
+gate_has   "s27: empty del ENOENT" "$S27" 'kq: ok    empty del ENOENT'
+gate_has   "s27: user add"         "$S27" 'kq: ok    user add'
+gate_has   "s27: user no trigger"  "$S27" 'kq: ok    user silent without trigger'
+gate_has   "s27: user trigger"     "$S27" 'kq: ok    user trigger'
+gate_has   "s27: user fires"       "$S27" 'kq: ok    user fires on trigger'
+gate_has   "s27: user filter"      "$S27" 'kq: ok    user filter is USER'
+gate_has   "s27: user stored"      "$S27" 'kq: ok    user reports stored'
+gate_has   "s27: trigger masked"   "$S27" 'kq: ok    user masks trigger bit'
+gate_has   "s27: top bits FFNOP"   "$S27" 'kq: ok    user top bits are FFNOP'
+gate_has   "s27: user udata"       "$S27" 'kq: ok    user udata'
+gate_has   "s27: user ffor"        "$S27" 'kq: ok    user ffor'
+gate_has   "s27: user ffor widen"  "$S27" 'kq: ok    user ffor widened'
+gate_has   "s27: user ffand"       "$S27" 'kq: ok    user ffand'
+gate_has   "s27: user ffand narrow" "$S27" 'kq: ok    user ffand narrowed'
+gate_has   "s27: user delete"      "$S27" 'kq: ok    user delete'
+gate_has   "s27: aio ENOSYS again" "$S27" 'kq: ok    aio ENOSYS again'
+gate_has   "s27: fs ENOSYS"        "$S27" 'kq: ok    fs ENOSYS'
+gate_has   "s27: unknown EINVAL"   "$S27" 'kq: ok    unknown filter EINVAL'
 gate_has   "s27: all ok"          "$S27" 'kq: all ok'
 gate_has   "s27: exit 0"          "$S27" 'sh: kqtest exited 0'
 gate_count "s27: no panic"        "$S27" 'panic' 0
